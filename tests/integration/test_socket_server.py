@@ -1,0 +1,202 @@
+"""Streaming and cancellation over real sockets.
+
+The gateway and a fake upstream both run in uvicorn on ephemeral localhost ports,
+so these tests exercise httpx's connection pool, uvicorn's disconnect signalling,
+and incremental delivery without buffering.
+"""
+
+import asyncio
+import json
+import logging
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import StreamingResponse
+from starlette.routing import Route
+from starlette.types import ASGIApp
+
+from gateway.main import build_app
+from tests.fakes import AUTH_HEADERS, make_config, make_settings, openai_chunk, sse_body
+
+TIMEOUT_SECONDS = 5
+STREAM_REQUEST = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+
+
+class FakeUpstream:
+    """An OpenAI-compatible upstream whose progress is controlled by the test."""
+
+    def __init__(self, *, fail_after_first_chunk: bool = False) -> None:
+        self.fail_after_first_chunk = fail_after_first_chunk
+        self.request_received = asyncio.Event()
+        self.release = asyncio.Event()
+        self.connection_closed = asyncio.Event()
+
+    def app(self) -> Starlette:
+        return Starlette(routes=[Route("/v1/chat/completions", self._handle, methods=["POST"])])
+
+    async def _handle(self, request: Request) -> StreamingResponse:
+        stream = (await request.json())["stream"]
+        self.request_received.set()
+        return StreamingResponse(
+            self._stream_body() if stream else self._json_body(),
+            media_type="text/event-stream" if stream else "application/json",
+        )
+
+    async def _stream_body(self) -> AsyncIterator[bytes]:
+        try:
+            yield sse_body(openai_chunk("Hel"), done=False)
+            await self.release.wait()
+            if self.fail_after_first_chunk:
+                raise RuntimeError("simulated upstream crash")
+            yield sse_body(openai_chunk("lo", finish_reason="stop"))
+        except asyncio.CancelledError:
+            self.connection_closed.set()
+            raise
+
+    async def _json_body(self) -> AsyncIterator[bytes]:
+        try:
+            await self.release.wait()
+            body = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+            yield json.dumps(body).encode()
+        except asyncio.CancelledError:
+            self.connection_closed.set()
+            raise
+
+
+@asynccontextmanager
+async def run_server(app: ASGIApp) -> AsyncIterator[str]:
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=0,
+        log_config=None,
+        access_log=False,
+        timeout_graceful_shutdown=1,
+    )
+    server = uvicorn.Server(config)
+    task = asyncio.create_task(server.serve())
+    async with asyncio.timeout(TIMEOUT_SECONDS):
+        while not server.started:
+            if task.done():
+                task.result()
+            await asyncio.sleep(0.01)
+    port = server.servers[0].sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        await task
+
+
+@asynccontextmanager
+async def running(upstream: FakeUpstream) -> AsyncIterator[httpx.AsyncClient]:
+    async with run_server(upstream.app()) as upstream_url:
+        config = make_config(
+            {
+                "providers": {
+                    "upstream": {"type": "openai_compatible", "base_url": f"{upstream_url}/v1"}
+                },
+                "models": {"fast": {"provider": "upstream", "model": "m"}},
+            },
+            {"upstream": None},
+        )
+        async with (
+            run_server(build_app(make_settings(), config)) as gateway_url,
+            httpx.AsyncClient(base_url=gateway_url, headers=AUTH_HEADERS) as client,
+        ):
+            yield client
+
+
+async def eventually(condition: Callable[[], bool]) -> None:
+    async with asyncio.timeout(TIMEOUT_SECONDS):
+        while not condition():
+            await asyncio.sleep(0.01)
+
+
+def completion_outcomes(caplog: pytest.LogCaptureFixture) -> list[object]:
+    return [
+        record.__dict__["outcome"]
+        for record in caplog.records
+        if record.getMessage() == "completion finished"
+    ]
+
+
+async def test_chunks_are_delivered_before_the_upstream_finishes() -> None:
+    upstream = FakeUpstream()
+
+    async with (
+        running(upstream) as client,
+        asyncio.timeout(TIMEOUT_SECONDS),
+        client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response,
+    ):
+        lines = response.aiter_lines()
+        received = []
+        # The upstream is blocked after its first chunk, so this only completes
+        # if the gateway forwards chunks as they arrive.
+        while not any('"Hel"' in line for line in received):
+            received.append(await anext(lines))
+        assert not upstream.release.is_set()
+
+        upstream.release.set()
+        rest = [line async for line in lines]
+
+    assert "data: [DONE]" in rest
+
+
+async def test_client_disconnect_during_stream_closes_the_upstream_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream = FakeUpstream()
+    caplog.set_level(logging.INFO)
+
+    async with running(upstream) as client, asyncio.timeout(TIMEOUT_SECONDS):
+        async with client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response:
+            async for line in response.aiter_lines():
+                if '"Hel"' in line:
+                    break
+        # Leaving the block closes the client connection mid-stream.
+        await upstream.connection_closed.wait()
+        await eventually(lambda: completion_outcomes(caplog) == ["cancelled"])
+
+    assert not upstream.release.is_set()
+
+
+async def test_client_disconnect_during_non_streaming_request_cancels_upstream_call(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream = FakeUpstream()
+    caplog.set_level(logging.INFO)
+    body = {**STREAM_REQUEST, "stream": False}
+
+    async with running(upstream) as client, asyncio.timeout(TIMEOUT_SECONDS):
+        request = asyncio.create_task(client.post("/v1/chat/completions", json=body))
+        await upstream.request_received.wait()
+        request.cancel()
+
+        await upstream.connection_closed.wait()
+        await eventually(lambda: completion_outcomes(caplog) == ["cancelled"])
+
+    access = [r for r in caplog.records if r.getMessage() == "request completed"]
+    assert access[-1].__dict__["status_code"] == 499
+
+
+async def test_upstream_crash_mid_stream_is_reported_to_the_client() -> None:
+    upstream = FakeUpstream(fail_after_first_chunk=True)
+
+    async with (
+        running(upstream) as client,
+        asyncio.timeout(TIMEOUT_SECONDS),
+        client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response,
+    ):
+        upstream.release.set()
+        lines = [line async for line in response.aiter_lines() if line]
+
+    assert response.status_code == 200
+    assert "data: [DONE]" not in lines
+    error = json.loads(lines[-1].removeprefix("data: "))["error"]
+    assert error["type"] == "provider_unavailable"

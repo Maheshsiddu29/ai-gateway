@@ -7,9 +7,10 @@ libraries surface them, with ``type`` set to a stable gateway category.
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from gateway.api.disconnect import ClientDisconnectedError
 from gateway.core.logging import request_id_var
 from gateway.errors import (
     AuthenticationError,
@@ -20,6 +21,9 @@ from gateway.errors import (
 )
 
 _HTTP_EXCEPTION_CODES = {404: "not_found", 405: "method_not_allowed"}
+# Not sent to anyone, since the client is gone; recorded in the access log. The
+# value follows the common "client closed request" convention.
+CLIENT_CLOSED_REQUEST = 499
 
 
 def error_payload(error: GatewayError) -> dict[str, Any]:
@@ -66,3 +70,7 @@ def install_error_handlers(app: FastAPI) -> None:
         if exc.headers:
             response.headers.update(exc.headers)
         return response
+
+    @app.exception_handler(ClientDisconnectedError)
+    async def handle_client_disconnect(request: Request, exc: ClientDisconnectedError) -> Response:
+        return Response(status_code=CLIENT_CLOSED_REQUEST)

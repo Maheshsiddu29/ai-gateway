@@ -14,6 +14,7 @@ from gateway.main import build_app
 from gateway.providers.factory import build_provider
 from tests.fakes import (
     AUTH_HEADERS,
+    FAKE_UPSTREAM_KEY,
     GATEWAY_API_KEY,
     UpstreamHandler,
     UpstreamStub,
@@ -22,7 +23,6 @@ from tests.fakes import (
     serve,
 )
 
-UPSTREAM_KEY = "sk-upstream-secret-value"
 CONFIG: dict[str, object] = {
     "providers": {
         "openai": {
@@ -50,7 +50,7 @@ async def gateway(
     stub = UpstreamStub(handler)
     app = build_app(
         make_settings(),
-        make_config(CONFIG, {"openai": UPSTREAM_KEY}),
+        make_config(CONFIG, {"openai": FAKE_UPSTREAM_KEY}),
         partial(build_provider, transport=stub),
     )
     async with serve(app) as client:
@@ -87,7 +87,7 @@ async def test_client_headers_are_not_forwarded_upstream() -> None:
         await client.post("/v1/chat/completions", json=REQUEST, headers=client_headers)
 
     upstream_headers = stub.requests[0].headers
-    assert upstream_headers["authorization"] == f"Bearer {UPSTREAM_KEY}"
+    assert upstream_headers["authorization"] == f"Bearer {FAKE_UPSTREAM_KEY}"
     assert upstream_headers["host"] == "llm.test"
     assert set(upstream_headers.keys()) == {
         "host",
@@ -119,7 +119,7 @@ async def test_credentials_never_reach_clients_or_logs(
         response = await client.post("/v1/chat/completions", json=REQUEST, headers=AUTH_HEADERS)
 
     assert response.status_code >= 400
-    for secret in (UPSTREAM_KEY, GATEWAY_API_KEY):
+    for secret in (FAKE_UPSTREAM_KEY, GATEWAY_API_KEY):
         assert secret not in response.text
         assert secret not in str(response.headers)
         assert secret not in caplog.text

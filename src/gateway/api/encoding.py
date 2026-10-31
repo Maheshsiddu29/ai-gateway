@@ -4,6 +4,7 @@
 upstream model name. ``usage`` is included only when the provider reported it.
 """
 
+import json
 import time
 import uuid
 from typing import Any
@@ -46,3 +47,31 @@ def completion_body(
     if completion.usage is not None:
         body["usage"] = usage_body(completion.usage)
     return body
+
+
+def chunk_base(*, completion_id: str, created: int, model: str) -> dict[str, Any]:
+    """Fields shared by every chunk of one streamed completion."""
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+    }
+
+
+def delta_chunk(
+    base: dict[str, Any], delta: dict[str, str], finish_reason: str | None = None
+) -> dict[str, Any]:
+    return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+
+
+def usage_chunk(base: dict[str, Any], usage: Usage) -> dict[str, Any]:
+    return {**base, "choices": [], "usage": usage_body(usage)}
+
+
+def sse_frame(payload: dict[str, Any]) -> bytes:
+    # json.dumps escapes newlines, so each payload is a single ``data:`` line.
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
+
+
+SSE_DONE = b"data: [DONE]\n\n"

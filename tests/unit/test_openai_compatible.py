@@ -15,7 +15,14 @@ from gateway.errors import (
 from gateway.providers.base import ProviderRequest, StreamEnd, StreamEvent, TextDelta, Usage
 from gateway.providers.openai_compatible import OpenAICompatibleProvider
 from gateway.schemas.completions import ChatMessage
-from tests.fakes import SSE_HEADERS, ControlledStream, UpstreamHandler, UpstreamStub, sse_body
+from tests.fakes import (
+    SSE_HEADERS,
+    ControlledStream,
+    UpstreamHandler,
+    UpstreamStub,
+    openai_chunk,
+    sse_body,
+)
 
 UPSTREAM_KEY = "upstream-secret-key"
 REQUEST = ProviderRequest(
@@ -52,11 +59,6 @@ def make_provider(
     )
     key = SecretStr(api_key) if api_key is not None else None
     return OpenAICompatibleProvider.from_config("openai", config, key, transport=stub), stub
-
-
-def chunk(content: str | None = None, finish_reason: str | None = None) -> dict[str, object]:
-    delta = {} if content is None else {"content": content}
-    return {"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
 
 
 async def collect(events: AsyncIterator[StreamEvent]) -> list[StreamEvent]:
@@ -215,9 +217,9 @@ class TestStream:
     async def test_yields_deltas_then_end_with_usage(self) -> None:
         body = sse_body(
             {"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]},
-            chunk("Hel"),
-            chunk("lo"),
-            chunk(finish_reason="stop"),
+            openai_chunk("Hel"),
+            openai_chunk("lo"),
+            openai_chunk(finish_reason="stop"),
             {
                 "choices": [],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
@@ -237,7 +239,7 @@ class TestStream:
 
     @pytest.mark.parametrize("include_usage", [False, True])
     async def test_requests_a_stream(self, include_usage: bool) -> None:
-        body = sse_body(chunk("x", finish_reason="stop"))
+        body = sse_body(openai_chunk("x", finish_reason="stop"))
         provider, stub = make_provider(
             lambda _: httpx.Response(200, headers=SSE_HEADERS, content=body)
         )
@@ -273,7 +275,7 @@ class TestStream:
         assert exc_info.value.code == "malformed_provider_response"
 
     async def test_accepts_end_of_stream_without_done_after_a_finish_reason(self) -> None:
-        body = sse_body(chunk("x"), chunk(finish_reason="length"), done=False)
+        body = sse_body(openai_chunk("x"), openai_chunk(finish_reason="length"), done=False)
         provider, _ = make_provider(
             lambda _: httpx.Response(200, headers=SSE_HEADERS, content=body)
         )
@@ -283,7 +285,7 @@ class TestStream:
         assert events[-1] == StreamEnd(finish_reason="length", usage=None)
 
     async def test_end_of_stream_before_completion_is_an_error(self) -> None:
-        body = sse_body(chunk("partial"), done=False)
+        body = sse_body(openai_chunk("partial"), done=False)
         provider, _ = make_provider(
             lambda _: httpx.Response(200, headers=SSE_HEADERS, content=body)
         )
@@ -314,7 +316,9 @@ class TestStream:
         assert exc_info.value.code == code
 
     async def test_read_timeout_after_partial_output(self) -> None:
-        stream = ControlledStream(sse_body(chunk("Hel"), done=False), httpx.ReadTimeout("slow"))
+        stream = ControlledStream(
+            sse_body(openai_chunk("Hel"), done=False), httpx.ReadTimeout("slow")
+        )
         provider, _ = make_provider(
             lambda _: httpx.Response(200, headers=SSE_HEADERS, stream=stream)
         )
@@ -327,7 +331,7 @@ class TestStream:
         assert stream.closed.is_set()
 
     async def test_closing_the_stream_early_releases_the_upstream_response(self) -> None:
-        stream = ControlledStream(sse_body(chunk("Hel"), done=False))
+        stream = ControlledStream(sse_body(openai_chunk("Hel"), done=False))
         provider, _ = make_provider(
             lambda _: httpx.Response(200, headers=SSE_HEADERS, stream=stream)
         )

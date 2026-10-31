@@ -15,6 +15,7 @@ from gateway.core.config import Environment, GatewayConfig, LoadedConfig, Settin
 from gateway.providers.base import Completion, ProviderRequest, StreamEvent
 
 GATEWAY_API_KEY = "test-gateway-key-0123456789abcdef"
+FAKE_UPSTREAM_KEY = "sk-upstream-secret-value"
 AUTH_HEADERS = {"Authorization": f"Bearer {GATEWAY_API_KEY}"}
 
 
@@ -42,7 +43,7 @@ class FakeProvider:
         name: str = "fake",
         *,
         completion: Completion | None = None,
-        events: list[StreamEvent] | None = None,
+        events: list[StreamEvent | BaseException] | None = None,
         error: BaseException | None = None,
     ) -> None:
         self._name = name
@@ -69,6 +70,8 @@ class FakeProvider:
         if self._error is not None:
             raise self._error
         for event in self._events:
+            if isinstance(event, BaseException):
+                raise event
             yield event
 
     async def aclose(self) -> None:
@@ -133,6 +136,11 @@ class ControlledStream(httpx.AsyncByteStream):
 
     async def aclose(self) -> None:
         self.closed.set()
+
+
+def openai_chunk(content: str | None = None, finish_reason: str | None = None) -> dict[str, Any]:
+    delta = {} if content is None else {"content": content}
+    return {"choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
 
 
 def sse_body(*payloads: object, done: bool = True) -> bytes:

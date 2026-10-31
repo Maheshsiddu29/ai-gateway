@@ -8,13 +8,22 @@ emits one ``completion finished`` log event per request with the outcome.
 import asyncio
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import aclosing
 from dataclasses import dataclass
 
 from gateway.core.config import GatewayConfig
 from gateway.core.security import Principal
-from gateway.errors import GatewayError, InvalidRequestError, ProviderError
-from gateway.providers.base import Completion, Provider, ProviderRequest, Usage
+from gateway.errors import GatewayError, InternalGatewayError, InvalidRequestError, ProviderError
+from gateway.providers.base import (
+    Completion,
+    Provider,
+    ProviderRequest,
+    StreamEnd,
+    StreamEvent,
+    TextDelta,
+    Usage,
+)
 from gateway.schemas.completions import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
@@ -59,6 +68,32 @@ class CompletionService:
         trace.succeeded(completion.finish_reason, completion.usage, completion.provider_response_id)
         return completion
 
+    async def stream(
+        self, request: ChatCompletionRequest, principal: Principal
+    ) -> AsyncGenerator[StreamEvent]:
+        """Relay provider stream events, logging the outcome once the stream ends.
+
+        Closing this generator early (client disconnect) closes the provider
+        stream and is logged as a cancellation.
+        """
+        route, provider = self._resolve(request.model)
+        trace = _CompletionTrace(principal, route, stream=True)
+        end: StreamEnd | None = None
+        try:
+            async with aclosing(provider.stream(_provider_request(request, route))) as events:
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        trace.first_token()
+                    else:
+                        end = event
+                    yield event
+            if end is None:
+                raise InternalGatewayError("The provider stream ended unexpectedly.")
+        except BaseException as exc:
+            trace.failed(exc)
+            raise
+        trace.succeeded(end.finish_reason, end.usage, provider_response_id=None)
+
     def _resolve(self, alias: str) -> tuple[ModelRoute, Provider]:
         route = self._routes.get(alias)
         if route is None:
@@ -100,6 +135,11 @@ class _CompletionTrace:
             "upstream_model": route.upstream_model,
             "stream": stream,
         }
+
+    def first_token(self) -> None:
+        self._fields.setdefault(
+            "time_to_first_token_ms", round((time.perf_counter() - self._started) * 1000, 2)
+        )
 
     def succeeded(
         self, finish_reason: str | None, usage: Usage | None, provider_response_id: str | None
