@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 
 from gateway.api.dependencies import (
     CompletionRequestDep,
@@ -9,6 +9,7 @@ from gateway.api.dependencies import (
 )
 from gateway.api.disconnect import run_until_disconnect
 from gateway.api.encoding import completion_body, new_completion_id, unix_time
+from gateway.api.responses import CompletionResponse
 from gateway.api.streaming import EventStreamResponse, encode_stream
 
 router = APIRouter()
@@ -53,6 +54,7 @@ async def create_chat_completion(
     completion = await run_until_disconnect(
         request.receive, service.complete(body, principal, deadline)
     )
-    return JSONResponse(
-        completion_body(completion, completion_id=completion_id, created=created, model=body.model)
+    return CompletionResponse(
+        completion_body(completion, completion_id=completion_id, created=created, model=body.model),
+        deadline,
     )

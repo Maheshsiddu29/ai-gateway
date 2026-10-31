@@ -17,7 +17,7 @@ from gateway.schemas.completions import KNOWN_UNSUPPORTED_PARAMETERS, ChatComple
 from gateway.services.completion import CompletionService
 
 
-def get_settings(request: Request) -> Settings:
+async def get_settings(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
 
@@ -29,7 +29,7 @@ async def start_deadline(request: Request) -> Deadline:
     return deadline
 
 
-def get_completion_service(request: Request) -> CompletionService:
+async def get_completion_service(request: Request) -> CompletionService:
     service: CompletionService | None = request.app.state.completion_service
     if service is None:
         raise InternalGatewayError("The gateway is not ready.", code="not_ready")

@@ -136,3 +136,8 @@ If the deadline expires after prefetch but before response headers, the response
 returns a JSON 504 and explicitly closes the prefetched provider stream. Closing
 an encoder that has never started is insufficient: Python does not execute its
 `finally` block in that case.
+
+Buffered JSON completions also check the deadline before headers and on body
+writes. Expiry before headers returns JSON 504. If a body write stalls after
+headers, the connection is aborted; the incomplete `Content-Length` response
+lets the client detect failure.
