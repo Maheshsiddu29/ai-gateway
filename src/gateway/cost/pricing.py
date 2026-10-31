@@ -61,12 +61,17 @@ class PriceCatalog:
             versions.sort(key=lambda price: price.effective_at)
 
     def select(self, provider: str, model: str, at: datetime) -> Price:
+        price = self.find(provider, model, at)
+        if price is None:
+            raise ValueError(f"no effective price for {provider}/{model}")
+        return price
+
+    def find(self, provider: str, model: str, at: datetime) -> Price | None:
+        """The latest price effective at ``at``, or None if there is none."""
         eligible = [
             price for price in self._prices.get((provider, model), []) if price.effective_at <= at
         ]
-        if not eligible:
-            raise ValueError(f"no effective price for {provider}/{model}")
-        return eligible[-1]
+        return eligible[-1] if eligible else None
 
     def has_model(self, provider: str, model: str) -> bool:
         return (provider, model) in self._prices
