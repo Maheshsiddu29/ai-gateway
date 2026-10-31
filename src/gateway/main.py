@@ -12,9 +12,10 @@ from fastapi import FastAPI
 
 from gateway.api.errors import install_error_handlers
 from gateway.api.middleware import RequestContextMiddleware
-from gateway.api.routes import completions, health
+from gateway.api.routes import completions, health, metrics
 from gateway.core.config import LoadedConfig, Settings, load_config
 from gateway.core.logging import configure_logging
+from gateway.core.metrics import Metrics
 from gateway.core.security import StaticKeyAuthenticator
 from gateway.providers.base import Provider
 from gateway.providers.factory import ProviderFactory, build_provider
@@ -60,9 +61,11 @@ def build_app(
     app.state.settings = settings
     app.state.authenticator = StaticKeyAuthenticator(settings.api_keys)
     app.state.completion_service = None
+    app.state.metrics = Metrics()
 
     install_error_handlers(app)
-    app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(RequestContextMiddleware, metrics=app.state.metrics)
     app.include_router(health.router)
+    app.include_router(metrics.router)
     app.include_router(completions.router)
     return app

@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from gateway.api.errors import internal_error_response
 from gateway.core.logging import request_id_var
+from gateway.core.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,18 @@ def _client_request_id(scope: Scope) -> str | None:
     return None
 
 
+def _route_template(scope: Scope) -> str:
+    # The matched route's path template rather than the raw path, so that requests
+    # to arbitrary unknown paths cannot create unbounded metric label values.
+    route = scope.get("route")
+    path = getattr(route, "path", None)
+    return path if isinstance(path, str) else "unmatched"
+
+
 class RequestContextMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, metrics: Metrics) -> None:
         self.app = app
+        self.metrics = metrics
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -62,13 +72,17 @@ class RequestContextMiddleware:
                 raise
             await internal_error_response()(scope, receive, send_with_request_id)
         finally:
+            duration = time.perf_counter() - started
+            route = _route_template(scope)
+            self.metrics.http_requests.labels(route, str(status_code)).inc()
+            self.metrics.http_request_duration.labels(route).observe(duration)
             logger.info(
                 "request completed",
                 extra={
                     "method": scope["method"],
                     "path": scope["path"],
                     "status_code": status_code,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "duration_ms": round(duration * 1000, 2),
                     "principal_id": state.get("principal_id"),
                     "error_type": state.get("error_type"),
                 },
