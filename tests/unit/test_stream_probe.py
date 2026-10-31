@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 
 import pytest
+from prometheus_client import generate_latest
 
 from gateway.admission.usage import UsageLedger
 from gateway.core.config import CircuitBreakerConfig, ResilienceConfig
@@ -46,11 +47,12 @@ async def test_probe_remains_held_until_the_whole_stream_finishes(outcome: str) 
     breaker.record_failure()
     clock[0] += 1
     provider = ProbeProvider(fail=outcome == "failure")
+    metrics = Metrics()
     executor = ProviderExecutor(
         {"fake": provider},
         {"fake": breaker},
         RetryPolicy.from_config(ResilienceConfig(max_attempts_per_provider=1)),
-        Metrics(),
+        metrics,
     )
     request = ProviderRequest(
         model="m",
@@ -79,3 +81,11 @@ async def test_probe_remains_held_until_the_whole_stream_finishes(outcome: str) 
         assert await anext(events, None) is None
         assert list(transitions)[-1] is BreakerState.CLOSED
     assert provider.stream_closed.is_set()
+
+    label = {"success": "success", "failure": "provider_unavailable", "cancelled": "cancelled"}[
+        outcome
+    ]
+    text = generate_latest(metrics.registry).decode()
+    assert f'gateway_provider_attempts_total{{outcome="{label}",provider="fake"}} 1.0' in text
+    if outcome != "success":
+        assert 'gateway_provider_attempts_total{outcome="success"' not in text

@@ -80,6 +80,7 @@ class ProviderExecutor:
         )
         attempt.succeeded(completion.usage)
         self._breakers[candidate.provider].release(permit, AttemptOutcome.SUCCESS)
+        self._observe(candidate.provider, attempt.started_at, "success")
         return completion
 
     async def stream(
@@ -89,6 +90,7 @@ class ProviderExecutor:
             candidates, deadline, ledger, _open_stream
         )
         outcome = AttemptOutcome.NEUTRAL
+        label = "cancelled"
         ended = False
         try:
             async with aclosing(events):
@@ -103,14 +105,17 @@ class ProviderExecutor:
                 if not ended:
                     raise InternalGatewayError("The provider stream ended unexpectedly.")
             outcome = AttemptOutcome.SUCCESS
+            label = "success"
         except BaseException as exc:
             attempt.failed(exc)
             outcome = outcome_of(exc)
+            label = _outcome_label(exc)
             raise
         finally:
             # A half-open probe remains occupied for the entire stream, including
             # slow-client pauses. Cancellation frees it without declaring recovery.
             self._breakers[candidate.provider].release(permit, outcome)
+            self._observe(candidate.provider, attempt.started_at, label)
 
     async def _first_success[T](
         self,
@@ -165,7 +170,7 @@ class ProviderExecutor:
                     may_have_processed=False,
                 )
             attempt = ledger.start(name)
-            started = time.perf_counter()
+            started = attempt.started_at
             try:
                 async with deadline.limit():
                     result = await run(provider, candidate.request)
@@ -189,7 +194,6 @@ class ProviderExecutor:
                 async with deadline.limit():
                     await self._sleep(delay)
                 continue
-            self._observe(name, started, "success")
             return result, attempt, permit
 
     def _retry_delay(self, exc: BaseException, attempt: int, deadline: Deadline) -> float | None:
@@ -241,6 +245,6 @@ async def _open_stream(provider: Provider, request: ProviderRequest) -> _OpenStr
 def _outcome_label(exc: BaseException) -> str:
     if isinstance(exc, GatewayError):
         return exc.error_type.value
-    if isinstance(exc, asyncio.CancelledError):
+    if isinstance(exc, asyncio.CancelledError | GeneratorExit):
         return "cancelled"
     return "internal_error"

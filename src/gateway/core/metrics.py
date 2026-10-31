@@ -77,7 +77,7 @@ class Metrics:
         )
         self.provider_attempt_duration = Histogram(
             "gateway_provider_attempt_duration_seconds",
-            "Duration of provider attempts; for streams, until the first event.",
+            "Provider attempt duration through completion or failure, including stream delivery.",
             ["provider"],
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,

@@ -12,6 +12,7 @@ token-per-minute limit as follows:
 Attempts are not free: two uncertain attempts are charged two reservations.
 """
 
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -28,6 +29,7 @@ class UsageStatus(StrEnum):
 @dataclass
 class Attempt:
     provider: str
+    started_at: float = field(default_factory=time.perf_counter)
     usage: Usage | None = None
     may_have_processed: bool = True
 

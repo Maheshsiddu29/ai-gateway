@@ -98,8 +98,10 @@ Each provider has a circuit breaker in each gateway process:
   that ends for an unrelated reason (client cancellation) frees its slot without
   deciding.
 
-A stream counts as a successful attempt once its first event arrives; a failure
-later in the stream is still counted as a provider failure.
+A stream counts as successful only after full completion. Attempt outcomes and
+duration metrics are recorded at completion, failure, or cancellation; streamed
+durations include client backpressure. The first event only closes the retry and
+fallback window.
 
 Breaker state is not shared between gateway instances. Each process opens and
 closes its breakers based on the traffic it sees, so with several replicas some may
