@@ -8,7 +8,7 @@ and incremental delivery without buffering.
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 
 import httpx
@@ -112,18 +112,32 @@ async def running(upstream: FakeUpstream) -> AsyncIterator[httpx.AsyncClient]:
             yield client
 
 
-async def eventually(condition: Callable[[], bool]) -> None:
-    async with asyncio.timeout(TIMEOUT_SECONDS):
-        while not condition():
-            await asyncio.sleep(0.01)
+class CompletionOutcomes(logging.Handler):
+    """Collects ``completion finished`` outcomes and signals when one arrives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.outcomes: list[str] = []
+        self.received = asyncio.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.getMessage() == "completion finished":
+            self.outcomes.append(record.__dict__["outcome"])
+            self.received.set()
 
 
-def completion_outcomes(caplog: pytest.LogCaptureFixture) -> list[object]:
-    return [
-        record.__dict__["outcome"]
-        for record in caplog.records
-        if record.getMessage() == "completion finished"
-    ]
+@pytest.fixture
+def completions_log() -> Iterator[CompletionOutcomes]:
+    handler = CompletionOutcomes()
+    logger = logging.getLogger("gateway.services.completion")
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 async def test_chunks_are_delivered_before_the_upstream_finishes() -> None:
@@ -135,7 +149,7 @@ async def test_chunks_are_delivered_before_the_upstream_finishes() -> None:
         client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response,
     ):
         lines = response.aiter_lines()
-        received = []
+        received: list[str] = []
         # The upstream is blocked after its first chunk, so this only completes
         # if the gateway forwards chunks as they arrive.
         while not any('"Hel"' in line for line in received):
@@ -149,10 +163,9 @@ async def test_chunks_are_delivered_before_the_upstream_finishes() -> None:
 
 
 async def test_client_disconnect_during_stream_closes_the_upstream_request(
-    caplog: pytest.LogCaptureFixture,
+    completions_log: CompletionOutcomes,
 ) -> None:
     upstream = FakeUpstream()
-    caplog.set_level(logging.INFO)
 
     async with running(upstream) as client, asyncio.timeout(TIMEOUT_SECONDS):
         async with client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response:
@@ -161,15 +174,17 @@ async def test_client_disconnect_during_stream_closes_the_upstream_request(
                     break
         # Leaving the block closes the client connection mid-stream.
         await upstream.connection_closed.wait()
-        await eventually(lambda: completion_outcomes(caplog) == ["cancelled"])
+        await completions_log.received.wait()
 
+    assert completions_log.outcomes == ["cancelled"]
     assert not upstream.release.is_set()
 
 
 async def test_client_disconnect_during_non_streaming_request_cancels_upstream_call(
-    caplog: pytest.LogCaptureFixture,
+    caplog: pytest.LogCaptureFixture, completions_log: CompletionOutcomes
 ) -> None:
     upstream = FakeUpstream()
+    caplog.set_level(logging.INFO)
     caplog.set_level(logging.INFO)
     body = {**STREAM_REQUEST, "stream": False}
 
@@ -179,8 +194,9 @@ async def test_client_disconnect_during_non_streaming_request_cancels_upstream_c
         request.cancel()
 
         await upstream.connection_closed.wait()
-        await eventually(lambda: completion_outcomes(caplog) == ["cancelled"])
+        await completions_log.received.wait()
 
+    assert completions_log.outcomes == ["cancelled"]
     access = [r for r in caplog.records if r.getMessage() == "request completed"]
     assert access[-1].__dict__["status_code"] == 499
 
