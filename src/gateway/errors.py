@@ -18,6 +18,7 @@ class ErrorType(StrEnum):
     PROVIDER_RATE_LIMITED = "provider_rate_limited"
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    DEADLINE_EXCEEDED = "deadline_exceeded"
     INTERNAL = "internal_error"
 
 
@@ -61,6 +62,14 @@ class UnsupportedCapabilityError(GatewayError):
 
 class InternalGatewayError(GatewayError):
     pass
+
+
+class DeadlineExceededError(GatewayError):
+    """The request's end-to-end deadline expired before it completed."""
+
+    error_type = ErrorType.DEADLINE_EXCEEDED
+    default_status_code = 504
+    default_code = "request_deadline_exceeded"
 
 
 class ProviderError(GatewayError):

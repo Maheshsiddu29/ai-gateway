@@ -3,9 +3,11 @@ import logging
 
 import pytest
 
+from gateway.core.metrics import Metrics
 from gateway.core.security import Principal
 from gateway.errors import InvalidRequestError, ProviderRateLimitError
 from gateway.providers.base import Completion, Usage
+from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import ChatCompletionRequest, ChatMessage
 from gateway.services.completion import CompletionService, ModelRoute
 from tests.fakes import FakeProvider
@@ -24,7 +26,7 @@ def make_service(
             default_max_tokens=default_max_tokens,
         )
     }
-    return CompletionService(routes, {provider.name: provider})
+    return CompletionService(routes, {provider.name: provider}, Metrics())
 
 
 def make_request(**fields: object) -> ChatCompletionRequest:
@@ -39,7 +41,9 @@ def make_request(**fields: object) -> ChatCompletionRequest:
 async def test_resolves_alias_to_upstream_model() -> None:
     provider = FakeProvider()
 
-    await make_service(provider).complete(make_request(temperature=0.3, stop=["x"]), PRINCIPAL)
+    await make_service(provider).complete(
+        make_request(temperature=0.3, stop=["x"]), PRINCIPAL, Deadline(60)
+    )
 
     [sent] = provider.requests
     assert sent.model == "upstream-model"
@@ -51,7 +55,7 @@ async def test_unknown_alias_is_rejected_without_calling_a_provider() -> None:
     provider = FakeProvider()
 
     with pytest.raises(InvalidRequestError) as exc_info:
-        await make_service(provider).complete(make_request(model="other"), PRINCIPAL)
+        await make_service(provider).complete(make_request(model="other"), PRINCIPAL, Deadline(60))
 
     assert exc_info.value.status_code == 404
     assert exc_info.value.code == "model_not_found"
@@ -65,7 +69,7 @@ async def test_default_max_tokens_applies_only_when_client_omits_it(
     provider = FakeProvider()
 
     await make_service(provider, default_max_tokens=256).complete(
-        make_request(max_tokens=requested), PRINCIPAL
+        make_request(max_tokens=requested), PRINCIPAL, Deadline(60)
     )
 
     assert provider.requests[0].max_tokens == expected
@@ -75,7 +79,7 @@ def test_routes_must_reference_known_providers() -> None:
     route = ModelRoute(alias="a", provider="missing", upstream_model="m", default_max_tokens=None)
 
     with pytest.raises(ValueError, match="missing"):
-        CompletionService({"a": route}, {})
+        CompletionService({"a": route}, {}, Metrics())
 
 
 async def test_logs_success_with_usage_but_without_content(
@@ -89,7 +93,9 @@ async def test_logs_success_with_usage_but_without_content(
     )
     caplog.set_level(logging.INFO)
 
-    await make_service(FakeProvider(completion=completion)).complete(make_request(), PRINCIPAL)
+    await make_service(FakeProvider(completion=completion)).complete(
+        make_request(), PRINCIPAL, Deadline(60)
+    )
 
     [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]
     assert record.__dict__["outcome"] == "success"
@@ -105,7 +111,9 @@ async def test_logs_provider_errors(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO)
 
     with pytest.raises(ProviderRateLimitError):
-        await make_service(FakeProvider(error=error)).complete(make_request(), PRINCIPAL)
+        await make_service(FakeProvider(error=error)).complete(
+            make_request(), PRINCIPAL, Deadline(60)
+        )
 
     [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]
     assert record.__dict__["outcome"] == "error"
@@ -118,7 +126,7 @@ async def test_logs_cancellation(caplog: pytest.LogCaptureFixture) -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await make_service(FakeProvider(error=asyncio.CancelledError())).complete(
-            make_request(), PRINCIPAL
+            make_request(), PRINCIPAL, Deadline(60)
         )
 
     [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]

@@ -95,6 +95,17 @@ required.
 
 Several aliases can point at the same provider and model.
 
+### Resilience
+
+```toml
+[resilience]
+request_deadline_seconds = 300
+```
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `request_deadline_seconds` | `300` | End-to-end limit for one request, from the start of request handling until the last response byte, including every provider attempt and, for streams, the whole stream. At most 3600. Expiry returns 504 `deadline_exceeded`, or ends a stream that has started with an error event. Provider timeouts still apply to each individual operation. |
+
 ## Production checks
 
 With `GATEWAY_ENVIRONMENT=production`, which is the default:

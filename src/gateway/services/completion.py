@@ -13,8 +13,15 @@ from contextlib import aclosing
 from dataclasses import dataclass
 
 from gateway.core.config import GatewayConfig
+from gateway.core.metrics import Metrics
 from gateway.core.security import Principal
-from gateway.errors import GatewayError, InternalGatewayError, InvalidRequestError, ProviderError
+from gateway.errors import (
+    DeadlineExceededError,
+    GatewayError,
+    InternalGatewayError,
+    InvalidRequestError,
+    ProviderError,
+)
 from gateway.providers.base import (
     Completion,
     Provider,
@@ -24,6 +31,7 @@ from gateway.providers.base import (
     TextDelta,
     Usage,
 )
+from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
@@ -50,18 +58,27 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
 
 
 class CompletionService:
-    def __init__(self, routes: Mapping[str, ModelRoute], providers: Mapping[str, Provider]) -> None:
+    def __init__(
+        self,
+        routes: Mapping[str, ModelRoute],
+        providers: Mapping[str, Provider],
+        metrics: Metrics,
+    ) -> None:
         missing = {route.provider for route in routes.values()} - providers.keys()
         if missing:
             raise ValueError(f"routes reference providers without adapters: {sorted(missing)}")
         self._routes = dict(routes)
         self._providers = dict(providers)
+        self._metrics = metrics
 
-    async def complete(self, request: ChatCompletionRequest, principal: Principal) -> Completion:
+    async def complete(
+        self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
+    ) -> Completion:
         route, provider = self._resolve(request.model)
-        trace = _CompletionTrace(principal, route, stream=False)
+        trace = _CompletionTrace(principal, route, self._metrics, stream=False)
         try:
-            completion = await provider.complete(_provider_request(request, route))
+            async with deadline.limit():
+                completion = await provider.complete(_provider_request(request, route))
         except BaseException as exc:
             trace.failed(exc)
             raise
@@ -69,19 +86,25 @@ class CompletionService:
         return completion
 
     async def stream(
-        self, request: ChatCompletionRequest, principal: Principal
+        self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
     ) -> AsyncGenerator[StreamEvent]:
         """Relay provider stream events, logging the outcome once the stream ends.
 
         Closing this generator early (client disconnect) closes the provider
-        stream and is logged as a cancellation.
+        stream and is logged as a cancellation. The deadline bounds each wait for
+        the next upstream event; the time a slow client takes to read is bounded by
+        the response (see api.streaming).
         """
         route, provider = self._resolve(request.model)
-        trace = _CompletionTrace(principal, route, stream=True)
+        trace = _CompletionTrace(principal, route, self._metrics, stream=True)
         end: StreamEnd | None = None
         try:
             async with aclosing(provider.stream(_provider_request(request, route))) as events:
-                async for event in events:
+                while True:
+                    async with deadline.limit():
+                        event = await anext(events, None)
+                    if event is None:
+                        break
                     if isinstance(event, TextDelta):
                         trace.first_token()
                     else:
@@ -126,8 +149,12 @@ class _CompletionTrace:
     Prompts and generated text are never recorded.
     """
 
-    def __init__(self, principal: Principal, route: ModelRoute, *, stream: bool) -> None:
+    def __init__(
+        self, principal: Principal, route: ModelRoute, metrics: Metrics, *, stream: bool
+    ) -> None:
         self._started = time.perf_counter()
+        self._metrics = metrics
+        self._stream = stream
         self._fields: dict[str, object] = {
             "principal_id": principal.id,
             "model_alias": route.alias,
@@ -156,6 +183,8 @@ class _CompletionTrace:
         if isinstance(exc, asyncio.CancelledError | GeneratorExit):
             self._emit(logging.INFO, "cancelled")
             return
+        if isinstance(exc, DeadlineExceededError):
+            self._metrics.deadline_exceeded.labels(str(self._stream).lower()).inc()
         if isinstance(exc, GatewayError):
             self._fields["error_type"] = exc.error_type.value
             self._fields["error_code"] = exc.code

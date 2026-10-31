@@ -21,8 +21,9 @@ from starlette.types import Receive, Scope, Send
 from gateway.api.disconnect import ClientDisconnectedError, run_until_disconnect
 from gateway.api.encoding import SSE_DONE, chunk_base, delta_chunk, sse_frame, usage_chunk
 from gateway.api.errors import error_payload
-from gateway.errors import GatewayError, InternalGatewayError
+from gateway.errors import DeadlineExceededError, GatewayError, InternalGatewayError
 from gateway.providers.base import StreamEnd, StreamEvent, TextDelta
+from gateway.resilience.deadline import Deadline
 
 logger = logging.getLogger(__name__)
 
@@ -66,26 +67,35 @@ async def encode_stream(
 
 
 class EventStreamResponse(StreamingResponse):
-    """A streaming response that always stops when the client disconnects.
+    """A streaming response that stops when the client disconnects or the deadline passes.
 
     Starlette's ``StreamingResponse`` only watches for disconnects on servers that
     report ASGI spec versions before 2.4, and it leaves the body generator to be
     finalized by the garbage collector when cancelled. This class watches on every
     server and closes the generator before returning, which closes the upstream
     connection deterministically.
+
+    The deadline here is a backstop for clients that stop reading: ``send`` then
+    blocks and the generator stays suspended, so the per-event deadline in the
+    completion service never runs. No error event can be delivered in that case;
+    the connection is closed.
     """
 
     media_type = "text/event-stream"
 
-    def __init__(self, content: AsyncGenerator[bytes]) -> None:
+    def __init__(self, deadline: Deadline, content: AsyncGenerator[bytes]) -> None:
         super().__init__(content, headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
+        self._deadline = deadline
         self._content = content
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            await run_until_disconnect(receive, self.stream_response(send))
+            async with self._deadline.limit():
+                await run_until_disconnect(receive, self.stream_response(send))
         except (ClientDisconnectedError, OSError):
             # OSError is how ASGI 2.4 servers report a write to a closed connection.
             logger.info("client disconnected during stream")
+        except DeadlineExceededError:
+            logger.warning("request deadline exceeded while sending a stream")
         finally:
             await self._content.aclose()

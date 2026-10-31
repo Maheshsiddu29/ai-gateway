@@ -27,3 +27,9 @@ class Metrics:
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
+        self.deadline_exceeded = Counter(
+            "gateway_deadline_exceeded",
+            "Completions that failed because the request deadline expired.",
+            ["stream"],
+            registry=self.registry,
+        )

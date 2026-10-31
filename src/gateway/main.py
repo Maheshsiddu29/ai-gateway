@@ -43,7 +43,7 @@ def build_app(
                 provider = provider_factory(name, provider_config, config.provider_api_keys[name])
                 stack.push_async_callback(provider.aclose)
                 providers[name] = provider
-            app.state.completion_service = CompletionService(routes, providers)
+            app.state.completion_service = CompletionService(routes, providers, app.state.metrics)
             try:
                 yield
             finally:
@@ -62,6 +62,7 @@ def build_app(
     app.state.authenticator = StaticKeyAuthenticator(settings.api_keys)
     app.state.completion_service = None
     app.state.metrics = Metrics()
+    app.state.resilience = config.gateway.resilience
 
     install_error_handlers(app)
     app.add_middleware(RequestContextMiddleware, metrics=app.state.metrics)

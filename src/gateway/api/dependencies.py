@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 from pydantic import ValidationError
 
-from gateway.core.config import Settings
+from gateway.core.config import ResilienceConfig, Settings
 from gateway.core.security import Authenticator, Principal, parse_bearer_token
 from gateway.errors import (
     AuthenticationError,
@@ -12,6 +12,7 @@ from gateway.errors import (
     InvalidRequestError,
     UnsupportedCapabilityError,
 )
+from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import KNOWN_UNSUPPORTED_PARAMETERS, ChatCompletionRequest
 from gateway.services.completion import CompletionService
 
@@ -19,6 +20,11 @@ from gateway.services.completion import CompletionService
 def get_settings(request: Request) -> Settings:
     settings: Settings = request.app.state.settings
     return settings
+
+
+def start_deadline(request: Request) -> Deadline:
+    resilience: ResilienceConfig = request.app.state.resilience
+    return Deadline(resilience.request_deadline_seconds)
 
 
 def get_completion_service(request: Request) -> CompletionService:
@@ -115,6 +121,7 @@ def _validation_error(exc: ValidationError) -> GatewayError:
     )
 
 
+DeadlineDep = Annotated[Deadline, Depends(start_deadline)]
 PrincipalDep = Annotated[Principal, Depends(require_principal)]
 CompletionRequestDep = Annotated[ChatCompletionRequest, Depends(read_completion_request)]
 CompletionServiceDep = Annotated[CompletionService, Depends(get_completion_service)]

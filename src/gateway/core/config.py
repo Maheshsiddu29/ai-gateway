@@ -122,11 +122,24 @@ class ModelConfig(BaseModel):
     default_max_tokens: int | None = Field(default=None, ge=1)
 
 
+# One hour; longer requests are better served by an asynchronous API.
+MAX_REQUEST_DEADLINE_SECONDS = 3600
+
+
+class ResilienceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # Covers the whole request: admission, every provider attempt and backoff
+    # delay, and for streams the time until the last event has been sent.
+    request_deadline_seconds: float = Field(default=300.0, gt=0, le=MAX_REQUEST_DEADLINE_SECONDS)
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     providers: dict[ProviderName, ProviderConfig] = Field(min_length=1)
     models: dict[ModelAlias, ModelConfig] = Field(min_length=1)
+    resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
 
     @model_validator(mode="after")
     def _check_model_providers(self) -> "GatewayConfig":

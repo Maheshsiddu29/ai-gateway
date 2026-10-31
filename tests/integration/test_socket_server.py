@@ -18,7 +18,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from starlette.routing import Route
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive
 
 from gateway.main import build_app
 from tests.fakes import AUTH_HEADERS, make_config, make_settings, openai_chunk, sse_body
@@ -27,11 +27,30 @@ TIMEOUT_SECONDS = 5
 STREAM_REQUEST = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "stream": True}
 
 
+class _DisconnectAwareResponse(StreamingResponse):
+    """Reports when the client (the gateway) disconnects.
+
+    A body generator cannot detect this itself: if it is suspended at a ``yield``
+    while the response is blocked writing, it is never resumed.
+    """
+
+    def __init__(
+        self, content: AsyncIterator[bytes], media_type: str, on_disconnect: asyncio.Event
+    ) -> None:
+        super().__init__(content, media_type=media_type)
+        self._on_disconnect = on_disconnect
+
+    async def listen_for_disconnect(self, receive: Receive) -> None:
+        await super().listen_for_disconnect(receive)
+        self._on_disconnect.set()
+
+
 class FakeUpstream:
     """An OpenAI-compatible upstream whose progress is controlled by the test."""
 
-    def __init__(self, *, fail_after_first_chunk: bool = False) -> None:
+    def __init__(self, *, fail_after_first_chunk: bool = False, endless: bool = False) -> None:
         self.fail_after_first_chunk = fail_after_first_chunk
+        self.endless = endless
         self.request_received = asyncio.Event()
         self.release = asyncio.Event()
         self.connection_closed = asyncio.Event()
@@ -42,30 +61,29 @@ class FakeUpstream:
     async def _handle(self, request: Request) -> StreamingResponse:
         stream = (await request.json())["stream"]
         self.request_received.set()
-        return StreamingResponse(
+        return _DisconnectAwareResponse(
             self._stream_body() if stream else self._json_body(),
             media_type="text/event-stream" if stream else "application/json",
+            on_disconnect=self.connection_closed,
         )
 
     async def _stream_body(self) -> AsyncIterator[bytes]:
-        try:
-            yield sse_body(openai_chunk("Hel"), done=False)
-            await self.release.wait()
-            if self.fail_after_first_chunk:
-                raise RuntimeError("simulated upstream crash")
-            yield sse_body(openai_chunk("lo", finish_reason="stop"))
-        except asyncio.CancelledError:
-            self.connection_closed.set()
-            raise
+        yield sse_body(openai_chunk("Hel"), done=False)
+        # Produce output for as long as the gateway keeps reading. uvicorn's send
+        # returns without suspending once the peer has gone, so yield to the loop
+        # explicitly to let the disconnect be noticed.
+        while self.endless:
+            yield sse_body(openai_chunk("x" * 65_536), done=False)
+            await asyncio.sleep(0)
+        await self.release.wait()
+        if self.fail_after_first_chunk:
+            raise RuntimeError("simulated upstream crash")
+        yield sse_body(openai_chunk("lo", finish_reason="stop"))
 
     async def _json_body(self) -> AsyncIterator[bytes]:
-        try:
-            await self.release.wait()
-            body = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
-            yield json.dumps(body).encode()
-        except asyncio.CancelledError:
-            self.connection_closed.set()
-            raise
+        await self.release.wait()
+        body = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+        yield json.dumps(body).encode()
 
 
 @asynccontextmanager
@@ -94,7 +112,9 @@ async def run_server(app: ASGIApp) -> AsyncIterator[str]:
 
 
 @asynccontextmanager
-async def running(upstream: FakeUpstream) -> AsyncIterator[httpx.AsyncClient]:
+async def running(
+    upstream: FakeUpstream, *, deadline_seconds: float = 60
+) -> AsyncIterator[httpx.AsyncClient]:
     async with run_server(upstream.app()) as upstream_url:
         config = make_config(
             {
@@ -102,6 +122,7 @@ async def running(upstream: FakeUpstream) -> AsyncIterator[httpx.AsyncClient]:
                     "upstream": {"type": "openai_compatible", "base_url": f"{upstream_url}/v1"}
                 },
                 "models": {"fast": {"provider": "upstream", "model": "m"}},
+                "resilience": {"request_deadline_seconds": deadline_seconds},
             },
             {"upstream": None},
         )
@@ -215,3 +236,18 @@ async def test_upstream_crash_mid_stream_is_reported_to_the_client() -> None:
     assert "data: [DONE]" not in lines
     error = json.loads(lines[-1].removeprefix("data: "))["error"]
     assert error["type"] == "provider_unavailable"
+
+
+async def test_deadline_closes_a_stream_whose_client_stopped_reading() -> None:
+    upstream = FakeUpstream(endless=True)
+
+    async with (
+        running(upstream, deadline_seconds=0.5) as client,
+        asyncio.timeout(TIMEOUT_SECONDS),
+        client.stream("POST", "/v1/chat/completions", json=STREAM_REQUEST) as response,
+    ):
+        lines = response.aiter_lines()
+        await anext(lines)
+        # Stop reading. Once socket buffers fill, the gateway's writes block and
+        # only the response-level deadline can end the request.
+        await upstream.connection_closed.wait()
