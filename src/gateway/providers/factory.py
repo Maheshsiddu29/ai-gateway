@@ -8,7 +8,7 @@ from gateway.core.config import (
     OpenAICompatibleProviderConfig,
     ProviderConfig,
 )
-from gateway.errors import ConfigurationError
+from gateway.providers.anthropic import AnthropicProvider
 from gateway.providers.base import Provider
 from gateway.providers.openai_compatible import OpenAICompatibleProvider
 
@@ -25,4 +25,4 @@ def build_provider(
         case OpenAICompatibleProviderConfig():
             return OpenAICompatibleProvider.from_config(name, config, api_key, transport)
         case AnthropicProviderConfig():
-            raise ConfigurationError("the anthropic provider type is not implemented yet")
+            return AnthropicProvider.from_config(name, config, api_key, transport)

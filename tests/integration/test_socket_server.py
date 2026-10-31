@@ -185,7 +185,6 @@ async def test_client_disconnect_during_non_streaming_request_cancels_upstream_c
 ) -> None:
     upstream = FakeUpstream()
     caplog.set_level(logging.INFO)
-    caplog.set_level(logging.INFO)
     body = {**STREAM_REQUEST, "stream": False}
 
     async with running(upstream) as client, asyncio.timeout(TIMEOUT_SECONDS):

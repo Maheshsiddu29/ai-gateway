@@ -39,6 +39,7 @@ ProviderName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 ModelAlias = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")]
 EnvVarName = Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+AnthropicApiVersion = Literal["2023-06-01", "2026-10-21"]
 
 
 class Environment(StrEnum):
@@ -103,7 +104,9 @@ class OpenAICompatibleProviderConfig(_ProviderConfigBase):
 class AnthropicProviderConfig(_ProviderConfigBase):
     type: Literal["anthropic"]
     api_key_env: EnvVarName
-    api_version: str = Field(default="2023-06-01", pattern=r"^\d{4}-\d{2}-\d{2}$")
+    # The adapter only sends request fields it knows each API version accepts, so
+    # only versions it has been written against are allowed.
+    api_version: AnthropicApiVersion = "2026-10-21"
 
 
 ProviderConfig = Annotated[
