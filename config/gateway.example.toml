@@ -1,0 +1,42 @@
+# Example gateway configuration. Copy to config/gateway.toml (ignored by git) and
+# replace the upstream model identifiers with models available to your accounts.
+#
+# This file must not contain secrets. Each provider names the environment
+# variable that holds its API key.
+
+[providers.openai]
+type = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+type = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+read_timeout_seconds = 300
+
+# A self-hosted OpenAI-compatible inference server on a private network.
+# Plain HTTP is rejected in production unless allow_insecure_http is set.
+[providers.local]
+type = "openai_compatible"
+base_url = "http://inference.internal:8000/v1"
+allow_insecure_http = true
+
+[models.fast]
+provider = "openai"
+model = "replace-with-openai-model-id"
+
+[models.balanced]
+provider = "anthropic"
+model = "replace-with-anthropic-model-id"
+# Anthropic requires max_tokens; this is used when the client omits it.
+default_max_tokens = 1024
+
+[models.quality]
+provider = "anthropic"
+model = "replace-with-anthropic-model-id"
+default_max_tokens = 4096
+
+[models.local]
+provider = "local"
+model = "replace-with-served-model-name"

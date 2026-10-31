@@ -1,0 +1,31 @@
+# Local development configuration backed by the mock upstream server in
+# tools/mock_upstream.py. The mock speaks both the OpenAI-compatible and the
+# Anthropic wire formats, so both provider adapters can be exercised without
+# vendor accounts.
+#
+# The base URLs assume the Compose service name; when running the mock directly
+# on the host, change them to http://127.0.0.1:9000.
+
+[providers.mock-openai]
+type = "openai_compatible"
+base_url = "http://mock-upstream:9000/v1"
+api_key_env = "MOCK_UPSTREAM_API_KEY"
+
+[providers.mock-anthropic]
+type = "anthropic"
+base_url = "http://mock-upstream:9000"
+api_key_env = "MOCK_UPSTREAM_API_KEY"
+
+[models.fast]
+provider = "mock-openai"
+model = "mock-small"
+
+[models.balanced]
+provider = "mock-anthropic"
+model = "mock-medium"
+default_max_tokens = 512
+
+[models.quality]
+provider = "mock-anthropic"
+model = "mock-large"
+default_max_tokens = 2048

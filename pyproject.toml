@@ -1,0 +1,73 @@
+[project]
+name = "ai-gateway"
+version = "0.1.0"
+description = "An asynchronous HTTP gateway exposing an OpenAI-compatible chat completion API over multiple LLM providers."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.170.14",
+    "mypy>=2.4.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1",
+    "ruff>=0.17.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gateway"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/gateway", "README.md", "pyproject.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests", "tools"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RET", "PT",
+    "ASYNC", "S", "BLE", "TID", "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use plain asserts and fixed, non-secret credentials.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = ["src", "tools"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tools"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "live: calls real provider APIs; skipped unless GATEWAY_LIVE_TESTS=1",
+]
+filterwarnings = ["error"]
