@@ -228,7 +228,9 @@ class TestLoadConfig:
     "path", sorted(Path(__file__).parents[2].joinpath("config").glob("*.toml")), ids=str
 )
 def test_repository_config_files_are_valid(path: Path) -> None:
-    settings = make_settings(path, environment=Environment.DEVELOPMENT)
+    settings = make_settings(
+        path, environment=Environment.DEVELOPMENT, redis_url="redis://redis:6379/0"
+    )
     environ = {
         "OPENAI_API_KEY": "x",
         "ANTHROPIC_API_KEY": "x",

@@ -5,6 +5,10 @@ formats, streaming and non-streaming, for the gateway's adapters to talk to it.
 Replies are deterministic. Reported "token" counts are whitespace-separated word
 counts, not real tokenizer output.
 
+For load tests it can delay responses (MOCK_RESPONSE_DELAY_SECONDS for whole
+responses, MOCK_STREAM_DELAY_SECONDS between streamed words) and reports the peak
+number of concurrent requests per model at GET /stats (POST /stats/reset clears it).
+
 Run with: uv run uvicorn mock_upstream:app --app-dir tools --port 9000
 """
 
@@ -12,6 +16,7 @@ import asyncio
 import json
 import os
 import time
+from collections import Counter
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -36,7 +41,35 @@ def _sse(data: dict[str, Any], event: str | None = None) -> bytes:
     return f"{prefix}data: {json.dumps(data)}\n\n".encode()
 
 
-def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
+class _InFlight:
+    """Concurrent requests per model, and the most seen at once."""
+
+    def __init__(self) -> None:
+        self.current: Counter[str] = Counter()
+        self.peak: Counter[str] = Counter()
+        self.total: Counter[str] = Counter()
+
+    def enter(self, model: str) -> None:
+        self.current[model] += 1
+        self.total[model] += 1
+        self.peak[model] = max(self.peak[model], self.current[model])
+
+    def leave(self, model: str) -> None:
+        self.current[model] -= 1
+
+    async def track(self, model: str, body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in body:
+                yield chunk
+        finally:
+            self.leave(model)
+
+
+def create_app(
+    stream_delay_seconds: float = 0.05, response_delay_seconds: float = 0.0
+) -> Starlette:
+    in_flight = _InFlight()
+
     async def words(text: str) -> AsyncIterator[str]:
         for index, word in enumerate(text.split(" ")):
             await asyncio.sleep(stream_delay_seconds)
@@ -53,8 +86,13 @@ def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
             "total_tokens": _prompt_words(body) + len(reply.split()),
         }
         base = {"id": "mock-chatcmpl", "created": int(time.time()), "model": body["model"]}
+        in_flight.enter(body["model"])
 
         if not body.get("stream"):
+            try:
+                await asyncio.sleep(response_delay_seconds)
+            finally:
+                in_flight.leave(body["model"])
             choice = {"index": 0, "message": {"role": "assistant", "content": reply}}
             return JSONResponse(
                 {
@@ -74,7 +112,9 @@ def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
                 yield _sse({**chunk, "choices": [], "usage": usage})
             yield b"data: [DONE]\n\n"
 
-        return StreamingResponse(chunks(), media_type="text/event-stream")
+        return StreamingResponse(
+            in_flight.track(body["model"], chunks()), media_type="text/event-stream"
+        )
 
     async def anthropic_messages(request: Request) -> Response:
         if not request.headers.get("x-api-key"):
@@ -83,8 +123,13 @@ def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
         body = await request.json()
         reply = _reply_for(body)
         input_tokens = _prompt_words(body)
+        in_flight.enter(body["model"])
 
         if not body.get("stream"):
+            try:
+                await asyncio.sleep(response_delay_seconds)
+            finally:
+                in_flight.leave(body["model"])
             return JSONResponse(
                 {
                     "id": "mock-msg",
@@ -122,7 +167,22 @@ def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
             yield _sse(end, "message_delta")
             yield _sse({"type": "message_stop"}, "message_stop")
 
-        return StreamingResponse(events(), media_type="text/event-stream")
+        return StreamingResponse(
+            in_flight.track(body["model"], events()), media_type="text/event-stream"
+        )
+
+    async def stats(_: Request) -> Response:
+        return JSONResponse(
+            {
+                model: {"peak_concurrent": in_flight.peak[model], "requests": total}
+                for model, total in in_flight.total.items()
+            }
+        )
+
+    async def reset_stats(_: Request) -> Response:
+        in_flight.peak.clear()
+        in_flight.total.clear()
+        return JSONResponse({})
 
     async def health(_: Request) -> Response:
         return JSONResponse({"status": "ok"})
@@ -132,8 +192,13 @@ def create_app(stream_delay_seconds: float = 0.05) -> Starlette:
             Route("/v1/chat/completions", openai_chat, methods=["POST"]),
             Route("/v1/messages", anthropic_messages, methods=["POST"]),
             Route("/health", health, methods=["GET"]),
+            Route("/stats", stats, methods=["GET"]),
+            Route("/stats/reset", reset_stats, methods=["POST"]),
         ]
     )
 
 
-app = create_app(float(os.environ.get("MOCK_STREAM_DELAY_SECONDS", "0.05")))
+app = create_app(
+    stream_delay_seconds=float(os.environ.get("MOCK_STREAM_DELAY_SECONDS", "0.05")),
+    response_delay_seconds=float(os.environ.get("MOCK_RESPONSE_DELAY_SECONDS", "0")),
+)

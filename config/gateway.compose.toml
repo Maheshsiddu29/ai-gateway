@@ -1,0 +1,45 @@
+# Configuration for compose.yaml: the mock provider, with admission control backed
+# by the Redis service. The same file serves every gateway instance in the stack.
+
+[providers.mock-openai]
+type = "openai_compatible"
+base_url = "http://mock-upstream:9000/v1"
+api_key_env = "MOCK_UPSTREAM_API_KEY"
+
+[providers.mock-anthropic]
+type = "anthropic"
+base_url = "http://mock-upstream:9000"
+api_key_env = "MOCK_UPSTREAM_API_KEY"
+
+[models.fast]
+provider = "mock-openai"
+model = "mock-small"
+max_output_tokens = 1024
+fallbacks = [{ provider = "mock-anthropic", model = "mock-small" }]
+
+[models.balanced]
+provider = "mock-anthropic"
+model = "mock-medium"
+default_max_tokens = 512
+max_output_tokens = 2048
+
+[models.quality]
+provider = "mock-anthropic"
+model = "mock-large"
+default_max_tokens = 2048
+max_output_tokens = 4096
+
+[resilience]
+request_deadline_seconds = 120
+
+[admission]
+enabled = true
+
+# Generous enough for local load tests to measure gateway overhead; lower them to
+# watch limits being enforced.
+[admission.default_limits]
+requests_per_minute = 6000
+request_burst = 1000
+tokens_per_minute = 6000000
+token_burst = 1000000
+max_concurrent_requests = 64

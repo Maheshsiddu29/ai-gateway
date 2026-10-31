@@ -27,6 +27,8 @@ jobs:
           version: ${{ env.UV_VERSION }}
       - name: Install dependencies from the lockfile
         run: uv sync --locked
+      - name: Install Redis for the admission-control integration tests
+        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends redis-server
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format
@@ -37,6 +39,9 @@ jobs:
         run: uv run pytest tests/unit
       - name: Integration tests
         run: uv run pytest tests/integration
+        env:
+          # Fail instead of skipping when redis-server is missing.
+          GATEWAY_REQUIRE_REDIS_TESTS: "1"
 
   package:
     name: Package build
@@ -54,8 +59,16 @@ jobs:
           uv venv --python 3.13 /tmp/wheel-check
           uv pip install --python /tmp/wheel-check dist/*.whl
           /tmp/wheel-check/bin/python -c "import gateway.main"
-      - name: Build the container image
-        run: docker build --target runtime --tag ai-gateway:ci .
+      - name: Build the container images
+        run: |
+          docker build --target runtime --tag ai-gateway:ci .
+          docker build --target mock-upstream --tag ai-gateway-mock:ci .
+      - name: Validate the Compose configuration
+        env:
+          GATEWAY_API_KEYS: ci-placeholder-key
+        run: |
+          docker compose config --quiet
+          docker compose --profile multi config --quiet
 
   security:
     name: Dependency audit and secret scan

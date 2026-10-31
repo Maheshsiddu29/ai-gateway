@@ -1,5 +1,11 @@
-# Local development stack: the gateway backed by the mock provider.
+# Local development stack: gateway, mock provider, and Redis for admission control.
 # Requires GATEWAY_API_KEYS in the shell or in .env (see .env.example).
+#
+#   docker compose up --build                  one gateway on 127.0.0.1:8000
+#   docker compose --profile multi up --build  a second gateway on 127.0.0.1:8001
+#
+# Redis is reachable only on the internal backend network. Its data is not
+# persisted, so limits reset when the container restarts.
 
 x-hardening: &hardening
   read_only: true
@@ -7,29 +13,67 @@ x-hardening: &hardening
   security_opt: ["no-new-privileges:true"]
   tmpfs: [/tmp]
 
+x-gateway: &gateway
+  <<: *hardening
+  build:
+    context: .
+    target: runtime
+  environment:
+    GATEWAY_ENVIRONMENT: development
+    GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in the shell or .env}
+    GATEWAY_LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-INFO}
+    GATEWAY_REDIS_URL: redis://redis:6379/0
+    # The mock only checks that a key is present; this is not a real credential.
+    MOCK_UPSTREAM_API_KEY: mock-upstream-key
+  volumes:
+    - ./config/gateway.compose.toml:/etc/gateway/gateway.toml:ro
+  networks: [frontend, backend]
+  depends_on:
+    mock-upstream:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  stop_grace_period: 35s
+
 services:
   gateway:
-    <<: *hardening
-    build:
-      context: .
-      target: runtime
+    <<: *gateway
     ports:
       - "127.0.0.1:8000:8000"
-    environment:
-      GATEWAY_ENVIRONMENT: development
-      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in the shell or .env}
-      GATEWAY_LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-INFO}
-      # The mock only checks that a key is present; this is not a real credential.
-      MOCK_UPSTREAM_API_KEY: mock-upstream-key
-    volumes:
-      - ./config/gateway.mock.toml:/etc/gateway/gateway.toml:ro
-    depends_on:
-      mock-upstream:
-        condition: service_healthy
-    stop_grace_period: 35s
+
+  gateway-2:
+    <<: *gateway
+    profiles: [multi]
+    ports:
+      - "127.0.0.1:8001:8000"
 
   mock-upstream:
     <<: *hardening
     build:
       context: .
       target: mock-upstream
+    environment:
+      MOCK_RESPONSE_DELAY_SECONDS: ${MOCK_RESPONSE_DELAY_SECONDS:-0}
+      MOCK_STREAM_DELAY_SECONDS: ${MOCK_STREAM_DELAY_SECONDS:-0.05}
+    # Published on localhost only, so load tests can measure a baseline without the
+    # gateway and read the mock's concurrency statistics.
+    ports:
+      - "127.0.0.1:9000:9000"
+    networks: [frontend, backend]
+
+  redis:
+    <<: *hardening
+    image: redis:8.10.3-alpine@sha256:21090af93f8324db2f0f0f4f38a7c60369d47d917e000c3423d89d2ae2883537
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [backend]
+    stop_grace_period: 10s
+
+networks:
+  frontend: {}
+  backend:
+    internal: true
