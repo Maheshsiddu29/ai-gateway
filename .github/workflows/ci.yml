@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.13.6"
+
+jobs:
+  checks:
+    name: Lint, types, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install dependencies from the lockfile
+        run: uv sync --locked
+      - name: Ruff lint
+        run: uv run ruff check .
+      - name: Ruff format
+        run: uv run ruff format --check .
+      - name: mypy
+        run: uv run mypy
+      - name: Unit tests
+        run: uv run pytest tests/unit
+      - name: Integration tests
+        run: uv run pytest tests/integration
+
+  package:
+    name: Package build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Install the wheel into a clean environment and import it
+        run: |
+          uv venv --python 3.13 /tmp/wheel-check
+          uv pip install --python /tmp/wheel-check dist/*.whl
+          /tmp/wheel-check/bin/python -c "import gateway.main"
+      - name: Build the container image
+        run: docker build --target runtime --tag ai-gateway:ci .
+
+  security:
+    name: Dependency audit and secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Audit runtime dependencies for known vulnerabilities
+        run: |
+          uv export --locked --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt
+          uvx --from pip-audit==2.10.1 pip-audit --strict --require-hashes --disable-pip -r /tmp/requirements.txt
+      - name: Scan the repository history for secrets
+        run: docker run --rm -v "$PWD:/repo:ro" ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git /repo --redact --no-banner
