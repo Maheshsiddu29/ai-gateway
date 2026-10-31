@@ -14,14 +14,14 @@ interrupted stream from a complete one.
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from starlette.responses import StreamingResponse
 from starlette.types import Receive, Scope, Send
 
 from gateway.api.disconnect import ClientDisconnectedError, run_until_disconnect
 from gateway.api.encoding import SSE_DONE, chunk_base, delta_chunk, sse_frame, usage_chunk
-from gateway.api.errors import error_payload
+from gateway.api.errors import error_payload, error_response
 from gateway.errors import DeadlineExceededError, GatewayError, InternalGatewayError
 from gateway.providers.base import StreamEnd, StreamEvent, TextDelta
 from gateway.resilience.deadline import Deadline
@@ -93,13 +93,22 @@ class EventStreamResponse(StreamingResponse):
 
     media_type = "text/event-stream"
 
-    def __init__(self, deadline: Deadline, content: AsyncGenerator[bytes]) -> None:
+    def __init__(
+        self,
+        deadline: Deadline,
+        content: AsyncGenerator[bytes],
+        *,
+        close_upstream: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         super().__init__(content, headers={"cache-control": "no-cache", "x-accel-buffering": "no"})
         self._deadline = deadline
         self._content = content
+        self._close_upstream = close_upstream
+        self._started = False
 
     async def stream_response(self, send: Send) -> None:
         async with self._deadline.limit():
+            self._started = True
             await send(
                 {
                     "type": "http.response.start",
@@ -134,7 +143,17 @@ class EventStreamResponse(StreamingResponse):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
             await run_until_disconnect(receive, self.stream_response(send))
+        except DeadlineExceededError as exc:
+            if self._started:
+                raise
+            await error_response(exc)(scope, receive, send)
         except (ClientDisconnectedError, OSError, TimeoutError):
             logger.info("client disconnected or stopped reading during stream")
         finally:
-            await self._content.aclose()
+            try:
+                await self._content.aclose()
+            finally:
+                # Closing an unstarted async generator does not run its finally
+                # block. The prefetched provider must also be closed explicitly.
+                if self._close_upstream is not None:
+                    await self._close_upstream()

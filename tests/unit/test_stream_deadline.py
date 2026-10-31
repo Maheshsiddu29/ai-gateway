@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator
 
+import httpx
 from starlette.types import Message
 
 from gateway.api.streaming import EventStreamResponse
@@ -32,3 +33,31 @@ async def test_response_deadline_sends_error_and_completes_asgi_body() -> None:
     assert b'"type":"deadline_exceeded"' in messages[-2]["body"]
     assert messages[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
     assert not any(b"[DONE]" in m.get("body", b"") for m in messages)
+
+
+async def test_expiry_before_response_start_closes_the_prefetched_provider() -> None:
+    clock = [100.0]
+    deadline = Deadline(1, clock=lambda: clock[0])
+    released = asyncio.Event()
+
+    async def provider() -> AsyncGenerator[bytes]:
+        try:
+            yield b"prefetched"
+        finally:
+            released.set()
+
+    upstream = provider()
+    assert await anext(upstream) == b"prefetched"
+
+    async def unstarted_encoder() -> AsyncGenerator[bytes]:
+        async for chunk in upstream:
+            yield chunk
+
+    response = EventStreamResponse(deadline, unstarted_encoder(), close_upstream=upstream.aclose)
+    clock[0] += 2
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=response), base_url="http://test"
+    ) as client:
+        result = await client.get("/")
+    assert result.status_code == 504
+    assert released.is_set()

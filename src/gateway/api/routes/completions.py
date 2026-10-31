@@ -47,6 +47,7 @@ async def create_chat_completion(
                 model=body.model,
                 include_usage=body.include_usage,
             ),
+            close_upstream=events.aclose,
         )
 
     completion = await run_until_disconnect(

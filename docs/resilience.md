@@ -129,3 +129,8 @@ to deliver a terminal error event to a reading client; a blocked connection is
 closed. Cleanup may additionally wait up to the configured Redis operation timeout.
 The success sentinel is sent only after provider exhaustion and settlement. Stalled
 request-body uploads are also interrupted by the same request deadline.
+
+If the deadline expires after prefetch but before response headers, the response
+returns a JSON 504 and explicitly closes the prefetched provider stream. Closing
+an encoder that has never started is insufficient: Python does not execute its
+`finally` block in that case.
