@@ -1,0 +1,203 @@
+{
+  "source_commit": "330234a",
+  "hardware": {
+    "cpu": "Apple M3 Pro",
+    "cpu_cores": 12,
+    "ram_bytes": 19327352832,
+    "macos": "26.2",
+    "docker_engine": "29.6.2",
+    "docker_vm_cpus": 12,
+    "docker_vm_memory_bytes": 8321232896
+  },
+  "python": "3.13.18",
+  "redis_compose": "8.10.3",
+  "mock_response_delay_seconds": 0.05,
+  "limits": {
+    "max_concurrent_requests": 64,
+    "request_burst": 1000,
+    "requests_per_minute": 6000,
+    "token_burst": 1000000,
+    "tokens_per_minute": 6000000
+  },
+  "method": "One run per scenario, closed-loop, all-response latency percentiles, no test suite concurrently. Docker stats samples are working-set estimates, not absolute RSS peaks. Redis FLUSHDB and mock statistics reset before each scenario.",
+  "results": [
+    {
+      "name": "baseline",
+      "requests": 500,
+      "concurrency": 4,
+      "elapsed_seconds": 7.2902270830236375,
+      "requests_per_second": 68.58496920683353,
+      "statuses": {
+        "200": 500
+      },
+      "p50_ms": 57.56556254345924,
+      "p95_ms": 61.97501636343077,
+      "p99_ms": 63.977126992540434,
+      "provider": {
+        "mock-small": {
+          "peak_concurrent": 4,
+          "requests": 500
+        }
+      },
+      "leftover_lease_keys": "",
+      "unsettled_records": 0,
+      "sampled_peak_memory_mib": {
+        "gateway-audit-gateway-1": 47.76,
+        "gateway-audit-gateway-2-1": 47.76,
+        "gateway-audit-mock-upstream-1": 22.37,
+        "gateway-audit-redis-1": 11.77
+      },
+      "memory_samples_mib": [
+        {
+          "gateway-audit-gateway-1": 47.76,
+          "gateway-audit-gateway-2-1": 47.76,
+          "gateway-audit-mock-upstream-1": 22.37,
+          "gateway-audit-redis-1": 11.77
+        },
+        {
+          "gateway-audit-gateway-1": 47.76,
+          "gateway-audit-gateway-2-1": 47.76,
+          "gateway-audit-mock-upstream-1": 21.55,
+          "gateway-audit-redis-1": 11.55
+        },
+        {
+          "gateway-audit-gateway-1": 47.76,
+          "gateway-audit-gateway-2-1": 47.76,
+          "gateway-audit-mock-upstream-1": 21.74,
+          "gateway-audit-redis-1": 11.52
+        },
+        {
+          "gateway-audit-gateway-1": 47.76,
+          "gateway-audit-gateway-2-1": 47.76,
+          "gateway-audit-mock-upstream-1": 21.8,
+          "gateway-audit-redis-1": 11.52
+        }
+      ]
+    },
+    {
+      "name": "gateway",
+      "requests": 500,
+      "concurrency": 4,
+      "elapsed_seconds": 8.049139334005304,
+      "requests_per_second": 62.11844263741882,
+      "statuses": {
+        "200": 500
+      },
+      "p50_ms": 62.89766647387296,
+      "p95_ms": 73.04098757449538,
+      "p99_ms": 79.43617505254224,
+      "provider": {
+        "mock-small": {
+          "peak_concurrent": 4,
+          "requests": 500
+        }
+      },
+      "leftover_lease_keys": "",
+      "unsettled_records": 0,
+      "sampled_peak_memory_mib": {
+        "gateway-audit-gateway-1": 48.99,
+        "gateway-audit-gateway-2-1": 48.87,
+        "gateway-audit-mock-upstream-1": 21.58,
+        "gateway-audit-redis-1": 12.59
+      },
+      "memory_samples_mib": [
+        {
+          "gateway-audit-gateway-1": 48.17,
+          "gateway-audit-gateway-2-1": 48.17,
+          "gateway-audit-mock-upstream-1": 21.31,
+          "gateway-audit-redis-1": 12.11
+        },
+        {
+          "gateway-audit-gateway-1": 48.99,
+          "gateway-audit-gateway-2-1": 48.26,
+          "gateway-audit-mock-upstream-1": 21.32,
+          "gateway-audit-redis-1": 12.59
+        },
+        {
+          "gateway-audit-gateway-1": 48.3,
+          "gateway-audit-gateway-2-1": 48.58,
+          "gateway-audit-mock-upstream-1": 21.31,
+          "gateway-audit-redis-1": 12.12
+        },
+        {
+          "gateway-audit-gateway-1": 48.34,
+          "gateway-audit-gateway-2-1": 48.63,
+          "gateway-audit-mock-upstream-1": 21.58,
+          "gateway-audit-redis-1": 12.11
+        },
+        {
+          "gateway-audit-gateway-1": 48.58,
+          "gateway-audit-gateway-2-1": 48.87,
+          "gateway-audit-mock-upstream-1": 21.32,
+          "gateway-audit-redis-1": 12.35
+        }
+      ]
+    },
+    {
+      "name": "saturation",
+      "requests": 1000,
+      "concurrency": 128,
+      "elapsed_seconds": 9.968901750049554,
+      "requests_per_second": 100.3119526175518,
+      "statuses": {
+        "200": 936,
+        "429": 64
+      },
+      "p50_ms": 709.5561250462197,
+      "p95_ms": 3574.0707370918244,
+      "p99_ms": 5453.723407076905,
+      "provider": {
+        "mock-small": {
+          "peak_concurrent": 62,
+          "requests": 936
+        }
+      },
+      "leftover_lease_keys": "",
+      "unsettled_records": 0,
+      "sampled_peak_memory_mib": {
+        "gateway-audit-gateway-1": 64.5,
+        "gateway-audit-gateway-2-1": 65.46,
+        "gateway-audit-mock-upstream-1": 33.0,
+        "gateway-audit-redis-1": 13.38
+      },
+      "memory_samples_mib": [
+        {
+          "gateway-audit-gateway-1": 52.18,
+          "gateway-audit-gateway-2-1": 53.23,
+          "gateway-audit-mock-upstream-1": 21.82,
+          "gateway-audit-redis-1": 13.13
+        },
+        {
+          "gateway-audit-gateway-1": 52.44,
+          "gateway-audit-gateway-2-1": 53.0,
+          "gateway-audit-mock-upstream-1": 21.81,
+          "gateway-audit-redis-1": 13.38
+        },
+        {
+          "gateway-audit-gateway-1": 51.99,
+          "gateway-audit-gateway-2-1": 52.71,
+          "gateway-audit-mock-upstream-1": 21.66,
+          "gateway-audit-redis-1": 13.16
+        },
+        {
+          "gateway-audit-gateway-1": 52.07,
+          "gateway-audit-gateway-2-1": 53.4,
+          "gateway-audit-mock-upstream-1": 21.8,
+          "gateway-audit-redis-1": 13.17
+        },
+        {
+          "gateway-audit-gateway-1": 52.32,
+          "gateway-audit-gateway-2-1": 53.16,
+          "gateway-audit-mock-upstream-1": 21.8,
+          "gateway-audit-redis-1": 13.17
+        },
+        {
+          "gateway-audit-gateway-1": 64.5,
+          "gateway-audit-gateway-2-1": 65.46,
+          "gateway-audit-mock-upstream-1": 33.0,
+          "gateway-audit-redis-1": 12.83
+        }
+      ]
+    }
+  ]
+}
