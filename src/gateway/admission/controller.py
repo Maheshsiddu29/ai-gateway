@@ -4,8 +4,15 @@ Failure policy: any Redis error or timeout while admitting refuses the request w
 ``admission_unavailable``. There is no local fallback, so a Redis outage never
 silently disables limits.
 
-Lost replies: if an admission call fails or is cancelled after the command was
-sent, it may still have committed. The controller then settles the reservation with
+Broken connections: a pooled connection can break without the client noticing (for
+example when Redis restarts behind a container network), so its next command fails.
+Both scripts are idempotent for a reservation ID, so after a connection error the
+call is repeated once, with the same ID, on a new connection, within the same
+operation timeout. A repeated admission that had already committed reports itself as
+admitted without charging again.
+
+Lost replies: if an admission call still fails, or is cancelled, after the command was
+sent, it may have committed. The controller then settles the reservation with
 zero tokens. Settlement is idempotent and, if it runs before a delayed admission,
 prevents that admission from committing, so either way no lease is left behind.
 If the release also fails, the lease expires on its own and the reserved tokens stay
@@ -20,10 +27,11 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from math import ceil
 from typing import Any, Protocol
 
+from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
 
 from gateway.admission.limits import KeyLimits
@@ -104,7 +112,7 @@ class AdmissionController:
         started = time.perf_counter()
         try:
             async with deadline.limit(), asyncio.timeout(self._timeout):
-                decision = await self._store.admit(admission)
+                decision = await _with_reconnect(lambda: self._store.admit(admission))
         except (*_REDIS_FAILURES, DeadlineExceededError, asyncio.CancelledError) as exc:
             self._release_unconfirmed(admission)
             if isinstance(exc, DeadlineExceededError | asyncio.CancelledError):
@@ -163,7 +171,9 @@ class AdmissionController:
         }
         try:
             async with asyncio.timeout(self._timeout):
-                outcome = await self._store.settle(admission, charge.tokens)
+                outcome = await _with_reconnect(
+                    lambda: self._store.settle(admission, charge.tokens)
+                )
         except _REDIS_FAILURES as exc:
             self._metrics.redis_errors.labels("settle").inc()
             self._metrics.reservations_settled.labels("failed").inc()
@@ -198,6 +208,18 @@ class AdmissionController:
                 "retry_after_ms": decision.retry_after_ms,
             },
         )
+
+
+async def _with_reconnect[T](call: Callable[[], Awaitable[T]]) -> T:
+    """Repeat an idempotent call once if its connection was broken.
+
+    redis-py discards a connection that fails, so the second call uses a new one.
+    Timeouts are not repeated: the server may still be executing the first call.
+    """
+    try:
+        return await call()
+    except RedisConnectionError:
+        return await call()
 
 
 def _identifiers(admission: Admission) -> dict[str, object]:

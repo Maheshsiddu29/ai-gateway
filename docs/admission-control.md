@@ -141,8 +141,9 @@ Redis is part of the admission decision. With admission enabled:
 - Every Redis call is bounded by `redis_operation_timeout_seconds` and by the
   remaining request deadline. Connections come from a bounded pool
   (`redis_max_connections`, waiting at most `redis_pool_timeout_seconds`).
-- redis-py's automatic command retries are disabled. Each request makes at most
-  one admission call.
+- redis-py's automatic command retries are disabled, because they are not aware of
+  idempotency. The gateway repeats a call only after a connection error, once, with
+  the same reservation ID (see Restart below).
 - `/health/ready` pings Redis and returns 503 when it does not answer.
 
 **Lost replies.** If the admission call fails or is cancelled after the command
@@ -158,9 +159,14 @@ If settlement itself fails (`reservation unresolved` in the logs, and the
 after its TTL and the reserved tokens stay charged: the gateway errs towards
 under-admission.
 
-**Restart.** Requests made while Redis is down are refused. Pooled connections
-that the server closed are detected when next checked out of the pool and
-re-established, so admission resumes with the first request after Redis is back.
+**Restart.** Requests made while Redis is down are refused. A pooled connection can
+break without the client noticing, for example when Redis restarts behind a
+container network, and then fails on its next command. Because both scripts are
+idempotent for a reservation ID, a call that fails with a connection error is
+repeated once, with the same ID, on a new connection and within the same operation
+timeout. A repeated admission that had already committed reports itself as admitted
+without charging again. Timeouts are not repeated, because the server may still be
+running the first call.
 
 ## Consistency and durability assumptions
 

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 from pydantic import SecretStr
@@ -40,6 +41,19 @@ def controller_for(store: AdmissionStore) -> AdmissionController:
     )
 
 
+@asynccontextmanager
+async def proxied_controller(proxy: ReplyDroppingProxy) -> AsyncIterator[AdmissionController]:
+    """A controller connected through the proxy; waits for its background settlements
+    and closes its connections on exit, including when the test fails."""
+    client = create_redis_client(SecretStr(proxy.url), AdmissionConfig())
+    controller = controller_for(RedisAdmissionStore(client))
+    try:
+        yield controller
+    finally:
+        await controller.aclose()
+        await client.aclose(close_connection_pool=True)
+
+
 @pytest.fixture
 async def proxy(redis_server: RedisServer) -> AsyncIterator[ReplyDroppingProxy]:
     proxy = ReplyDroppingProxy(redis_server.socket_path)
@@ -59,20 +73,37 @@ async def test_lost_admission_reply_is_refused_and_the_reservation_released(
     direct = RedisAdmissionStore(redis_client)
     await direct.admit(warmup)
     await direct.settle(warmup, 0)
-    proxied = create_redis_client(SecretStr(proxy.url), AdmissionConfig())
-    controller = controller_for(RedisAdmissionStore(proxied))
     proxy.drop_script_replies = True
 
-    with pytest.raises(AdmissionUnavailableError):
-        await controller.admit(PRINCIPAL, LIMITS, tokens=400, deadline=Deadline(10))
-    await controller.aclose()
-    await proxied.aclose(close_connection_pool=True)
+    async with proxied_controller(proxy) as controller:
+        with pytest.raises(AdmissionUnavailableError):
+            await controller.admit(PRINCIPAL, LIMITS, tokens=400, deadline=Deadline(10))
 
-    # Both the admission and the release ran in Redis although neither reply arrived.
-    assert proxy.dropped_replies == 2
+    # The admission and the release each ran (and were repeated once after the broken
+    # connection) although no reply arrived. The repeats did not charge twice.
+    assert proxy.dropped_replies == 4
     assert await redis_client.zcard(f"{STATE}:leases") == 0
     [reservation] = [key async for key in redis_client.scan_iter(f"{STATE}:reservation:*")]
     assert await redis_client.hget(reservation, "state") == "settled"
+    assert float(await redis_client.hget(f"{STATE}:tokens", "tokens") or 0) == pytest.approx(
+        1000, abs=2
+    )
+
+
+async def test_a_silently_broken_connection_is_replaced_without_refusing_the_request(
+    proxy: ReplyDroppingProxy, redis_client: Redis
+) -> None:
+    async with proxied_controller(proxy) as controller:
+        first = await controller.admit(PRINCIPAL, LIMITS, tokens=100, deadline=Deadline(10))
+        await controller.settle(first, UsageLedger())
+
+        proxy.break_open_connections()
+        second = await controller.admit(PRINCIPAL, LIMITS, tokens=100, deadline=Deadline(10))
+        proxy.break_open_connections()
+        await controller.settle(second, UsageLedger())
+
+    assert await redis_client.zcard(f"{STATE}:leases") == 0
+    # Each request was charged once despite the repeated calls.
     assert float(await redis_client.hget(f"{STATE}:tokens", "tokens") or 0) == pytest.approx(
         1000, abs=2
     )
