@@ -43,3 +43,42 @@ request_burst = 1000
 tokens_per_minute = 6000000
 token_burst = 1000000
 max_concurrent_requests = 64
+
+[cost]
+enabled = true
+
+[cost.default_key_limits]
+daily_micro_usd = 1000000
+monthly_micro_usd = 10000000
+
+[[cost.pricing]]
+provider = "mock-openai"
+model = "mock-small"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"
+
+[[cost.pricing]]
+provider = "mock-anthropic"
+model = "mock-small"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"
+
+[[cost.pricing]]
+provider = "mock-anthropic"
+model = "mock-medium"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"
+
+[[cost.pricing]]
+provider = "mock-anthropic"
+model = "mock-large"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"

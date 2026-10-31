@@ -55,6 +55,9 @@ CMD ["uvicorn", "mock_upstream:app", "--app-dir", "/opt/mock", "--host", "0.0.0.
 # configuration file at GATEWAY_CONFIG_FILE and pass keys as environment variables.
 FROM base AS runtime
 ENV GATEWAY_CONFIG_FILE=/etc/gateway/gateway.toml
+WORKDIR /opt/gateway
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2)"]

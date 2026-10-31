@@ -23,6 +23,7 @@ x-gateway: &gateway
     GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in the shell or .env}
     GATEWAY_LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-INFO}
     GATEWAY_REDIS_URL: redis://redis:6379/0
+    GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway-local-only@postgres:5432/gateway
     # The mock only checks that a key is present; this is not a real credential.
     MOCK_UPSTREAM_API_KEY: mock-upstream-key
   volumes:
@@ -33,6 +34,8 @@ x-gateway: &gateway
       condition: service_healthy
     redis:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
   stop_grace_period: 35s
 
 services:
@@ -73,7 +76,37 @@ services:
     networks: [backend]
     stop_grace_period: 10s
 
+  postgres:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway-local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    environment:
+      GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway-local-only@postgres:5432/gateway
+    command: ["alembic", "upgrade", "head"]
+    networks: [backend]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 networks:
   frontend: {}
   backend:
     internal: true
+
+volumes:
+  postgres-data: {}
