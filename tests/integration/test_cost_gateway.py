@@ -9,8 +9,10 @@ from functools import partial
 import httpx
 import pytest
 from pydantic import SecretStr
+from redis.asyncio import Redis
 from sqlalchemy import text
 
+from gateway.admission.redis_store import KEY_PREFIX
 from gateway.core.security import StaticKeyAuthenticator
 from gateway.main import build_app
 from gateway.providers.base import Completion
@@ -52,7 +54,14 @@ async def gateway_cost(
     raw: dict[str, object] = {
         "providers": {"fake": {"type": "openai_compatible", "base_url": "https://fake.test/v1"}},
         "models": {"fast": {"provider": "fake", "model": "mock", "max_output_tokens": 100}},
-        "admission": {"enabled": True, "default_limits": {"max_concurrent_requests": 10}},
+        "admission": {
+            "enabled": True,
+            "default_limits": {
+                "max_concurrent_requests": 10,
+                "tokens_per_minute": 1000,
+                "token_burst": 1000,
+            },
+        },
         "cost": {
             "enabled": True,
             "pricing": [
@@ -85,6 +94,7 @@ async def gateway_cost(
 
 async def test_budget_denial_blocks_upstream_and_analytics_are_scoped(
     gateway_cost: tuple[httpx.AsyncClient, FakeProvider, str, str, str],
+    redis_server: RedisServer,
 ) -> None:
     client, provider, first_key, second_key, team_id = gateway_cost
     body = {"model": "fast", "messages": [{"role": "user", "content": "hi"}]}
@@ -111,6 +121,14 @@ async def test_budget_denial_blocks_upstream_and_analytics_are_scoped(
     assert budgets.json()["items"][0]["spent_micro_usd"] == 100
     assert team.json()["items"][0]["spent_micro_usd"] == 100
     assert forbidden.status_code == 403
+    redis = Redis.from_url(redis_server.url, decode_responses=True)
+    try:
+        prefix = f"{KEY_PREFIX}:{{{_key_id(second_key)}}}:reservation:*"
+        records = [await redis.hgetall(key) async for key in redis.scan_iter(prefix)]
+        assert len(records) == 1
+        assert records[0]["charged"] == "0"
+    finally:
+        await redis.aclose(close_connection_pool=True)
 
 
 async def test_analytics_range_is_bounded(

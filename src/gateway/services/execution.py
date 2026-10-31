@@ -207,6 +207,8 @@ class ProviderExecutor:
                     result = await run(provider, candidate.request)
             except BaseException as exc:
                 attempt.failed(exc)
+                if not dispatched:
+                    attempt.may_have_processed = False
                 breaker.release(permit, outcome_of(exc))
                 self._observe(name, started, _outcome_label(exc))
                 if cost is not None and attempt.cost_attempt_id is not None:
