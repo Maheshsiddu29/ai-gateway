@@ -16,9 +16,22 @@ ENV UV_COMPILE_BYTECODE=1 \
 WORKDIR /build
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
-COPY README.md ./
+COPY README.md LICENSE ./
 COPY src ./src
 RUN uv sync --locked --no-dev --no-editable
+
+# Linux regression environment using the Redis 7.0 package from Debian bookworm.
+# This stage is never part of the runtime image.
+FROM builder AS validation
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends redis-server openssl \
+    && rm -rf /var/lib/apt/lists/*
+RUN uv sync --locked
+COPY tests ./tests
+COPY tools ./tools
+COPY config ./config
+ENV GATEWAY_REQUIRE_REDIS_TESTS=1
+CMD ["uv", "run", "pytest", "-q"]
 
 # Shared runtime: the virtual environment and an unprivileged user, no build tools.
 FROM ${PYTHON_IMAGE} AS base

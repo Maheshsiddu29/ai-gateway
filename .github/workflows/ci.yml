@@ -18,7 +18,7 @@ env:
 jobs:
   checks:
     name: Lint, types, and tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,7 +28,10 @@ jobs:
       - name: Install dependencies from the lockfile
         run: uv sync --locked
       - name: Install Redis for the admission-control integration tests
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends redis-server openssl
+          redis-server --version | grep -E "v=7\.0\."
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format
@@ -45,7 +48,7 @@ jobs:
 
   package:
     name: Package build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +75,7 @@ jobs:
 
   security:
     name: Dependency audit and secret scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

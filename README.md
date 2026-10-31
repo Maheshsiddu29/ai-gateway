@@ -315,6 +315,15 @@ missing; set `GATEWAY_REQUIRE_REDIS_TESTS=1` (as CI does) to fail instead. Tests
 uvicorn on localhost to test streaming, disconnects, and limits across two
 instances over real sockets.
 
+To run the suite in the Linux build environment with Redis 7.0:
+
+```sh
+docker build --target validation -t ai-gateway:validation .
+docker run --rm ai-gateway:validation
+```
+
+CI pins Ubuntu 24.04 and verifies the installed Redis is from the 7.0 series.
+
 `tools/loadtest.py` measures latency and throughput against running gateways; see
 [docs/benchmarks.md](docs/benchmarks.md) for commands and recorded results.
 
