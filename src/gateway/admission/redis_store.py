@@ -57,7 +57,10 @@ local function refill_ms(missing, rate)
 end
 
 local function save(key, tokens, rate, capacity)
-  redis.call('HSET', key, 'tokens', string.format('%.6f', tokens), 'updated_ms', now)
+  -- Do not move the refill origin backwards if the server clock regressed.
+  local previous = tonumber(redis.call('HGET', key, 'updated_ms')) or now
+  redis.call('HSET', key, 'tokens', string.format('%.6f', tokens),
+             'updated_ms', math.max(now, previous))
   -- An absent bucket is a full one, so the key can expire once it would be full.
   redis.call('PEXPIRE', key, refill_ms(capacity - tokens, rate) + 1000)
 end
@@ -78,11 +81,13 @@ local max_concurrent = tonumber(ARGV[7])
 local lease_ttl, record_ttl = tonumber(ARGV[8]), tonumber(ARGV[9])
 
 local state = redis.call('HGET', KEYS[4], 'state')
-if state == 'released' then
-  return {0, 'released', -1}
-end
 if state then
-  return {1, 'duplicate', -1}
+  local expires = tonumber(redis.call('ZSCORE', KEYS[3], id)) or 0
+  if state == 'admitted' and expires > now then
+    return {1, 'duplicate', -1}
+  end
+  -- A completed or expired lease must never authorize another dispatch.
+  return {0, 'released', -1}
 end
 
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now)
@@ -147,9 +152,8 @@ end
 if token_rate > 0 then
   local reserved = tonumber(redis.call('HGET', KEYS[3], 'tokens')) or 0
   local tokens = available(KEYS[1], token_rate, token_capacity)
-  -- Usage above the reservation becomes debt that delays later admissions. Debt is
-  -- capped at one bucket capacity.
-  local settled = math.max(-token_capacity, math.min(token_capacity, tokens + reserved - charged))
+  -- Preserve all excess usage as debt; truncating it would recreate quota.
+  local settled = math.min(token_capacity, tokens + reserved - charged)
   save(KEYS[1], settled, token_rate, token_capacity)
 end
 redis.call('HSET', KEYS[3], 'state', 'settled', 'charged', charged)

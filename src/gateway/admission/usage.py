@@ -7,7 +7,7 @@ token-per-minute limit as follows:
 * no usage reported, but the provider may have run the request (a success without
   usage, an interrupted stream, a timeout after sending): the full reservation,
   because the actual amount is unknown;
-* the provider certainly did not run it (connection failure, error status): zero.
+* the provider certainly did not run it (connection failure, explicit client rejection): zero.
 
 Attempts are not free: two uncertain attempts are charged two reservations.
 """

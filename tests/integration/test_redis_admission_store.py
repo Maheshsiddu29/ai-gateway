@@ -160,7 +160,7 @@ class TestTokenBucket:
         assert later.retry_after_ms is not None
         assert later.retry_after_ms > 200_000
 
-    async def test_debt_is_capped_at_one_bucket_capacity(
+    async def test_all_excess_usage_remains_debt(
         self, store: RedisAdmissionStore, redis_client: Redis
     ) -> None:
         limits = tokens_only(rate=60, capacity=1000)
@@ -169,7 +169,7 @@ class TestTokenBucket:
 
         await store.settle(reserved, 1_000_000)
 
-        assert await bucket_tokens(redis_client, "tokens") == pytest.approx(-1000, abs=1)
+        assert await bucket_tokens(redis_client, "tokens") == pytest.approx(-999_000, abs=1)
 
 
 class TestConcurrency:
@@ -349,3 +349,36 @@ class TestServerFailures:
 
         # The restarted server has no persistence, so the exhausted bucket is gone.
         assert (await store.admit(admission(limits))).admitted
+
+
+async def test_settled_reservation_cannot_authorize_another_dispatch(
+    store: RedisAdmissionStore,
+) -> None:
+    reserved = admission(UNLIMITED)
+    assert (await store.admit(reserved)).admitted
+    await store.settle(reserved, 0)
+    assert (await store.admit(reserved)).rejection is Rejection.RELEASED
+
+
+async def test_expired_lease_cannot_be_replayed(
+    store: RedisAdmissionStore,
+    redis_client: Redis,
+) -> None:
+    reserved = admission(UNLIMITED)
+    await store.admit(reserved)
+    await redis_client.zadd(f"{KEY_PREFIX}:{{{PRINCIPAL}}}:leases", {reserved.reservation_id: 0})
+    assert (await store.admit(reserved)).rejection is Rejection.RELEASED
+
+
+async def test_backward_clock_does_not_create_a_second_refill(
+    store: RedisAdmissionStore,
+    redis_client: Redis,
+) -> None:
+    limits = requests_only(rate=60, capacity=10)
+    key = f"{KEY_PREFIX}:{{{PRINCIPAL}}}:requests"
+    seconds, micros = await redis_client.time()
+    future = seconds * 1000 + micros // 1000 + 60_000
+    await redis_client.hset(key, mapping={"tokens": 5, "updated_ms": future})
+    assert (await store.admit(admission(limits))).admitted
+    assert int(await redis_client.hget(key, "updated_ms") or 0) == future
+    assert await bucket_tokens(redis_client, "requests") == 4

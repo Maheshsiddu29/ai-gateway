@@ -118,15 +118,14 @@ Charges per provider attempt:
 | --- | --- |
 | Provider reported usage | the reported total |
 | Completed without usage, stream interrupted, read timeout, client cancelled | the full reservation |
-| Connection not established, or the provider returned an error status (other than 408/504) | nothing |
+| Connection not established, or an explicit client/account rejection | nothing |
 
 The usage status of a settlement is `observed` when every charged attempt reported
 usage, `unknown` when any attempt was charged its full reservation, and `none`
 when nothing was charged.
 
 Usage above the reservation becomes debt: the balance goes negative and later
-admissions for the key wait until it refills. Debt is capped at one bucket
-capacity. Request tokens are never refunded: a request that was admitted counts
+admissions for the key wait until it refills. All excess usage is preserved as debt; it is not truncated to a bucket capacity. Request tokens are never refunded: a request that was admitted counts
 against the request limit whatever its outcome.
 
 Settlement runs in a task shielded from cancellation, so a client disconnect or

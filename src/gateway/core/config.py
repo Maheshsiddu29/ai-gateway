@@ -253,7 +253,7 @@ class ResilienceConfig(BaseModel):
     retry_jitter_ratio: float = Field(default=0.5, ge=0, le=1)
     # A provider asking to wait longer than this is not retried.
     max_retry_after_seconds: float = Field(default=10.0, ge=0, le=300)
-    retry_on_status: frozenset[int] = frozenset({429, 500, 502, 503, 529})
+    retry_on_status: frozenset[int] = frozenset({429})
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
 
     @field_validator("retry_on_status")

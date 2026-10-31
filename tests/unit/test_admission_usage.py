@@ -53,7 +53,7 @@ def test_success_without_usage_is_charged_the_reservation() -> None:
 @pytest.mark.parametrize(
     ("exc", "charged"),
     [
-        (error_from_status(httpx.Response(503)), 0),
+        (error_from_status(httpx.Response(503)), RESERVED),
         (error_from_status(httpx.Response(429)), 0),
         (error_from_transport(httpx.ConnectError("refused")), 0),
         (error_from_transport(httpx.ConnectTimeout("slow")), 0),
@@ -80,4 +80,4 @@ def test_every_attempt_that_may_have_run_is_charged() -> None:
     ledger.start("primary").failed(error_from_status(httpx.Response(503)))
     ledger.start("secondary").succeeded(Usage(40, 10, 50))
 
-    assert ledger.charge(RESERVED) == Charge(RESERVED + 50, UsageStatus.UNKNOWN)
+    assert ledger.charge(RESERVED) == Charge(2 * RESERVED + 50, UsageStatus.UNKNOWN)

@@ -281,7 +281,7 @@ Every response carries an `X-Request-ID` header. A client may supply its own
 ### Failure behaviour
 
 - Provider failures where the provider certainly did not run the request
-  (connection failures, 429, 5xx other than 504) are retried with backoff and then
+  (connection establishment failures or explicit 429 rejections) are retried with backoff and then
   passed to the alias's next fallback provider. Read timeouts, dropped connections,
   and malformed responses are returned to the client, because the provider may
   already have run, and charged for, the request.
@@ -350,9 +350,9 @@ history with gitleaks.
   persistence, failover to a lagging replica), buckets reset and active leases are
   forgotten.
 - Circuit breaker state is per process, not shared between instances.
-- Retries and fallback assume that a provider answering with an error status did
-  not run, or charge for, the request. Requests that may have run are never
-  retried, but duplicate execution cannot be ruled out entirely.
+- All 5xx responses are treated as uncertain execution: no retry or fallback,
+  and unknown usage retains its reservation. Explicit 429/client rejections still
+  depend on provider rejection semantics; exactly-once execution is not guaranteed.
 - No keep-alive comments are sent on idle streams; proxies with short idle timeouts
   may close long pauses.
 - `GET /v1/models` and other OpenAI endpoints are not implemented.

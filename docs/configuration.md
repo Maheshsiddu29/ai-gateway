@@ -118,7 +118,7 @@ recovery_seconds = 30
 | `retry_max_backoff_seconds` | `2` | Cap on the exponentially growing delay. |
 | `retry_jitter_ratio` | `0.5` | Each delay is reduced by a random fraction of up to this ratio (0 to 1). |
 | `max_retry_after_seconds` | `10` | A provider `Retry-After` longer than this is not waited for; the error is returned instead. |
-| `retry_on_status` | `[429, 500, 502, 503, 529]` | HTTP statuses eligible for retry. Only 429 and 5xx are allowed. Statuses after which the request may still be running (504) are never retried. |
+| `retry_on_status` | `[429]` | HTTP statuses eligible for retry. Only 429 and 5xx are allowed. All 5xx statuses are uncertain and never retried, even if listed in an older configuration. |
 
 `[resilience.circuit_breaker]`:
 

@@ -100,8 +100,9 @@ class ProviderError(GatewayError):
     are never included in client responses.
 
     ``may_have_processed`` is False only when the provider certainly did not run the
-    request: the connection was never established, or the provider answered with an
-    error status. It decides whether the attempt is charged against token limits and
+    request: the connection was never established, or the provider explicitly
+    rejected the request with a client/account error. Server errors are uncertain.
+    This decides whether the attempt is charged against token limits and
     whether it may be retried. It defaults to True, the safe assumption.
     """
 

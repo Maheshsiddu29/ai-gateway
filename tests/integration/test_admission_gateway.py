@@ -190,7 +190,7 @@ class TestTokenLimit:
     ) -> None:
         limits = {"tokens_per_minute": 60, "token_burst": 1000}
 
-        async with gateway(redis_server, limits, lambda _: httpx.Response(503)) as (client, _):
+        async with gateway(redis_server, limits, lambda _: httpx.Response(401)) as (client, _):
             response = await post(client)
 
         assert response.status_code == 502
@@ -406,3 +406,17 @@ class TestRedisFailure:
         assert json.loads(response.text)["error"]["message"] == (
             "Request admission is temporarily unavailable."
         )
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504, 529])
+async def test_server_error_retains_reservation_without_retry(
+    redis_server: RedisServer,
+    redis_client: Redis,
+    status: int,
+) -> None:
+    limits = {"tokens_per_minute": 60, "token_burst": 1000}
+    async with gateway(redis_server, limits, lambda _: httpx.Response(status)) as (client, stub):
+        response = await post(client)
+    assert response.status_code in (502, 504)
+    assert len(stub.requests) == 1
+    assert await token_balance(redis_client) == pytest.approx(1000 - RESERVED_TOKENS, abs=2)

@@ -25,111 +25,55 @@ On expiry:
 In each case the upstream request is cancelled, its connection closed, and the
 admission reservation settled.
 
-## Retries
+## Retries and fallback
 
-A failed attempt is retried only if all of these hold:
+Connection establishment failures, connect timeouts, and pool timeouts can be
+retried because dispatch did not occur. HTTP 429 is retryable under the assumption
+that the provider rejected the request before generation. Explicit client/account
+rejections (400, 401, 402, 403, 404, 413, 422) do not incur token charges; only
+account/configuration failures can trigger a configured fallback.
 
-1. The provider certainly did not run the request: the connection was never
-   established (connection refused, connect or pool timeout), or the provider
-   answered with an error status.
-2. The failure is transient: HTTP 429, a status in `retry_on_status` (default 429,
-   500, 502, 503, 529), or a connection failure.
-3. Attempts remain (`max_attempts_per_provider`, default 2, at most 5).
-4. The backoff delay ends before the deadline.
-5. If the provider sent `Retry-After`, it is at most `max_retry_after_seconds`.
+**All HTTP 5xx statuses are uncertain execution**, including 500, 502, 503, 504,
+and 529. A server or proxy can fail after inference executed. They are not retried
+or redirected, and retain the full token reservation when usage is unknown. The
+same applies to read/write failures, malformed responses, and stream errors.
+There is no exactly-once execution guarantee. The 429 and client-rejection policy
+still assumes the provider implements those rejection semantics honestly.
 
-The delay after attempt *n* is
-`min(retry_max_backoff_seconds, retry_initial_backoff_seconds * 2^(n-1))`, reduced
-by a random fraction of up to `retry_jitter_ratio`, and never shorter than the
-provider's `Retry-After`.
+`max_attempts_per_provider` includes the first attempt (default 2, at most 5).
+Backoff doubles from `retry_initial_backoff_seconds` to
+`retry_max_backoff_seconds`, reduced by a random fraction of up to
+`retry_jitter_ratio`. Delay-seconds `Retry-After` is respected up to
+`max_retry_after_seconds`; longer delays stop retries. Every delay and attempt
+shares the original deadline. No new attempt begins after it expires.
 
-Not retried:
+`retry_on_status` defaults to `[429]`. Existing configurations listing 5xx remain
+loadable, but cannot override the execution-uncertainty safety check. There is no
+setting that enables automatic replay of uncertain inference calls.
 
-| Failure | Reason |
-| --- | --- |
-| Read timeout, connection dropped after sending, 504, 408 | The provider may be running the request. |
-| Malformed response, incomplete stream | The provider ran the request. |
-| 400, 401, 403, 404, 422, unsupported capabilities | Retrying cannot succeed. |
-| Any failure after a streamed event was sent to the client | The client already has output. |
-| Deadline expiry, client disconnect | The request is over. |
-
-For streams, the first upstream event is part of the attempt: a failure before it
-(such as a 503 status or a connection failure) can be retried, and the client sees
-only the successful attempt's output.
-
-## Duplicate execution and charges
-
-Provider inference APIs are not idempotent and offer no way to cancel or
-deduplicate a request. Retries are therefore limited to failures where the request
-did not run, but this rests on two assumptions:
-
-- a provider that returns an error status has not generated, or charged for, a
-  completion;
-- a request whose connection was never established was not received.
-
-If a provider charges for requests that it then answers with 5xx, a retry can be
-charged twice. The gateway never retries a request that may still be running.
-Retries are not exactly-once delivery: they reduce failures without guaranteeing a
-single upstream execution.
-
-Each attempt is charged against the key's token limit separately (see
-[admission-control.md](admission-control.md#settlement)). Attempts that certainly
-did not run are charged nothing; attempts with unknown usage are charged a full
-reservation.
-
-## Fallback
-
-A model alias may list fallbacks, tried in order after the primary:
+### Configured fallback
 
 ```toml
 [models.fast]
 provider = "primary"
 model = "primary-model-id"
-fallbacks = [
-  { provider = "secondary", model = "secondary-model-id" },
-]
+fallbacks = [{ provider = "secondary", model = "secondary-model-id" }]
 ```
 
-Each fallback names a configured provider and the model ID to request from it.
-Fallbacks only reference providers, never other aliases, so chains cannot form
-cycles; the same provider and model may not appear twice. At most three fallbacks
-are allowed.
+Candidates reference configured providers, not aliases; chains cannot form cycles.
+Up to three fallbacks are allowed, with no duplicate provider/model pairs. They
+receive the same request with only the upstream model changed. Adapters validate
+candidates before admission; an incompatible fallback is skipped rather than
+receiving modified generation parameters. Each provider uses its own credential.
 
-**Eligibility.** After the primary's retries are exhausted, the next candidate is
-tried if the last failure shows the primary did not run the request: a connection
-failure, a 429 or 5xx status other than 504, or a provider configuration error
-(401, 403, 404, which say nothing about the other provider). An open circuit
-breaker also moves on to the next candidate without contacting the provider. The
-gateway does not fall back after read timeouts, connection drops after sending,
-malformed or interrupted responses, or client errors (400, 422). When every
-candidate fails, the last candidate's error is returned.
+A connection establishment failure, explicit rate rejection, provider configuration
+error, or an already-open breaker can move to the next candidate. The request
+that first opens a circuit with an uncertain failure ends with that error; later
+requests can skip the open provider. Usage is accounted for each attempt.
 
-**Same request.** A fallback receives the primary's request with only the upstream
-model changed: the same messages, `max_tokens` (including any default or ceiling
-from the alias), sampling parameters, and stop sequences. Each provider adapter
-validates the request before admission. A fallback that cannot run it faithfully,
-such as the Anthropic adapter on API version 2026-10-21 receiving `temperature`, is
-skipped and logged as `fallback skipped`; the request is never altered to fit.
-
-**Isolation.** Each provider uses its own HTTP client, base URL, and credential, so
-nothing from one provider's configuration is sent to another.
-
-**Streams.** The first upstream event is part of each attempt, so a stream can fall
-back only before any output has been sent to the client. A failure after that ends
-the stream with an error event; the client never receives output from two
-providers in one response.
-
-**Deadline and accounting.** Fallback attempts share the request deadline, and the
-admission reservation covers the whole request. Each attempt is charged against the
-token limit on its own (see [admission-control.md](admission-control.md#settlement)),
-so a fallback is not free. A primary attempt that certainly did not run costs
-nothing. Fallback does not prevent duplicate charges: it follows only failures the
-gateway believes did not run, under the same assumptions as retries.
-
-The response's `model` field is the requested alias whichever provider served it.
-The `completion finished` log event records the serving provider and the number of
-attempts, and `gateway_provider_fallbacks_total{from_provider,to_provider}` counts
-fallbacks.
+For streams, fallback and retry stop at the first upstream event. Partial output
+is never joined to another generation. A later failure emits an error event and
+withholds `[DONE]`.
 
 ## Circuit breakers
 

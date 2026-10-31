@@ -18,13 +18,12 @@ from gateway.errors import (
 
 USER_AGENT = f"ai-gateway/{__version__}"
 _MAX_RETRY_AFTER_SECONDS = 86_400
-_UNCERTAIN_STATUSES = (408, 504)
+_TIMEOUT_STATUSES = (408, 504)
+_REJECTED_STATUSES = (400, 401, 402, 403, 404, 413, 422, 429)
 _NOT_SENT_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
     httpx.PoolTimeout,
-    httpx.UnsupportedProtocol,
-    httpx.LocalProtocolError,
 )
 _TIMEOUT_CODES: dict[type[httpx.TimeoutException], str] = {
     httpx.ConnectTimeout: "provider_connect_timeout",
@@ -93,9 +92,9 @@ def error_from_status(response: httpx.Response) -> ProviderError:
     """
     status = response.status_code
     error_type = _upstream_error_type(response)
-    # An error status means the provider did not produce a completion, except for
-    # timeouts reported by an intermediary, behind which the request may still run.
-    processed = status in _UNCERTAIN_STATUSES
+    # A 5xx can follow inference execution or come from an intermediary. Only
+    # explicit client/account rejections imply no generation was accepted.
+    processed = status not in _REJECTED_STATUSES
 
     if status in (400, 413, 422):
         return ProviderRejectedRequestError(
@@ -128,7 +127,7 @@ def error_from_status(response: httpx.Response) -> ProviderError:
             upstream_error_type=error_type,
             may_have_processed=processed,
         )
-    if status in _UNCERTAIN_STATUSES:
+    if status in _TIMEOUT_STATUSES:
         return ProviderTimeoutError(
             "The provider timed out.",
             upstream_status=status,
@@ -168,7 +167,7 @@ def _retry_after_seconds(response: httpx.Response) -> int | None:
     # Only the delay-seconds form is forwarded; HTTP-date values are dropped
     # rather than converted, to avoid relying on clock agreement with the provider.
     value = response.headers.get("retry-after", "").strip()
-    if not value.isdigit():
+    if not (value.isascii() and value.isdigit()) or len(value) > 10:
         return None
     return min(int(value), _MAX_RETRY_AFTER_SECONDS)
 

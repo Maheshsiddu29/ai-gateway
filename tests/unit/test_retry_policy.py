@@ -29,10 +29,10 @@ def full_jitter() -> float:
     ("exc", "retryable"),
     [
         (error_from_status(httpx.Response(429)), True),
-        (error_from_status(httpx.Response(500)), True),
-        (error_from_status(httpx.Response(502)), True),
-        (error_from_status(httpx.Response(503)), True),
-        (error_from_status(httpx.Response(529)), True),
+        (error_from_status(httpx.Response(500)), False),
+        (error_from_status(httpx.Response(503)), False),
+        (error_from_status(httpx.Response(502)), False),
+        (error_from_status(httpx.Response(529)), False),
         (error_from_transport(httpx.ConnectError("refused")), True),
         (error_from_transport(httpx.ConnectTimeout("slow")), True),
         (error_from_transport(httpx.PoolTimeout("busy")), True),
@@ -64,7 +64,7 @@ def test_jitter_only_shortens_the_delay_within_its_ratio() -> None:
 
 
 def test_stops_after_the_maximum_attempts() -> None:
-    exc = error_from_status(httpx.Response(503))
+    exc = error_from_status(httpx.Response(429))
 
     assert POLICY.delay_before_retry(exc, 2, 60, no_jitter) is not None
     assert POLICY.delay_before_retry(exc, 3, 60, no_jitter) is None
@@ -83,17 +83,17 @@ def test_does_not_retry_when_retry_after_exceeds_the_cap() -> None:
 
 
 def test_does_not_retry_when_the_delay_would_use_up_the_deadline() -> None:
-    exc = error_from_status(httpx.Response(503))
+    exc = error_from_status(httpx.Response(429))
 
     assert POLICY.delay_before_retry(exc, 1, remaining_seconds=0.1, random=no_jitter) is None
     assert POLICY.delay_before_retry(exc, 1, remaining_seconds=0.11, random=no_jitter) == 0.1
 
 
 def test_status_allow_list_is_respected() -> None:
-    policy = RetryPolicy.from_config(ResilienceConfig(retry_on_status=frozenset({503})))
+    policy = RetryPolicy.from_config(ResilienceConfig(retry_on_status=frozenset({429})))
 
-    assert policy.is_retryable(error_from_status(httpx.Response(503)))
-    assert not policy.is_retryable(error_from_status(httpx.Response(429)))
+    assert policy.is_retryable(error_from_status(httpx.Response(429)))
+    assert not policy.is_retryable(error_from_status(httpx.Response(503)))
 
 
 @pytest.mark.parametrize("status", [400, 404, 418])
@@ -105,7 +105,7 @@ def test_config_rejects_non_transient_statuses(status: int) -> None:
 @pytest.mark.parametrize(
     ("exc", "allowed"),
     [
-        (error_from_status(httpx.Response(503)), True),
+        (error_from_status(httpx.Response(503)), False),
         (error_from_status(httpx.Response(429)), True),
         (error_from_status(httpx.Response(401)), True),
         (error_from_status(httpx.Response(404)), True),

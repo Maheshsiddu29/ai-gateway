@@ -16,9 +16,9 @@ response.
 
 - Each provider error records whether the provider may have processed the request.
   It may not have only when the connection was never established or the provider
-  answered with an error status other than 408 or 504.
-- Only those failures are retried, and only if transient (429, configured 5xx
-  statuses, connection failures), with bounded exponential backoff and jitter,
+  explicitly rejected it with a client/account status. All 5xx statuses remain
+  uncertain because inference may already have executed.
+- Only those failures are retried, and only if transient (429, connection establishment failures), with bounded exponential backoff and jitter,
   within the request deadline, honouring `Retry-After` up to a cap.
 - After retries, the same class of failures (plus provider configuration errors and
   open circuit breakers) moves the request to the alias's next configured fallback.
@@ -44,6 +44,5 @@ response.
 
 - Read timeouts and dropped connections are returned to the client rather than
   retried.
-- The policy depends on providers not charging for requests they answer with error
-  statuses; it does not provide exactly-once execution.
+- The policy depends on providers not charging for explicit client rejections; it does not provide exactly-once execution.
 - Replicas may disagree about whether a provider's circuit is open.

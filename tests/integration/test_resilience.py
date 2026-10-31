@@ -113,13 +113,12 @@ class TestRetries:
     @pytest.mark.parametrize(
         "failure",
         [
-            httpx.Response(503),
-            httpx.Response(500),
+            httpx.Response(429),
             httpx.Response(429, headers={"retry-after": "0"}),
             httpx.ConnectError("connection refused"),
             httpx.ConnectTimeout("connect timed out"),
         ],
-        ids=["503", "500", "429", "connection-refused", "connect-timeout"],
+        ids=["429-empty", "429-delay", "connection-refused", "connect-timeout"],
     )
     async def test_transient_failure_then_success(self, failure: Outcome) -> None:
         async with gateway(sequence(failure, ok("recovered"))) as (client, stub):
@@ -132,10 +131,10 @@ class TestRetries:
         assert 'gateway_provider_retries_total{provider="openai"} 1.0' in metrics
 
     async def test_retries_are_bounded(self) -> None:
-        async with gateway(lambda _: httpx.Response(503)) as (client, stub):
+        async with gateway(lambda _: httpx.Response(429)) as (client, stub):
             response = await post(client)
 
-        assert response.status_code == 502
+        assert response.status_code == 429
         assert len(stub.requests) == FAST_RETRIES["max_attempts_per_provider"]
 
     @pytest.mark.parametrize(
@@ -144,11 +143,26 @@ class TestRetries:
             (httpx.ReadTimeout("no response"), 504),
             (httpx.RemoteProtocolError("server disconnected"), 502),
             (httpx.Response(504), 504),
+            (httpx.Response(500), 502),
+            (httpx.Response(502), 502),
+            (httpx.Response(503), 502),
+            (httpx.Response(529), 502),
             (httpx.Response(400), 400),
             (httpx.Response(401), 502),
             (httpx.Response(200, content=b"not json"), 502),
         ],
-        ids=["read-timeout", "dropped-before-headers", "504", "400", "401", "malformed"],
+        ids=[
+            "read-timeout",
+            "dropped-before-headers",
+            "504",
+            "500",
+            "502",
+            "503",
+            "529",
+            "400",
+            "401",
+            "malformed",
+        ],
     )
     async def test_failures_that_may_have_run_or_are_not_transient_are_not_retried(
         self, failure: Outcome, status: int
@@ -173,7 +187,7 @@ class TestRetries:
 
     async def test_retries_stop_at_the_deadline(self) -> None:
         async with gateway(
-            lambda _: httpx.Response(503),
+            lambda _: httpx.Response(429),
             request_deadline_seconds=0.3,
             max_attempts_per_provider=5,
             retry_initial_backoff_seconds=0.2,
@@ -183,7 +197,7 @@ class TestRetries:
             response = await post(client)
             elapsed = time.monotonic() - started
 
-        assert response.status_code == 502
+        assert response.status_code == 429
         # After the first backoff only 0.1 s remain, too little for another 0.2 s wait.
         assert len(stub.requests) == 2
         assert elapsed < 0.3
@@ -191,7 +205,7 @@ class TestRetries:
     async def test_stream_failure_before_output_is_retried_without_duplicating_content(
         self,
     ) -> None:
-        async with gateway(sequence(httpx.Response(503), stream_ok("Hel", "lo"))) as (
+        async with gateway(sequence(httpx.Response(429), stream_ok("Hel", "lo"))) as (
             client,
             stub,
         ):

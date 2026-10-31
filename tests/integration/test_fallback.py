@@ -120,12 +120,12 @@ class TestNonStreaming:
     @pytest.mark.parametrize(
         "failure",
         [
-            httpx.Response(503),
             httpx.Response(429),
+            httpx.Response(403),
             httpx.Response(401),
             httpx.ConnectError("connection refused"),
         ],
-        ids=["503", "429", "401", "connection-refused"],
+        ids=["429", "403", "401", "connection-refused"],
     )
     async def test_falls_back_when_the_primary_did_not_run_the_request(
         self, failure: httpx.Response | Exception, caplog: pytest.LogCaptureFixture
@@ -153,7 +153,7 @@ class TestNonStreaming:
 
     async def test_each_provider_receives_only_its_own_credential(self) -> None:
         hosts = {
-            "primary.test": fail_with(httpx.Response(503)),
+            "primary.test": fail_with(httpx.Response(429)),
             "secondary.test": lambda _: ok("b"),
         }
 
@@ -173,8 +173,11 @@ class TestNonStreaming:
             (httpx.RemoteProtocolError("dropped after sending"), 502),
             (httpx.Response(200, content=b"<html>"), 502),
             (httpx.Response(400), 400),
+            (httpx.Response(503), 502),
+            (httpx.Response(500), 502),
+            (httpx.Response(502), 502),
         ],
-        ids=["read-timeout", "dropped", "malformed", "400"],
+        ids=["read-timeout", "dropped", "malformed", "400", "503", "500", "502"],
     )
     async def test_does_not_fall_back_when_the_primary_may_have_run_or_the_request_is_bad(
         self, failure: httpx.Response | Exception, status: int
@@ -198,15 +201,15 @@ class TestNonStreaming:
             first = await post(client)
             second = await post(client)
 
-        assert (first.status_code, second.status_code) == (200, 200)
+        assert (first.status_code, second.status_code) == (502, 200)
         # The breaker opened after the first failure, so the second request went
         # straight to the fallback.
         assert len(requests_to(stub, "primary.test")) == 1
-        assert len(requests_to(stub, "secondary.test")) == 2
+        assert len(requests_to(stub, "secondary.test")) == 1
 
     async def test_returns_the_last_error_when_every_provider_fails(self) -> None:
         hosts = {
-            "primary.test": fail_with(httpx.Response(503)),
+            "primary.test": fail_with(httpx.Response(429)),
             "secondary.test": fail_with(httpx.Response(429, headers={"retry-after": "7"})),
         }
 
@@ -222,7 +225,7 @@ class TestNonStreaming:
             {"provider": "secondary", "model": "secondary-model"},
         ]
         hosts = {
-            "primary.test": fail_with(httpx.Response(503)),
+            "primary.test": fail_with(httpx.Response(429)),
             "secondary.test": lambda _: ok("b"),
         }
 
@@ -253,7 +256,7 @@ class TestNonStreaming:
 class TestStreaming:
     async def test_falls_back_before_the_first_event(self) -> None:
         hosts = {
-            "primary.test": fail_with(httpx.Response(503)),
+            "primary.test": fail_with(httpx.Response(429)),
             "secondary.test": lambda _: stream_ok("from b"),
         }
 

@@ -20,7 +20,7 @@ after a response, while admission happens before it.
 - Request and token limits are token buckets with configurable rate and burst.
   Tokens are reserved at admission (estimated input plus output allowance) and a
   second script settles the reservation with the usage actually charged, carrying
-  any excess as bounded debt.
+  all excess as debt.
 - Concurrency is a set of leases whose lifetime is the request deadline plus a
   grace period, so no renewal is needed and a crashed instance's leases expire.
 - Settlement is idempotent per reservation ID and leaves a tombstone when it finds
