@@ -56,6 +56,7 @@ ban-relative-imports = "all"
 strict = true
 python_version = "3.13"
 mypy_path = ["src", "tools"]
+files = ["src", "tests", "tools"]
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
 

@@ -1,0 +1,35 @@
+# Local development stack: the gateway backed by the mock provider.
+# Requires GATEWAY_API_KEYS in the shell or in .env (see .env.example).
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: [/tmp]
+
+services:
+  gateway:
+    <<: *hardening
+    build:
+      context: .
+      target: runtime
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      GATEWAY_ENVIRONMENT: development
+      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in the shell or .env}
+      GATEWAY_LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-INFO}
+      # The mock only checks that a key is present; this is not a real credential.
+      MOCK_UPSTREAM_API_KEY: mock-upstream-key
+    volumes:
+      - ./config/gateway.mock.toml:/etc/gateway/gateway.toml:ro
+    depends_on:
+      mock-upstream:
+        condition: service_healthy
+    stop_grace_period: 35s
+
+  mock-upstream:
+    <<: *hardening
+    build:
+      context: .
+      target: mock-upstream
