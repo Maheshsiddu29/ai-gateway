@@ -45,6 +45,7 @@ from gateway.providers.base import (
 )
 from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import ChatCompletionRequest
+from gateway.services.execution import ProviderExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ class CompletionService:
         self,
         routes: Mapping[str, ModelRoute],
         providers: Mapping[str, Provider],
+        executor: ProviderExecutor,
         metrics: Metrics,
         admission: AdmissionController | None = None,
     ) -> None:
@@ -91,6 +93,7 @@ class CompletionService:
             raise ValueError(f"routes reference providers without adapters: {sorted(missing)}")
         self._routes = dict(routes)
         self._providers = dict(providers)
+        self._executor = executor
         self._metrics = metrics
         self._admission = admission
 
@@ -98,19 +101,14 @@ class CompletionService:
         self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
     ) -> Completion:
         plan = self._plan(request)
-        trace = _CompletionTrace(principal, plan.route, self._metrics, stream=False)
         ledger = UsageLedger()
+        trace = _CompletionTrace(principal, plan.route, ledger, self._metrics, stream=False)
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                attempt = ledger.start(plan.route.provider)
-                try:
-                    async with deadline.limit():
-                        completion = await plan.provider.complete(plan.request)
-                except BaseException as exc:
-                    attempt.failed(exc)
-                    raise
-                attempt.succeeded(completion.usage)
+                completion = await self._executor.complete(
+                    plan.route.provider, plan.request, deadline, ledger
+                )
             finally:
                 await self._settle(admission, ledger)
         except BaseException as exc:
@@ -126,34 +124,27 @@ class CompletionService:
 
         Closing this generator early (client disconnect) closes the provider
         stream, settles the reservation, and is logged as a cancellation. The
-        deadline bounds each wait for the next upstream event; the time a slow
-        client takes to read is bounded by the response (see api.streaming).
+        executor bounds each wait for the next upstream event by the deadline; the
+        time a slow client takes to read is bounded by the response (see
+        api.streaming).
         """
         plan = self._plan(request)
-        trace = _CompletionTrace(principal, plan.route, self._metrics, stream=True)
         ledger = UsageLedger()
+        trace = _CompletionTrace(principal, plan.route, ledger, self._metrics, stream=True)
         end: StreamEnd | None = None
         try:
             admission = await self._admit(principal, plan, deadline, trace)
-            attempt = ledger.start(plan.route.provider)
             try:
-                async with aclosing(plan.provider.stream(plan.request)) as events:
-                    while True:
-                        async with deadline.limit():
-                            event = await anext(events, None)
-                        if event is None:
-                            break
+                events = self._executor.stream(plan.route.provider, plan.request, deadline, ledger)
+                async with aclosing(events):
+                    async for event in events:
                         if isinstance(event, TextDelta):
                             trace.first_token()
                         else:
                             end = event
-                            attempt.succeeded(event.usage)
                         yield event
                 if end is None:
                     raise InternalGatewayError("The provider stream ended unexpectedly.")
-            except BaseException as exc:
-                attempt.failed(exc)
-                raise
             finally:
                 await self._settle(admission, ledger)
         except BaseException as exc:
@@ -241,9 +232,16 @@ class _CompletionTrace:
     """
 
     def __init__(
-        self, principal: Principal, route: ModelRoute, metrics: Metrics, *, stream: bool
+        self,
+        principal: Principal,
+        route: ModelRoute,
+        ledger: UsageLedger,
+        metrics: Metrics,
+        *,
+        stream: bool,
     ) -> None:
         self._started = time.perf_counter()
+        self._ledger = ledger
         self._metrics = metrics
         self._stream = stream
         self._fields: dict[str, object] = {
@@ -293,8 +291,17 @@ class _CompletionTrace:
 
     def _emit(self, level: int, outcome: str) -> None:
         duration_ms = round((time.perf_counter() - self._started) * 1000, 2)
+        attempts = self._ledger.attempts
+        if attempts:
+            # The provider that made the last attempt, which served any response.
+            self._fields["provider"] = attempts[-1].provider
         logger.log(
             level,
             "completion finished",
-            extra={**self._fields, "outcome": outcome, "duration_ms": duration_ms},
+            extra={
+                **self._fields,
+                "outcome": outcome,
+                "duration_ms": duration_ms,
+                "attempts": len(attempts),
+            },
         )

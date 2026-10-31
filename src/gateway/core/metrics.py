@@ -68,3 +68,29 @@ class Metrics:
             ["operation"],
             registry=self.registry,
         )
+        self.provider_attempts = Counter(
+            "gateway_provider_attempts",
+            "Provider attempts by provider and outcome (success, the error type, or"
+            " circuit_open when the breaker refused the attempt).",
+            ["provider", "outcome"],
+            registry=self.registry,
+        )
+        self.provider_attempt_duration = Histogram(
+            "gateway_provider_attempt_duration_seconds",
+            "Duration of provider attempts; for streams, until the first event.",
+            ["provider"],
+            buckets=_LATENCY_BUCKETS,
+            registry=self.registry,
+        )
+        self.provider_retries = Counter(
+            "gateway_provider_retries",
+            "Attempts retried after a transient provider failure.",
+            ["provider"],
+            registry=self.registry,
+        )
+        self.circuit_transitions = Counter(
+            "gateway_circuit_breaker_transitions",
+            "Circuit breaker state changes in this process.",
+            ["provider", "state"],
+            registry=self.registry,
+        )

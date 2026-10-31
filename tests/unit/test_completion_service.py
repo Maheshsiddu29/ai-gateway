@@ -3,6 +3,7 @@ import logging
 
 import pytest
 
+from gateway.core.config import ResilienceConfig
 from gateway.core.metrics import Metrics
 from gateway.core.security import Principal
 from gateway.errors import InvalidRequestError, ProviderRateLimitError
@@ -10,9 +11,18 @@ from gateway.providers.base import Completion, Usage
 from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import ChatCompletionRequest, ChatMessage
 from gateway.services.completion import CompletionService, ModelRoute
+from gateway.services.execution import build_executor
 from tests.fakes import FakeProvider
 
 PRINCIPAL = Principal(id="key-abc")
+
+
+def service_for(
+    routes: dict[str, ModelRoute], providers: dict[str, FakeProvider]
+) -> CompletionService:
+    metrics = Metrics()
+    executor = build_executor(providers, ResilienceConfig(max_attempts_per_provider=1), metrics)
+    return CompletionService(routes, providers, executor, metrics)
 
 
 def make_service(
@@ -27,7 +37,7 @@ def make_service(
             max_output_tokens=None,
         )
     }
-    return CompletionService(routes, {provider.name: provider}, Metrics())
+    return service_for(routes, {provider.name: provider})
 
 
 def make_request(**fields: object) -> ChatCompletionRequest:
@@ -86,7 +96,7 @@ def test_routes_must_reference_known_providers() -> None:
     )
 
     with pytest.raises(ValueError, match="missing"):
-        CompletionService({"a": route}, {}, Metrics())
+        service_for({"a": route}, {})
 
 
 async def test_logs_success_with_usage_but_without_content(
@@ -150,7 +160,7 @@ def make_capped_service(
         default_max_tokens=default_max_tokens,
         max_output_tokens=ceiling,
     )
-    return CompletionService({"fast": route}, {provider.name: provider}, Metrics())
+    return service_for({"fast": route}, {provider.name: provider})
 
 
 @pytest.mark.parametrize(

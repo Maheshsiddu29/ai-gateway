@@ -42,6 +42,9 @@ CONFIG: dict[str, object] = {
         }
     },
     "models": {"fast": {"provider": "openai", "model": "upstream-fast"}},
+    # These tests check how single upstream responses are mapped; retries are
+    # covered in test_resilience.py.
+    "resilience": {"max_attempts_per_provider": 1},
 }
 STREAM_REQUEST = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "stream": True}
 USAGE = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}

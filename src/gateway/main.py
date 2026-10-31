@@ -30,6 +30,7 @@ from gateway.core.security import StaticKeyAuthenticator
 from gateway.providers.base import Provider
 from gateway.providers.factory import ProviderFactory, build_provider
 from gateway.services.completion import CompletionService, routes_from_config
+from gateway.services.execution import build_executor
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,11 @@ def build_app(
             admission = await _start_admission(stack, settings, config.gateway, app.state.metrics)
             app.state.admission = admission
             app.state.completion_service = CompletionService(
-                routes, providers, app.state.metrics, admission
+                routes,
+                providers,
+                build_executor(providers, config.gateway.resilience, app.state.metrics),
+                app.state.metrics,
+                admission,
             )
             try:
                 yield

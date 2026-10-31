@@ -204,12 +204,54 @@ class AdmissionConfig(BaseModel):
 MAX_REQUEST_DEADLINE_SECONDS = 3600
 
 
+# Upper bound on attempts per provider, to keep retry amplification small.
+MAX_ATTEMPTS_PER_PROVIDER = 5
+# Statuses that may be configured as retryable, besides 429: server errors.
+_RETRYABLE_STATUS_RANGE = range(500, 600)
+
+
+class CircuitBreakerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = True
+    # The breaker opens after this many provider failures within the window.
+    failure_threshold: int = Field(default=5, ge=1, le=1000)
+    failure_window_seconds: float = Field(default=30.0, gt=0, le=3600)
+    # How long the breaker stays open before letting probe requests through.
+    recovery_seconds: float = Field(default=30.0, gt=0, le=3600)
+    half_open_max_probes: int = Field(default=1, ge=1, le=100)
+
+
 class ResilienceConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     # Covers the whole request: admission, every provider attempt and backoff
     # delay, and for streams the time until the last event has been sent.
     request_deadline_seconds: float = Field(default=300.0, gt=0, le=MAX_REQUEST_DEADLINE_SECONDS)
+    # 1 disables retries.
+    max_attempts_per_provider: int = Field(default=2, ge=1, le=MAX_ATTEMPTS_PER_PROVIDER)
+    retry_initial_backoff_seconds: float = Field(default=0.2, gt=0, le=10)
+    retry_max_backoff_seconds: float = Field(default=2.0, gt=0, le=60)
+    # Each delay is reduced by a random fraction of up to this ratio.
+    retry_jitter_ratio: float = Field(default=0.5, ge=0, le=1)
+    # A provider asking to wait longer than this is not retried.
+    max_retry_after_seconds: float = Field(default=10.0, ge=0, le=300)
+    retry_on_status: frozenset[int] = frozenset({429, 500, 502, 503, 529})
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+
+    @field_validator("retry_on_status")
+    @classmethod
+    def _check_statuses(cls, statuses: frozenset[int]) -> frozenset[int]:
+        invalid = sorted(s for s in statuses if s != 429 and s not in _RETRYABLE_STATUS_RANGE)
+        if invalid:
+            raise ValueError(f"only 429 and 5xx statuses can be retried, not {invalid}")
+        return statuses
+
+    @model_validator(mode="after")
+    def _check_backoff(self) -> "ResilienceConfig":
+        if self.retry_max_backoff_seconds < self.retry_initial_backoff_seconds:
+            raise ValueError("retry_max_backoff_seconds must be at least the initial backoff")
+        return self
 
 
 class GatewayConfig(BaseModel):

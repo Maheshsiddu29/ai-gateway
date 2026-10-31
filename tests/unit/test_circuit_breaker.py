@@ -1,0 +1,150 @@
+from gateway.core.config import CircuitBreakerConfig
+from gateway.resilience.breaker import AttemptOutcome, BreakerState, CircuitBreaker, Permit
+
+CONFIG = CircuitBreakerConfig(
+    failure_threshold=3, failure_window_seconds=10, recovery_seconds=5, half_open_max_probes=1
+)
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class Harness:
+    def __init__(self, config: CircuitBreakerConfig = CONFIG) -> None:
+        self.clock = FakeClock()
+        self.transitions: list[BreakerState] = []
+        self.breaker = CircuitBreaker(
+            "p",
+            config,
+            clock=self.clock,
+            on_transition=lambda _, state: self.transitions.append(state),
+        )
+
+    def state(self) -> BreakerState:
+        # A method rather than the property, so type checkers do not narrow it
+        # across the state changes a test makes.
+        return self.breaker.state
+
+    def fail(self, times: int = 1) -> None:
+        for _ in range(times):
+            permit = self.breaker.try_acquire()
+            assert permit is not None
+            self.breaker.release(permit, AttemptOutcome.FAILURE)
+
+    def open(self) -> None:
+        self.fail(CONFIG.failure_threshold)
+        assert self.state() is BreakerState.OPEN
+
+
+def test_opens_after_the_threshold_within_the_window() -> None:
+    harness = Harness()
+
+    harness.fail(2)
+    assert harness.state() is BreakerState.CLOSED
+    harness.fail()
+
+    assert harness.state() is BreakerState.OPEN
+    assert harness.breaker.try_acquire() is None
+    assert harness.transitions == [BreakerState.OPEN]
+
+
+def test_failures_outside_the_window_do_not_open_it() -> None:
+    harness = Harness()
+
+    for _ in range(5):
+        harness.fail()
+        harness.clock.now += 6
+
+    assert harness.state() is BreakerState.CLOSED
+
+
+def test_neutral_outcomes_and_successes_are_not_failures() -> None:
+    harness = Harness()
+
+    for outcome in [AttemptOutcome.NEUTRAL, AttemptOutcome.SUCCESS] * 5:
+        permit = harness.breaker.try_acquire()
+        assert permit is not None
+        harness.breaker.release(permit, outcome)
+
+    assert harness.state() is BreakerState.CLOSED
+
+
+def test_becomes_half_open_after_recovery_and_limits_probes() -> None:
+    harness = Harness()
+    harness.open()
+
+    harness.clock.now += 4.9
+    assert harness.breaker.try_acquire() is None
+    harness.clock.now += 0.1
+    probe = harness.breaker.try_acquire()
+
+    assert probe == Permit(probe=True)
+    assert harness.state() is BreakerState.HALF_OPEN
+    assert harness.breaker.try_acquire() is None
+
+
+def test_successful_probe_closes_and_resets_failures() -> None:
+    harness = Harness()
+    harness.open()
+    harness.clock.now += 5
+    probe = harness.breaker.try_acquire()
+    assert probe is not None
+
+    harness.breaker.release(probe, AttemptOutcome.SUCCESS)
+
+    assert harness.state() is BreakerState.CLOSED
+    harness.fail(2)
+    assert harness.state() is BreakerState.CLOSED
+    assert harness.transitions == [BreakerState.OPEN, BreakerState.HALF_OPEN, BreakerState.CLOSED]
+
+
+def test_failed_probe_reopens_for_another_recovery_period() -> None:
+    harness = Harness()
+    harness.open()
+    harness.clock.now += 5
+    probe = harness.breaker.try_acquire()
+    assert probe is not None
+
+    harness.breaker.release(probe, AttemptOutcome.FAILURE)
+
+    assert harness.state() is BreakerState.OPEN
+    harness.clock.now += 4
+    assert harness.breaker.try_acquire() is None
+    harness.clock.now += 1
+    assert harness.breaker.try_acquire() is not None
+
+
+def test_a_neutral_probe_frees_its_slot_without_deciding() -> None:
+    harness = Harness()
+    harness.open()
+    harness.clock.now += 5
+    probe = harness.breaker.try_acquire()
+    assert probe is not None
+
+    harness.breaker.release(probe, AttemptOutcome.NEUTRAL)
+
+    assert harness.state() is BreakerState.HALF_OPEN
+    assert harness.breaker.try_acquire() is not None
+
+
+def test_failures_after_a_permit_are_counted() -> None:
+    harness = Harness()
+
+    for _ in range(3):
+        harness.breaker.record_failure()
+
+    assert harness.state() is BreakerState.OPEN
+
+
+def test_disabled_breaker_never_opens() -> None:
+    harness = Harness(CircuitBreakerConfig(enabled=False, failure_threshold=1))
+
+    harness.fail(10)
+
+    assert harness.state() is BreakerState.CLOSED
+    assert harness.transitions == []

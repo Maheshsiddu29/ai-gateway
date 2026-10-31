@@ -102,11 +102,34 @@ Several aliases can point at the same provider and model.
 ```toml
 [resilience]
 request_deadline_seconds = 300
+max_attempts_per_provider = 2
+
+[resilience.circuit_breaker]
+failure_threshold = 5
+recovery_seconds = 30
 ```
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `request_deadline_seconds` | `300` | End-to-end limit for one request, from the start of request handling until the last response byte, including every provider attempt and, for streams, the whole stream. At most 3600. Expiry returns 504 `deadline_exceeded`, or ends a stream that has started with an error event. Provider timeouts still apply to each individual operation. |
+| `request_deadline_seconds` | `300` | End-to-end limit for one request, from the start of request handling until the last response byte, including every provider attempt and backoff delay and, for streams, the whole stream. At most 3600. Provider timeouts still apply to individual operations. |
+| `max_attempts_per_provider` | `2` | Attempts per provider for retryable failures, including the first. `1` disables retries. At most 5. |
+| `retry_initial_backoff_seconds` | `0.2` | Delay after the first failed attempt. |
+| `retry_max_backoff_seconds` | `2` | Cap on the exponentially growing delay. |
+| `retry_jitter_ratio` | `0.5` | Each delay is reduced by a random fraction of up to this ratio (0 to 1). |
+| `max_retry_after_seconds` | `10` | A provider `Retry-After` longer than this is not waited for; the error is returned instead. |
+| `retry_on_status` | `[429, 500, 502, 503, 529]` | HTTP statuses eligible for retry. Only 429 and 5xx are allowed. Statuses after which the request may still be running (504) are never retried. |
+
+`[resilience.circuit_breaker]`:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `true` | Use per-provider circuit breakers. |
+| `failure_threshold` | `5` | Provider failures within the window that open the breaker. |
+| `failure_window_seconds` | `30` | Window for counting failures. |
+| `recovery_seconds` | `30` | Time open before probe requests are allowed. |
+| `half_open_max_probes` | `1` | Concurrent probe requests while half-open. |
+
+See [resilience.md](resilience.md) for retry eligibility and breaker behaviour.
 
 ### Admission control
 
@@ -206,6 +229,10 @@ Phase 1 configuration files load unchanged. Behaviour differences:
 
 - Every request now has an end-to-end deadline (`request_deadline_seconds`,
   default 300).
+- Failures where the provider certainly did not run the request are retried once
+  by default (`max_attempts_per_provider = 2`); set it to 1 for the Phase 1
+  behaviour.
+- Each provider has a circuit breaker, enabled by default.
 - `/health/ready` includes an `admission` field in its response body.
 - If a model sets `max_output_tokens`, requests without `max_tokens` are sent that
   value instead of omitting the field.
