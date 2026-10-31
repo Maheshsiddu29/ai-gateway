@@ -62,7 +62,8 @@ local function save(key, tokens, rate, capacity)
   redis.call('HSET', key, 'tokens', string.format('%.6f', tokens),
              'updated_ms', math.max(now, previous))
   -- An absent bucket is a full one, so the key can expire once it would be full.
-  redis.call('PEXPIRE', key, refill_ms(capacity - tokens, rate) + 1000)
+  redis.call('PEXPIRE', key, refill_ms(capacity - tokens, rate)
+             + math.max(0, previous - now) + 1000)
 end
 """
 

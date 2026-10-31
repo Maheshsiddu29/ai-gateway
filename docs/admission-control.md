@@ -172,7 +172,7 @@ running the first call.
 ## Consistency and durability assumptions
 
 - **One logical Redis primary.** All admission state for a key is written by one
-  script on one server. Redis Cluster is supported by the key layout, as each key's
+  script on one server. The key layout is Cluster-slot compatible, as each key's
   state lives in one slot.
 - **No durability guarantee.** If Redis loses data (a restart without persistence,
   or failover to a replica that had not received recent writes), buckets reset to
@@ -209,3 +209,17 @@ sockets remain available for a co-located Redis. URL query parameters are reject
 because redis-py otherwise lets them override timeouts, retries, and TLS options.
 The Compose demonstration deliberately uses plaintext on an isolated development
 network; it is not a production Redis deployment.
+
+Only a standalone Redis endpoint is supported by the current client. Redis Cluster
+and Sentinel discovery are not implemented. Operators must use `maxmemory-policy
+noeviction`: evicting an active bucket or lease would recreate quota or concurrency
+capacity. Use a dedicated Redis database, sufficient memory, and ACL isolation;
+admins able to delete or modify admission keys can bypass these limits. Persistence
+and replication settings remain operational responsibilities.
+
+Settlement tasks are capped at `redis_max_connections` per process. If cleanup
+capacity is exhausted, new admissions fail closed. Cleanup that cannot be queued
+logs `reservation unresolved` with reason `settlement_capacity_exhausted`; the
+original token reservation is retained and its concurrency lease expires normally.
+No detached queue grows during a Redis outage. Readiness probes are coalesced
+under one lock, so concurrent probes share the same cached result.

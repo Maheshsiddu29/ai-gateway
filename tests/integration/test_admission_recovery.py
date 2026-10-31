@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
+from prometheus_client import generate_latest
 from pydantic import SecretStr
 from redis.asyncio import Redis
 
@@ -27,6 +28,7 @@ from gateway.core.metrics import Metrics
 from gateway.core.redis import create_redis_client
 from gateway.core.security import Principal
 from gateway.errors import AdmissionUnavailableError
+from gateway.providers.base import Usage
 from gateway.resilience.deadline import Deadline
 from tests.redis_proxy import ReplyDroppingProxy
 from tests.redis_server import RedisServer
@@ -173,6 +175,7 @@ class CountingStore(BlockingStore):
 
     async def ping(self) -> None:
         self.pings += 1
+        await asyncio.sleep(0)
 
 
 async def test_readiness_checks_are_reused_for_a_second() -> None:
@@ -186,9 +189,65 @@ async def test_readiness_checks_are_reused_for_a_second() -> None:
         clock=lambda: now[0],
     )
 
-    results = [await controller.is_ready() for _ in range(50)]
+    results = await asyncio.gather(*(controller.is_ready() for _ in range(50)))
     now[0] += READINESS_CACHE_SECONDS
     await controller.is_ready()
 
     assert all(results)
     assert store.pings == 2
+
+
+async def test_slow_redis_cannot_create_unbounded_settlement_tasks() -> None:
+    class SlowStore(CountingStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+
+        async def settle(self, admission: Admission, charged_tokens: int) -> SettleOutcome:
+            self.calls += 1
+            self.started.set()
+            await self.release.wait()
+            return SettleOutcome.SETTLED
+
+    store = SlowStore()
+    controller = AdmissionController(
+        store,
+        AdmissionConfig(enabled=True, redis_max_connections=1),
+        request_deadline_seconds=60,
+        metrics=Metrics(),
+    )
+    reserved = Admission(PRINCIPAL.id, "a" * 32, LIMITS, 100, 60_000, 120_000)
+    first = asyncio.create_task(controller.settle(reserved, UsageLedger()))
+    await store.started.wait()
+    # Excess cleanup retains the reservation instead of creating more tasks.
+    await asyncio.gather(*(controller.settle(reserved, UsageLedger()) for _ in range(100)))
+    with pytest.raises(AdmissionUnavailableError, match="cleanup capacity"):
+        await controller.admit(PRINCIPAL, LIMITS, tokens=100, deadline=Deadline(10))
+    assert store.calls == 1
+    store.release.set()
+    await first
+    await controller.aclose()
+
+
+async def test_duplicate_settlement_does_not_double_count_charged_token_metrics(
+    redis_client: Redis,
+) -> None:
+    metrics = Metrics()
+    controller = AdmissionController(
+        RedisAdmissionStore(redis_client),
+        AdmissionConfig(enabled=True),
+        request_deadline_seconds=60,
+        metrics=metrics,
+    )
+    reserved = await controller.admit(PRINCIPAL, LIMITS, 100, Deadline(10))
+    ledger = UsageLedger()
+    ledger.start("provider").succeeded(Usage(10, 5, 15))
+    await controller.settle(reserved, ledger)
+    await controller.settle(reserved, ledger)
+    await controller.aclose()
+    assert (
+        'gateway_charged_tokens_total{usage="observed"} 15.0'
+        in generate_latest(metrics.registry).decode()
+    )

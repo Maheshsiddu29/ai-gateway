@@ -130,9 +130,9 @@ with admission control enabled, concurrency per key is limited by leases in Redi
 without it, concurrency is bounded only by the connection pools. Redis connections
 come from one bounded pool per process.
 
-Background work is limited to settlement tasks: one per admitted request, and one
-per admission whose outcome was lost. Each is bounded by the Redis operation
-timeout and awaited at shutdown. There are no queues or periodic tasks.
+Background work is limited to settlement tasks, capped per process at
+`redis_max_connections`. Each is bounded by the Redis operation timeout and
+awaited at shutdown; overloaded cleanup retains its reservation until expiry. There are no queues or periodic tasks.
 
 **Cancellation.** ASGI servers do not cancel a handler when its client
 disconnects; they deliver an `http.disconnect` message through `receive()`. The

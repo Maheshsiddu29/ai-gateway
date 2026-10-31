@@ -27,9 +27,9 @@ import asyncio
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from math import ceil
-from typing import Any, Protocol
+from typing import Protocol
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError
@@ -94,6 +94,7 @@ class AdmissionController:
         self._tasks: set[asyncio.Task[None]] = set()
         self._clock = clock
         self._readiness: tuple[float, bool] | None = None
+        self._readiness_lock = asyncio.Lock()
 
     def limits_for(self, principal: Principal) -> KeyLimits:
         limits = self._limits.get(principal.id)
@@ -113,6 +114,9 @@ class AdmissionController:
             lease_ttl_ms=self._lease_ttl_ms,
             record_ttl_ms=self._record_ttl_ms,
         )
+        if len(self._tasks) >= self._config.redis_max_connections:
+            self._metrics.admission_decisions.labels("unavailable").inc()
+            raise AdmissionUnavailableError("Request admission cleanup capacity is exhausted.")
         started = time.perf_counter()
         try:
             async with deadline.limit(), asyncio.timeout(self._timeout):
@@ -147,30 +151,33 @@ class AdmissionController:
 
     async def settle(self, admission: Admission, ledger: UsageLedger) -> None:
         """Release the lease and charge the tokens used. Never raises."""
-        await asyncio.shield(self._spawn(self._settle(admission, ledger)))
+        task = self._queue_settlement(admission, ledger)
+        if task is not None:
+            await asyncio.shield(task)
 
     async def is_ready(self) -> bool:
         # The readiness endpoint is unauthenticated, so the result is reused briefly:
         # otherwise every probe request would cost a Redis round trip.
-        now = self._clock()
-        if self._readiness is not None and now - self._readiness[0] < READINESS_CACHE_SECONDS:
-            return self._readiness[1]
-        try:
-            async with asyncio.timeout(self._timeout):
-                await self._store.ping()
-        except _REDIS_FAILURES:
-            self._metrics.redis_errors.labels("ping").inc()
-            ready = False
-        else:
-            ready = True
-        self._readiness = (now, ready)
-        return ready
+        async with self._readiness_lock:
+            now = self._clock()
+            if self._readiness is not None and now - self._readiness[0] < READINESS_CACHE_SECONDS:
+                return self._readiness[1]
+            try:
+                async with asyncio.timeout(self._timeout):
+                    await self._store.ping()
+            except _REDIS_FAILURES:
+                self._metrics.redis_errors.labels("ping").inc()
+                ready = False
+            else:
+                ready = True
+            self._readiness = (now, ready)
+            return ready
 
     async def aclose(self) -> None:
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     def _release_unconfirmed(self, admission: Admission) -> None:
-        self._spawn(self._settle(admission, UsageLedger()))
+        self._queue_settlement(admission, UsageLedger())
 
     async def _settle(self, admission: Admission, ledger: UsageLedger) -> None:
         charge = ledger.charge(admission.tokens)
@@ -199,11 +206,27 @@ class AdmissionController:
             logger.exception("reservation settlement failed", extra=fields)
             return
         self._metrics.reservations_settled.labels(outcome.value).inc()
-        self._metrics.charged_tokens.labels(charge.status.value).inc(charge.tokens)
+        if outcome is SettleOutcome.SETTLED:
+            self._metrics.charged_tokens.labels(charge.status.value).inc(charge.tokens)
         logger.info("reservation settled", extra={**fields, "outcome": outcome.value})
 
-    def _spawn(self, work: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
-        task = asyncio.get_running_loop().create_task(work)
+    def _queue_settlement(
+        self, admission: Admission, ledger: UsageLedger
+    ) -> asyncio.Task[None] | None:
+        if len(self._tasks) >= self._config.redis_max_connections:
+            # Retain the original charge and let the lease expire rather than
+            # accumulating detached tasks while Redis is slow or unavailable.
+            self._metrics.reservations_settled.labels("overloaded").inc()
+            logger.warning(
+                "reservation unresolved",
+                extra={
+                    **_identifiers(admission),
+                    "reason": "settlement_capacity_exhausted",
+                    "retained_tokens": admission.tokens,
+                },
+            )
+            return None
+        task = asyncio.get_running_loop().create_task(self._settle(admission, ledger))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task

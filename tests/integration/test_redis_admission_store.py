@@ -382,3 +382,4 @@ async def test_backward_clock_does_not_create_a_second_refill(
     assert (await store.admit(admission(limits))).admitted
     assert int(await redis_client.hget(key, "updated_ms") or 0) == future
     assert await bucket_tokens(redis_client, "requests") == 4
+    assert await redis_client.pttl(key) >= 60_000
