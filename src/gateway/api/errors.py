@@ -17,7 +17,6 @@ from gateway.errors import (
     GatewayError,
     InternalGatewayError,
     InvalidRequestError,
-    ProviderRateLimitError,
 )
 
 _HTTP_EXCEPTION_CODES = {404: "not_found", 405: "method_not_allowed"}
@@ -42,7 +41,7 @@ def error_response(error: GatewayError) -> JSONResponse:
     headers: dict[str, str] = {}
     if isinstance(error, AuthenticationError):
         headers["WWW-Authenticate"] = "Bearer"
-    if isinstance(error, ProviderRateLimitError) and error.retry_after_seconds is not None:
+    if error.retry_after_seconds is not None:
         headers["Retry-After"] = str(error.retry_after_seconds)
     return JSONResponse(error_payload(error), status_code=error.status_code, headers=headers)
 

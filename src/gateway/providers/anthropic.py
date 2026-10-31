@@ -165,6 +165,9 @@ class AnthropicProvider:
     def name(self) -> str:
         return self._name
 
+    def validate(self, request: ProviderRequest) -> None:
+        self._build_payload(request, stream=False)
+
     async def complete(self, request: ProviderRequest) -> Completion:
         payload = self._build_payload(request, stream=False)
         try:

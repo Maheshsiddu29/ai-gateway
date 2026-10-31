@@ -24,6 +24,7 @@ def make_service(
             provider=provider.name,
             upstream_model="upstream-model",
             default_max_tokens=default_max_tokens,
+            max_output_tokens=None,
         )
     }
     return CompletionService(routes, {provider.name: provider}, Metrics())
@@ -76,7 +77,13 @@ async def test_default_max_tokens_applies_only_when_client_omits_it(
 
 
 def test_routes_must_reference_known_providers() -> None:
-    route = ModelRoute(alias="a", provider="missing", upstream_model="m", default_max_tokens=None)
+    route = ModelRoute(
+        alias="a",
+        provider="missing",
+        upstream_model="m",
+        default_max_tokens=None,
+        max_output_tokens=None,
+    )
 
     with pytest.raises(ValueError, match="missing"):
         CompletionService({"a": route}, {}, Metrics())
@@ -131,3 +138,58 @@ async def test_logs_cancellation(caplog: pytest.LogCaptureFixture) -> None:
 
     [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]
     assert record.__dict__["outcome"] == "cancelled"
+
+
+def make_capped_service(
+    provider: FakeProvider, *, default_max_tokens: int | None, ceiling: int | None
+) -> CompletionService:
+    route = ModelRoute(
+        alias="fast",
+        provider=provider.name,
+        upstream_model="upstream-model",
+        default_max_tokens=default_max_tokens,
+        max_output_tokens=ceiling,
+    )
+    return CompletionService({"fast": route}, {provider.name: provider}, Metrics())
+
+
+@pytest.mark.parametrize(
+    ("requested", "default", "ceiling", "sent"),
+    [
+        (None, None, None, None),
+        (None, None, 300, 300),
+        (None, 100, 300, 100),
+        (250, 100, 300, 250),
+        (300, None, 300, 300),
+    ],
+)
+async def test_output_allowance(
+    requested: int | None, default: int | None, ceiling: int | None, sent: int | None
+) -> None:
+    provider = FakeProvider()
+
+    await make_capped_service(provider, default_max_tokens=default, ceiling=ceiling).complete(
+        make_request(max_tokens=requested), PRINCIPAL, Deadline(60)
+    )
+
+    assert provider.requests[0].max_tokens == sent
+
+
+async def test_max_tokens_above_the_ceiling_is_rejected_before_the_provider() -> None:
+    provider = FakeProvider()
+    service = make_capped_service(provider, default_max_tokens=None, ceiling=300)
+
+    with pytest.raises(InvalidRequestError) as exc_info:
+        await service.complete(make_request(max_tokens=301), PRINCIPAL, Deadline(60))
+
+    assert exc_info.value.code == "max_tokens_exceeds_limit"
+    assert provider.requests == []
+
+
+async def test_provider_validation_runs_before_any_call() -> None:
+    provider = FakeProvider(validation_error=InvalidRequestError("no", code="unsupported"))
+
+    with pytest.raises(InvalidRequestError):
+        await make_service(provider).complete(make_request(), PRINCIPAL, Deadline(60))
+
+    assert provider.requests == []

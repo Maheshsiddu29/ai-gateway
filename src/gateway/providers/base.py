@@ -63,6 +63,14 @@ class Provider(Protocol):
     @property
     def name(self) -> str: ...
 
+    def validate(self, request: ProviderRequest) -> None:
+        """Raise a ``GatewayError`` if this provider cannot run the request faithfully.
+
+        Called before admission, so that requests that would be rejected consume no
+        quota and are never sent upstream. Performs no I/O.
+        """
+        ...
+
     async def complete(self, request: ProviderRequest) -> Completion:
         """Return a full completion or raise a ``GatewayError``."""
         ...

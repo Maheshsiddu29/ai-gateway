@@ -13,15 +13,15 @@ from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 from starlette.routing import Route
-from starlette.types import ASGIApp, Receive
+from starlette.types import Receive
 
 from gateway.main import build_app
 from tests.fakes import AUTH_HEADERS, make_config, make_settings, openai_chunk, sse_body
+from tests.servers import run_server
 
 TIMEOUT_SECONDS = 5
 STREAM_REQUEST = {"model": "fast", "messages": [{"role": "user", "content": "hi"}], "stream": True}
@@ -84,31 +84,6 @@ class FakeUpstream:
         await self.release.wait()
         body = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
         yield json.dumps(body).encode()
-
-
-@asynccontextmanager
-async def run_server(app: ASGIApp) -> AsyncIterator[str]:
-    config = uvicorn.Config(
-        app,
-        host="127.0.0.1",
-        port=0,
-        log_config=None,
-        access_log=False,
-        timeout_graceful_shutdown=1,
-    )
-    server = uvicorn.Server(config)
-    task = asyncio.create_task(server.serve())
-    async with asyncio.timeout(TIMEOUT_SECONDS):
-        while not server.started:
-            if task.done():
-                task.result()
-            await asyncio.sleep(0.01)
-    port = server.servers[0].sockets[0].getsockname()[1]
-    try:
-        yield f"http://127.0.0.1:{port}"
-    finally:
-        server.should_exit = True
-        await task
 
 
 @asynccontextmanager

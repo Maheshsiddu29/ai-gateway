@@ -33,3 +33,38 @@ class Metrics:
             ["stream"],
             registry=self.registry,
         )
+        self.admission_decisions = Counter(
+            "gateway_admission_decisions",
+            "Admission decisions by outcome.",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.admission_duration = Histogram(
+            "gateway_admission_duration_seconds",
+            "Time taken to obtain an admission decision from Redis.",
+            buckets=_LATENCY_BUCKETS,
+            registry=self.registry,
+        )
+        self.reservations_settled = Counter(
+            "gateway_reservations_settled",
+            "Reservation settlements by outcome; 'failed' leaves the reservation to expire.",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.reserved_tokens = Counter(
+            "gateway_reserved_tokens",
+            "Tokens reserved at admission (estimated input plus output allowance).",
+            registry=self.registry,
+        )
+        self.charged_tokens = Counter(
+            "gateway_charged_tokens",
+            "Tokens charged at settlement, by whether usage was reported by the provider.",
+            ["usage"],
+            registry=self.registry,
+        )
+        self.redis_errors = Counter(
+            "gateway_redis_errors",
+            "Failed Redis operations.",
+            ["operation"],
+            registry=self.registry,
+        )

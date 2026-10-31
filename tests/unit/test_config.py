@@ -236,3 +236,78 @@ def test_repository_config_files_are_valid(path: Path) -> None:
     }
 
     load_config(settings, environ)
+
+
+ADMISSION_CONFIG = (
+    VALID_CONFIG
+    + """
+[admission]
+enabled = true
+
+[admission.default_limits]
+requests_per_minute = 60
+tokens_per_minute = 10000
+max_concurrent_requests = 4
+
+[admission.key_limits.key-0123456789ab]
+requests_per_minute = 600
+request_burst = 50
+"""
+)
+
+
+class TestAdmissionConfig:
+    def test_loads_default_and_per_key_limits(self, tmp_path: Path) -> None:
+        settings = make_settings(
+            write_config(tmp_path, ADMISSION_CONFIG), redis_url="redis://redis.internal:6379/0"
+        )
+
+        admission = load_config(settings, PROVIDER_KEYS).gateway.admission
+
+        assert admission.enabled
+        assert admission.limits_for("key-ffffffffffff").max_concurrent_requests == 4
+        overridden = admission.limits_for("key-0123456789ab")
+        assert overridden.request_burst == 50
+        # Overrides replace the defaults rather than merging with them.
+        assert overridden.tokens_per_minute is None
+
+    def test_requires_a_redis_url_when_enabled(self, tmp_path: Path) -> None:
+        settings = make_settings(write_config(tmp_path, ADMISSION_CONFIG))
+
+        with pytest.raises(ConfigurationError, match="GATEWAY_REDIS_URL"):
+            load_config(settings, PROVIDER_KEYS)
+
+    def test_absent_section_disables_admission(self, tmp_path: Path) -> None:
+        settings = make_settings(write_config(tmp_path, VALID_CONFIG))
+
+        assert not load_config(settings, PROVIDER_KEYS).gateway.admission.enabled
+
+    @pytest.mark.parametrize(
+        ("addition", "message"),
+        [
+            ("[admission.default_limits]\nrequest_burst = 5\n", "request_burst requires"),
+            ("[admission.default_limits]\ntoken_burst = 5\n", "token_burst requires"),
+            ("[admission.default_limits]\nrequests_per_minute = 0\n", "requests_per_minute"),
+            ("[admission.key_limits.my-raw-api-key]\nrequests_per_minute = 1\n", "key_limits"),
+            ("[admission]\nlease_grace_seconds = 0\n", "lease_grace_seconds"),
+        ],
+    )
+    def test_rejects_invalid_admission_settings(
+        self, tmp_path: Path, addition: str, message: str
+    ) -> None:
+        settings = make_settings(write_config(tmp_path, VALID_CONFIG + addition))
+
+        with pytest.raises(ConfigurationError, match=message):
+            load_config(settings, PROVIDER_KEYS)
+
+    def test_redis_url_scheme_is_validated_without_echoing_it(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            make_settings(Path("unused.toml"), redis_url="http://user:hunter2@redis")
+
+        assert "hunter2" not in str(exc_info.value)
+        assert "redis_url" in str(exc_info.value)
+
+    def test_redis_url_is_masked_in_repr(self) -> None:
+        settings = make_settings(Path("unused.toml"), redis_url="redis://:hunter2@redis:6379")
+
+        assert "hunter2" not in repr(settings)

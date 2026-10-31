@@ -105,6 +105,10 @@ class OpenAICompatibleProvider:
     def name(self) -> str:
         return self._name
 
+    def validate(self, request: ProviderRequest) -> None:
+        # Every field of the gateway's request subset maps directly onto this API.
+        return
+
     async def complete(self, request: ProviderRequest) -> Completion:
         try:
             response = await self._client.post(

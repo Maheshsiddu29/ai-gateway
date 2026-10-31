@@ -18,6 +18,8 @@ class ErrorType(StrEnum):
     PROVIDER_RATE_LIMITED = "provider_rate_limited"
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    RATE_LIMITED = "rate_limited"
+    ADMISSION_UNAVAILABLE = "admission_unavailable"
     DEADLINE_EXCEEDED = "deadline_exceeded"
     INTERNAL = "internal_error"
 
@@ -34,12 +36,15 @@ class GatewayError(Exception):
         code: str | None = None,
         param: str | None = None,
         status_code: int | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code or self.default_code
         self.param = param
         self.status_code = status_code or self.default_status_code
+        # Sent to the client as Retry-After when set.
+        self.retry_after_seconds = retry_after_seconds
 
 
 class AuthenticationError(GatewayError):
@@ -64,6 +69,22 @@ class InternalGatewayError(GatewayError):
     pass
 
 
+class RateLimitedError(GatewayError):
+    """A gateway admission limit (requests, tokens, or concurrency) was reached."""
+
+    error_type = ErrorType.RATE_LIMITED
+    default_status_code = 429
+    default_code = "rate_limited"
+
+
+class AdmissionUnavailableError(GatewayError):
+    """No trustworthy admission decision could be made, so the request was refused."""
+
+    error_type = ErrorType.ADMISSION_UNAVAILABLE
+    default_status_code = 503
+    default_code = "admission_unavailable"
+
+
 class DeadlineExceededError(GatewayError):
     """The request's end-to-end deadline expired before it completed."""
 
@@ -77,6 +98,11 @@ class ProviderError(GatewayError):
 
     ``upstream_status`` and ``upstream_error_type`` are recorded for logs only and
     are never included in client responses.
+
+    ``may_have_processed`` is False only when the provider certainly did not run the
+    request: the connection was never established, or the provider answered with an
+    error status. It decides whether the attempt is charged against token limits and
+    whether it may be retried. It defaults to True, the safe assumption.
     """
 
     def __init__(
@@ -86,10 +112,13 @@ class ProviderError(GatewayError):
         code: str | None = None,
         upstream_status: int | None = None,
         upstream_error_type: str | None = None,
+        retry_after_seconds: int | None = None,
+        may_have_processed: bool = True,
     ) -> None:
-        super().__init__(message, code=code)
+        super().__init__(message, code=code, retry_after_seconds=retry_after_seconds)
         self.upstream_status = upstream_status
         self.upstream_error_type = upstream_error_type
+        self.may_have_processed = may_have_processed
 
 
 class ProviderRejectedRequestError(ProviderError):
@@ -110,19 +139,6 @@ class ProviderRateLimitError(ProviderError):
     error_type = ErrorType.PROVIDER_RATE_LIMITED
     default_status_code = 429
     default_code = "provider_rate_limited"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        retry_after_seconds: int | None = None,
-        upstream_status: int | None = None,
-        upstream_error_type: str | None = None,
-    ) -> None:
-        super().__init__(
-            message, upstream_status=upstream_status, upstream_error_type=upstream_error_type
-        )
-        self.retry_after_seconds = retry_after_seconds
 
 
 class ProviderTimeoutError(ProviderError):

@@ -18,6 +18,14 @@ from gateway.errors import (
 
 USER_AGENT = f"ai-gateway/{__version__}"
 _MAX_RETRY_AFTER_SECONDS = 86_400
+_UNCERTAIN_STATUSES = (408, 504)
+_NOT_SENT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.UnsupportedProtocol,
+    httpx.LocalProtocolError,
+)
 _TIMEOUT_CODES: dict[type[httpx.TimeoutException], str] = {
     httpx.ConnectTimeout: "provider_connect_timeout",
     httpx.ReadTimeout: "provider_read_timeout",
@@ -59,13 +67,20 @@ def create_client(
 
 
 def error_from_transport(exc: httpx.TransportError) -> ProviderError:
+    # Only failures before the request was sent prove the provider did not run it.
+    # A read timeout or a dropped connection may follow a request the provider
+    # received and is still processing.
+    not_sent = isinstance(exc, _NOT_SENT_ERRORS)
     if isinstance(exc, httpx.TimeoutException):
         return ProviderTimeoutError(
             "The provider did not respond in time.",
             code=_TIMEOUT_CODES.get(type(exc), "provider_timeout"),
+            may_have_processed=not not_sent,
         )
     return ProviderUnavailableError(
-        "Could not communicate with the provider.", code="provider_connection_error"
+        "Could not communicate with the provider.",
+        code="provider_connection_error",
+        may_have_processed=not not_sent,
     )
 
 
@@ -78,12 +93,16 @@ def error_from_status(response: httpx.Response) -> ProviderError:
     """
     status = response.status_code
     error_type = _upstream_error_type(response)
+    # An error status means the provider did not produce a completion, except for
+    # timeouts reported by an intermediary, behind which the request may still run.
+    processed = status in _UNCERTAIN_STATUSES
 
     if status in (400, 413, 422):
         return ProviderRejectedRequestError(
             "The provider rejected the request.",
             upstream_status=status,
             upstream_error_type=error_type,
+            may_have_processed=processed,
         )
     if status in (401, 402, 403):
         return ProviderConfigurationError(
@@ -91,6 +110,7 @@ def error_from_status(response: httpx.Response) -> ProviderError:
             code="provider_authentication_failed",
             upstream_status=status,
             upstream_error_type=error_type,
+            may_have_processed=processed,
         )
     if status == 404:
         return ProviderConfigurationError(
@@ -98,6 +118,7 @@ def error_from_status(response: httpx.Response) -> ProviderError:
             code="provider_not_found",
             upstream_status=status,
             upstream_error_type=error_type,
+            may_have_processed=processed,
         )
     if status == 429:
         return ProviderRateLimitError(
@@ -105,10 +126,14 @@ def error_from_status(response: httpx.Response) -> ProviderError:
             retry_after_seconds=_retry_after_seconds(response),
             upstream_status=status,
             upstream_error_type=error_type,
+            may_have_processed=processed,
         )
-    if status in (408, 504):
+    if status in _UNCERTAIN_STATUSES:
         return ProviderTimeoutError(
-            "The provider timed out.", upstream_status=status, upstream_error_type=error_type
+            "The provider timed out.",
+            upstream_status=status,
+            upstream_error_type=error_type,
+            may_have_processed=processed,
         )
     return ProviderUnavailableError(
         "The provider is unavailable."
@@ -117,6 +142,7 @@ def error_from_status(response: httpx.Response) -> ProviderError:
         code="provider_server_error" if status >= 500 else "unexpected_provider_status",
         upstream_status=status,
         upstream_error_type=error_type,
+        may_have_processed=processed,
     )
 
 

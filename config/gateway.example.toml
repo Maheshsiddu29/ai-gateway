@@ -43,3 +43,18 @@ default_max_tokens = 4096
 [models.local]
 provider = "local"
 model = "replace-with-served-model-name"
+
+# Distributed admission control. Requires GATEWAY_REDIS_URL. See
+# docs/admission-control.md.
+#
+# [admission]
+# enabled = true
+#
+# [admission.default_limits]
+# requests_per_minute = 60
+# request_burst = 10
+# tokens_per_minute = 100000
+# max_concurrent_requests = 8
+#
+# With a token limit, every model needs an output bound, for example
+# max_output_tokens = 4096 in its [models.<alias>] table.

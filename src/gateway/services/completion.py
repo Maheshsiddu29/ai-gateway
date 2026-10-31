@@ -1,8 +1,16 @@
 """Model alias resolution and the completion request lifecycle.
 
-The service is independent of HTTP: it receives a validated request and an
-authenticated principal, dispatches to the provider configured for the alias, and
-emits one ``completion finished`` log event per request with the outcome.
+The service is independent of HTTP. For each request it:
+
+1. resolves the alias and builds the provider request, applying the model's output
+   token ceiling, and lets the provider validate it;
+2. obtains admission (when admission control is enabled), reserving the estimated
+   input tokens plus the output allowance;
+3. calls the provider within the request deadline;
+4. settles the reservation with the usage recorded for every attempt, on every exit
+   path including cancellation.
+
+It emits one ``completion finished`` log event per request with the outcome.
 """
 
 import asyncio
@@ -12,6 +20,10 @@ from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
 
+from gateway.admission.controller import AdmissionController
+from gateway.admission.redis_store import Admission
+from gateway.admission.tokens import estimate_input_tokens
+from gateway.admission.usage import UsageLedger
 from gateway.core.config import GatewayConfig
 from gateway.core.metrics import Metrics
 from gateway.core.security import Principal
@@ -43,6 +55,7 @@ class ModelRoute:
     provider: str
     upstream_model: str
     default_max_tokens: int | None
+    max_output_tokens: int | None
 
 
 def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
@@ -52,9 +65,17 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
             provider=model.provider,
             upstream_model=model.model,
             default_max_tokens=model.default_max_tokens,
+            max_output_tokens=model.max_output_tokens,
         )
         for alias, model in config.models.items()
     }
+
+
+@dataclass(frozen=True)
+class _Plan:
+    route: ModelRoute
+    provider: Provider
+    request: ProviderRequest
 
 
 class CompletionService:
@@ -63,6 +84,7 @@ class CompletionService:
         routes: Mapping[str, ModelRoute],
         providers: Mapping[str, Provider],
         metrics: Metrics,
+        admission: AdmissionController | None = None,
     ) -> None:
         missing = {route.provider for route in routes.values()} - providers.keys()
         if missing:
@@ -70,15 +92,27 @@ class CompletionService:
         self._routes = dict(routes)
         self._providers = dict(providers)
         self._metrics = metrics
+        self._admission = admission
 
     async def complete(
         self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
     ) -> Completion:
-        route, provider = self._resolve(request.model)
-        trace = _CompletionTrace(principal, route, self._metrics, stream=False)
+        plan = self._plan(request)
+        trace = _CompletionTrace(principal, plan.route, self._metrics, stream=False)
+        ledger = UsageLedger()
         try:
-            async with deadline.limit():
-                completion = await provider.complete(_provider_request(request, route))
+            admission = await self._admit(principal, plan, deadline, trace)
+            try:
+                attempt = ledger.start(plan.route.provider)
+                try:
+                    async with deadline.limit():
+                        completion = await plan.provider.complete(plan.request)
+                except BaseException as exc:
+                    attempt.failed(exc)
+                    raise
+                attempt.succeeded(completion.usage)
+            finally:
+                await self._settle(admission, ledger)
         except BaseException as exc:
             trace.failed(exc)
             raise
@@ -91,34 +125,44 @@ class CompletionService:
         """Relay provider stream events, logging the outcome once the stream ends.
 
         Closing this generator early (client disconnect) closes the provider
-        stream and is logged as a cancellation. The deadline bounds each wait for
-        the next upstream event; the time a slow client takes to read is bounded by
-        the response (see api.streaming).
+        stream, settles the reservation, and is logged as a cancellation. The
+        deadline bounds each wait for the next upstream event; the time a slow
+        client takes to read is bounded by the response (see api.streaming).
         """
-        route, provider = self._resolve(request.model)
-        trace = _CompletionTrace(principal, route, self._metrics, stream=True)
+        plan = self._plan(request)
+        trace = _CompletionTrace(principal, plan.route, self._metrics, stream=True)
+        ledger = UsageLedger()
         end: StreamEnd | None = None
         try:
-            async with aclosing(provider.stream(_provider_request(request, route))) as events:
-                while True:
-                    async with deadline.limit():
-                        event = await anext(events, None)
-                    if event is None:
-                        break
-                    if isinstance(event, TextDelta):
-                        trace.first_token()
-                    else:
-                        end = event
-                    yield event
-            if end is None:
-                raise InternalGatewayError("The provider stream ended unexpectedly.")
+            admission = await self._admit(principal, plan, deadline, trace)
+            attempt = ledger.start(plan.route.provider)
+            try:
+                async with aclosing(plan.provider.stream(plan.request)) as events:
+                    while True:
+                        async with deadline.limit():
+                            event = await anext(events, None)
+                        if event is None:
+                            break
+                        if isinstance(event, TextDelta):
+                            trace.first_token()
+                        else:
+                            end = event
+                            attempt.succeeded(event.usage)
+                        yield event
+                if end is None:
+                    raise InternalGatewayError("The provider stream ended unexpectedly.")
+            except BaseException as exc:
+                attempt.failed(exc)
+                raise
+            finally:
+                await self._settle(admission, ledger)
         except BaseException as exc:
             trace.failed(exc)
             raise
         trace.succeeded(end.finish_reason, end.usage, provider_response_id=None)
 
-    def _resolve(self, alias: str) -> tuple[ModelRoute, Provider]:
-        route = self._routes.get(alias)
+    def _plan(self, request: ChatCompletionRequest) -> _Plan:
+        route = self._routes.get(request.model)
         if route is None:
             raise InvalidRequestError(
                 "The requested model is not configured.",
@@ -126,21 +170,68 @@ class CompletionService:
                 param="model",
                 status_code=404,
             )
-        return route, self._providers[route.provider]
+        provider = self._providers[route.provider]
+        provider_request = _provider_request(request, route)
+        provider.validate(provider_request)
+        return _Plan(route, provider, provider_request)
+
+    async def _admit(
+        self, principal: Principal, plan: _Plan, deadline: Deadline, trace: "_CompletionTrace"
+    ) -> Admission | None:
+        if self._admission is None:
+            return None
+        limits = self._admission.limits_for(principal)
+        tokens = 0
+        if limits.tokens is not None:
+            if plan.request.max_tokens is None:
+                raise InvalidRequestError(
+                    "max_tokens is required because this key has a token rate limit"
+                    " and the model has no output token limit.",
+                    code="max_tokens_required",
+                    param="max_tokens",
+                )
+            estimated_input = estimate_input_tokens(plan.request.messages)
+            tokens = estimated_input + plan.request.max_tokens
+            trace.reserved(estimated_input, tokens)
+            if tokens > limits.tokens.capacity:
+                raise InvalidRequestError(
+                    "The request's token reservation (estimated input plus max_tokens)"
+                    " exceeds this key's token rate limit.",
+                    code="token_reservation_exceeds_limit",
+                    param="max_tokens",
+                )
+        return await self._admission.admit(principal, limits, tokens, deadline)
+
+    async def _settle(self, admission: Admission | None, ledger: UsageLedger) -> None:
+        if self._admission is not None and admission is not None:
+            await self._admission.settle(admission, ledger)
 
 
 def _provider_request(request: ChatCompletionRequest, route: ModelRoute) -> ProviderRequest:
     return ProviderRequest(
         model=route.upstream_model,
         messages=tuple(request.messages),
-        max_tokens=request.max_tokens
-        if request.max_tokens is not None
-        else route.default_max_tokens,
+        max_tokens=_output_allowance(request.max_tokens, route),
         temperature=request.temperature,
         top_p=request.top_p,
         stop=tuple(request.stop or ()),
         include_usage=request.include_usage,
     )
+
+
+def _output_allowance(requested: int | None, route: ModelRoute) -> int | None:
+    """The max_tokens sent upstream. It is always sent when the model has a ceiling,
+    so the provider enforces the bound that admission reserved for."""
+    ceiling = route.max_output_tokens
+    if requested is not None and ceiling is not None and requested > ceiling:
+        raise InvalidRequestError(
+            f"max_tokens exceeds this model's limit of {ceiling}.",
+            code="max_tokens_exceeds_limit",
+            param="max_tokens",
+        )
+    if requested is not None:
+        return requested
+    return route.default_max_tokens if route.default_max_tokens is not None else ceiling
 
 
 class _CompletionTrace:
@@ -162,6 +253,10 @@ class _CompletionTrace:
             "upstream_model": route.upstream_model,
             "stream": stream,
         }
+
+    def reserved(self, estimated_input_tokens: int, reserved_tokens: int) -> None:
+        self._fields["estimated_input_tokens"] = estimated_input_tokens
+        self._fields["reserved_tokens"] = reserved_tokens
 
     def first_token(self) -> None:
         self._fields.setdefault(

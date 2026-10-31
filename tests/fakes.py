@@ -45,6 +45,7 @@ class FakeProvider:
         completion: Completion | None = None,
         events: list[StreamEvent | BaseException] | None = None,
         error: BaseException | None = None,
+        validation_error: Exception | None = None,
     ) -> None:
         self._name = name
         self._completion = completion or Completion(
@@ -52,12 +53,17 @@ class FakeProvider:
         )
         self._events = events or []
         self._error = error
+        self._validation_error = validation_error
         self.requests: list[ProviderRequest] = []
         self.closed = False
 
     @property
     def name(self) -> str:
         return self._name
+
+    def validate(self, request: ProviderRequest) -> None:
+        if self._validation_error is not None:
+            raise self._validation_error
 
     async def complete(self, request: ProviderRequest) -> Completion:
         self.requests.append(request)

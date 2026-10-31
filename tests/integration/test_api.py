@@ -88,7 +88,10 @@ class TestAuthentication:
         self, client: httpx.AsyncClient
     ) -> None:
         assert (await client.get("/health/live")).json() == {"status": "ok"}
-        assert (await client.get("/health/ready")).json() == {"status": "ready"}
+        assert (await client.get("/health/ready")).json() == {
+            "status": "ready",
+            "admission": "disabled",
+        }
 
 
 class TestCompletionResponse:

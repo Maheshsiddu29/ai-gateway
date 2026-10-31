@@ -32,6 +32,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from gateway.errors import ConfigurationError
+from gateway.schemas.completions import MAX_OUTPUT_TOKENS
 
 MIN_PRODUCTION_API_KEY_LENGTH = 32
 
@@ -41,6 +42,7 @@ EnvVarName = Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 # The non-secret identifier of a gateway key; see core.security.Principal.
 PrincipalId = Annotated[str, Field(pattern=r"^key-[0-9a-f]{12}$")]
+_REDIS_URL_SCHEMES = ("redis://", "rediss://", "unix://")
 # Keeps token-bucket arithmetic well within the exact integer range of the
 # double-precision numbers used by Redis Lua scripts.
 MAX_RATE_LIMIT = 1_000_000_000
@@ -60,6 +62,8 @@ class Settings(BaseSettings):
     config_file: Path = Path("config/gateway.toml")
     log_level: LogLevel = "INFO"
     max_request_bytes: int = Field(default=1_048_576, ge=1024, le=64 * 1_048_576)
+    # May embed a password, so it is held as a secret and never logged.
+    redis_url: SecretStr | None = None
 
     @field_validator("api_keys", mode="before")
     @classmethod
@@ -67,6 +71,13 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return tuple(key.strip() for key in value.split(",") if key.strip())
         return value
+
+    @field_validator("redis_url")
+    @classmethod
+    def _check_redis_url(cls, url: SecretStr | None) -> SecretStr | None:
+        if url is not None and not url.get_secret_value().startswith(_REDIS_URL_SCHEMES):
+            raise ValueError(f"redis_url must start with one of {', '.join(_REDIS_URL_SCHEMES)}")
+        return url
 
     @model_validator(mode="after")
     def _check_production_keys(self) -> "Settings":
@@ -125,6 +136,20 @@ class ModelConfig(BaseModel):
     provider: ProviderName
     model: str = Field(min_length=1, max_length=256)
     default_max_tokens: int | None = Field(default=None, ge=1)
+    # Requests asking for more are rejected, and requests that do not specify
+    # max_tokens are sent this value (unless default_max_tokens is set), so that every
+    # request has a known output bound.
+    max_output_tokens: int | None = Field(default=None, ge=1, le=MAX_OUTPUT_TOKENS)
+
+    @model_validator(mode="after")
+    def _check_output_limits(self) -> "ModelConfig":
+        if (
+            self.default_max_tokens is not None
+            and self.max_output_tokens is not None
+            and self.default_max_tokens > self.max_output_tokens
+        ):
+            raise ValueError("default_max_tokens must not exceed max_output_tokens")
+        return self
 
 
 RateLimit = Annotated[int, Field(ge=1, le=MAX_RATE_LIMIT)]
@@ -193,6 +218,7 @@ class GatewayConfig(BaseModel):
     providers: dict[ProviderName, ProviderConfig] = Field(min_length=1)
     models: dict[ModelAlias, ModelConfig] = Field(min_length=1)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
+    admission: AdmissionConfig = Field(default_factory=AdmissionConfig)
 
     @model_validator(mode="after")
     def _check_model_providers(self) -> "GatewayConfig":
@@ -213,7 +239,15 @@ def load_config(settings: Settings, environ: Mapping[str, str]) -> LoadedConfig:
     gateway = _read_gateway_config(settings.config_file)
     if settings.environment is Environment.PRODUCTION:
         _check_production_transport(gateway)
+    if gateway.admission.enabled:
+        require_redis_url(settings)
     return LoadedConfig(gateway=gateway, provider_api_keys=_resolve_api_keys(gateway, environ))
+
+
+def require_redis_url(settings: Settings) -> SecretStr:
+    if settings.redis_url is None:
+        raise ConfigurationError("admission control is enabled but GATEWAY_REDIS_URL is not set")
+    return settings.redis_url
 
 
 def _read_gateway_config(path: Path) -> GatewayConfig:
