@@ -9,6 +9,8 @@ from prometheus_client import CollectorRegistry, Counter, Histogram
 
 # Covers fast admission decisions and long completions alike.
 _LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300)
+# Routing decisions are in-memory computations measured in microseconds.
+_ROUTING_BUCKETS = (0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.01)
 
 
 class Metrics:
@@ -149,5 +151,31 @@ class Metrics:
             "Committed budget utilization at admission by scope and period.",
             ["scope", "period"],
             buckets=(0, 0.25, 0.5, 0.75, 0.9, 1, 1.25, 2, 5),
+            registry=self.registry,
+        )
+        self.routing_decisions = Counter(
+            "gateway_routing_decisions",
+            "Routing decisions for aliases with a dynamic policy, by reason and the provider"
+            " tried first ('none' when the request was refused).",
+            ["alias", "policy", "reason", "provider"],
+            registry=self.registry,
+        )
+        self.routing_exclusions = Counter(
+            "gateway_routing_exclusions",
+            "Candidates excluded from routing decisions, by reason.",
+            ["alias", "reason"],
+            registry=self.registry,
+        )
+        self.routing_decision_duration = Histogram(
+            "gateway_routing_decision_duration_seconds",
+            "Time to plan a request, including routing for aliases with a dynamic policy.",
+            ["policy"],
+            buckets=_ROUTING_BUCKETS,
+            registry=self.registry,
+        )
+        self.routing_evidence_refreshes = Counter(
+            "gateway_routing_evidence_refreshes",
+            "Evaluation evidence snapshot loads by outcome.",
+            ["outcome"],
             registry=self.registry,
         )

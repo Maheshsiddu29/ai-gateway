@@ -6,6 +6,8 @@ advertises a capability only if the operator lists it and the provider's adapter
 implements it (checked at startup in ``gateway.core.config``).
 """
 
+from dataclasses import dataclass
+from datetime import timedelta
 from enum import StrEnum
 from typing import Annotated
 
@@ -75,6 +77,16 @@ class InsufficientEvidence(StrEnum):
     REJECT = "reject"
 
 
+@dataclass(frozen=True)
+class QualityRules:
+    dataset: str
+    dataset_version: str
+    min_success_rate: float
+    min_samples: int
+    max_evidence_age: timedelta
+    max_p95_latency_ms: int | None
+
+
 _QUALITY_FIELDS = (
     "dataset",
     "dataset_version",
@@ -126,6 +138,26 @@ class AliasRouting(BaseModel):
         if len(set(targets)) != len(targets):
             raise ValueError("routing candidates must not repeat")
         return self
+
+    def quality_rules(self) -> QualityRules | None:
+        if self.policy is not RoutingPolicy.QUALITY_CONSTRAINED:
+            return None
+        if (
+            self.dataset is None
+            or self.dataset_version is None
+            or self.min_success_rate is None
+            or self.min_samples is None
+            or self.max_evidence_age_days is None
+        ):
+            raise ValueError("quality_constrained routing is missing evidence rules")
+        return QualityRules(
+            dataset=self.dataset,
+            dataset_version=self.dataset_version,
+            min_success_rate=self.min_success_rate,
+            min_samples=self.min_samples,
+            max_evidence_age=timedelta(days=self.max_evidence_age_days),
+            max_p95_latency_ms=self.max_p95_latency_ms,
+        )
 
 
 class RoutingConfig(BaseModel):
