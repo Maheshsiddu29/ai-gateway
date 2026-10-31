@@ -1,0 +1,95 @@
+# Configuration for exercising tools/routing_experiment.py with SIMULATED
+# evaluation results (python -m gateway.evaluation run --simulate ...).
+#
+# The provider, its models, and their prices are fictional. They give the three
+# candidates different prices so that the policies choose differently. They are
+# not real vendors or real rates.
+
+[providers.sim]
+type = "openai_compatible"
+base_url = "https://simulated.invalid/v1"
+
+[models.classify]
+provider = "sim"
+model = "large"
+max_output_tokens = 8
+
+[models.classify.routing]
+policy = "quality_constrained"
+candidates = [
+    { provider = "sim", model = "small" },
+    { provider = "sim", model = "medium" },
+]
+dataset = "support-ticket-category"
+dataset_version = "1"
+min_success_rate = 0.75
+min_samples = 40
+max_evidence_age_days = 30
+
+[models.extract]
+provider = "sim"
+model = "large"
+max_output_tokens = 128
+
+[models.extract.routing]
+policy = "quality_constrained"
+candidates = [
+    { provider = "sim", model = "small" },
+    { provider = "sim", model = "medium" },
+]
+dataset = "invoice-fields"
+dataset_version = "1"
+min_success_rate = 0.75
+min_samples = 40
+max_evidence_age_days = 30
+
+[cost]
+enabled = true
+
+[[cost.pricing]]
+provider = "sim"
+model = "small"
+version = "fictional-1"
+effective_at = 2026-01-01T00:00:00Z
+input_per_million_usd = "0.10"
+output_per_million_usd = "0.40"
+
+[[cost.pricing]]
+provider = "sim"
+model = "medium"
+version = "fictional-1"
+effective_at = 2026-01-01T00:00:00Z
+input_per_million_usd = "0.50"
+output_per_million_usd = "2.00"
+
+[[cost.pricing]]
+provider = "sim"
+model = "large"
+version = "fictional-1"
+effective_at = 2026-01-01T00:00:00Z
+input_per_million_usd = "3.00"
+output_per_million_usd = "15.00"
+
+[routing]
+enabled = true
+
+[[routing.models]]
+provider = "sim"
+model = "small"
+context_window_tokens = 8192
+max_output_tokens = 1024
+capabilities = ["stop"]
+
+[[routing.models]]
+provider = "sim"
+model = "medium"
+context_window_tokens = 8192
+max_output_tokens = 1024
+capabilities = ["stop"]
+
+[[routing.models]]
+provider = "sim"
+model = "large"
+context_window_tokens = 8192
+max_output_tokens = 1024
+capabilities = ["stop"]
