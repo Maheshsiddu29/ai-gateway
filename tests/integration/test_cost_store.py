@@ -5,6 +5,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from multiprocessing import get_context
@@ -12,6 +13,7 @@ from multiprocessing import get_context
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection
 
 from gateway.cost.config import CostConfig, SpendingLimits
 from gateway.cost.pricing import Price, PriceCatalog
@@ -159,6 +161,112 @@ async def test_duplicate_reservation_rolls_back_budget_updates(store: CostStore)
             )
         ).scalar_one()
     assert value == 3
+
+
+async def test_lost_reservation_commit_ack_fails_closed_without_duplicate_charge(
+    store: CostStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    principal = f"test-{uuid.uuid4()}"
+    attempt = uuid.uuid4()
+    transaction = store._transaction
+
+    @asynccontextmanager
+    async def lose_commit_ack() -> AsyncIterator[AsyncConnection]:
+        async with transaction() as connection:
+            yield connection
+        raise OSError("commit acknowledgement lost")
+
+    monkeypatch.setattr(store, "_transaction", lose_commit_ack)
+    with pytest.raises(AdmissionUnavailableError):
+        await store.reserve(
+            attempt_id=attempt,
+            request_id=uuid.uuid4(),
+            principal_id=principal,
+            provider="mock",
+            model="model",
+            estimated_input_tokens=3,
+            maximum_output_tokens=0,
+        )
+    monkeypatch.setattr(store, "_transaction", transaction)
+    async with store.engine.connect() as connection:
+        attempts = (
+            await connection.execute(
+                text("SELECT COUNT(*) FROM cost_attempts WHERE attempt_id=CAST(:id AS uuid)"),
+                {"id": str(attempt)},
+            )
+        ).scalar_one()
+        reserved = (
+            await connection.execute(
+                text("""SELECT reserved_micro_usd FROM budget_periods
+                WHERE subject_id=:principal AND period_kind='daily'"""),
+                {"principal": principal},
+            )
+        ).scalar_one()
+    assert (attempts, reserved) == (1, 3)
+    with pytest.raises(AdmissionUnavailableError):
+        await store.reserve(
+            attempt_id=attempt,
+            request_id=uuid.uuid4(),
+            principal_id=principal,
+            provider="mock",
+            model="model",
+            estimated_input_tokens=3,
+            maximum_output_tokens=0,
+        )
+    async with store.engine.begin() as connection:
+        await connection.execute(
+            text("""UPDATE cost_attempts SET expires_at=clock_timestamp()-interval '1 second'
+            WHERE attempt_id=CAST(:id AS uuid)"""),
+            {"id": str(attempt)},
+        )
+    await store.recover_expired()
+    async with store.engine.connect() as connection:
+        state = (
+            await connection.execute(
+                text("SELECT state FROM cost_attempts WHERE attempt_id=CAST(:id AS uuid)"),
+                {"id": str(attempt)},
+            )
+        ).scalar_one()
+    assert state == "released"
+
+
+async def test_lost_settlement_commit_ack_does_not_create_duplicate_event(
+    store: CostStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempt = await reserve(store, f"test-{uuid.uuid4()}", 3)
+    await store.dispatch(attempt)
+    transaction = store._transaction
+
+    @asynccontextmanager
+    async def lose_commit_ack() -> AsyncIterator[AsyncConnection]:
+        async with transaction() as connection:
+            yield connection
+        raise OSError("commit acknowledgement lost")
+
+    monkeypatch.setattr(store, "_transaction", lose_commit_ack)
+    with pytest.raises(AdmissionUnavailableError):
+        await store.settle(
+            attempt, Usage(2, 0, 2), may_have_processed=True, classification="success"
+        )
+    monkeypatch.setattr(store, "_transaction", transaction)
+    await store.settle(attempt, Usage(2, 0, 2), may_have_processed=True, classification="success")
+    async with store.engine.connect() as connection:
+        row = (
+            await connection.execute(
+                text("""SELECT state, charge_micro_usd FROM cost_attempts
+                WHERE attempt_id=CAST(:id AS uuid)"""),
+                {"id": str(attempt)},
+            )
+        ).one()
+        events = (
+            await connection.execute(
+                text("""SELECT COUNT(*) FROM cost_events
+                WHERE attempt_id=CAST(:id AS uuid) AND event_type='settled'"""),
+                {"id": str(attempt)},
+            )
+        ).scalar_one()
+    assert row == ("settled", 2)
+    assert events == 1
 
 
 async def test_reconnects_after_postgres_terminates_a_pooled_connection(
