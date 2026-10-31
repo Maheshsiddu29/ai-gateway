@@ -124,6 +124,10 @@ class EventStreamResponse(StreamingResponse):
                     break
                 async with self._deadline.limit():
                     await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                if chunk == SSE_DONE:
+                    # Generation and settlement are complete. Do not start another
+                    # deadline-bound read that could append an error after [DONE].
+                    break
         except DeadlineExceededError as exc:
             logger.warning("request deadline exceeded while sending a stream")
             # Reads and writes share the deadline, but no second timer wraps the

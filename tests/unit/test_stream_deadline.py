@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 import httpx
 from starlette.types import Message
 
+from gateway.api.encoding import SSE_DONE
 from gateway.api.streaming import EventStreamResponse
 from gateway.resilience.deadline import Deadline
 
@@ -61,3 +62,22 @@ async def test_expiry_before_response_start_closes_the_prefetched_provider() -> 
         result = await client.get("/")
     assert result.status_code == 504
     assert released.is_set()
+
+
+async def test_deadline_after_done_cannot_append_an_error_event() -> None:
+    clock = [0.0]
+    deadline = Deadline(1, clock=lambda: clock[0])
+    sent: list[Message] = []
+
+    async def body() -> AsyncGenerator[bytes]:
+        yield SSE_DONE
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+        if message.get("body") == SSE_DONE:
+            clock[0] += 2
+
+    content = body()
+    await EventStreamResponse(deadline, content).stream_response(send)
+    await content.aclose()
+    assert [m["body"] for m in sent if m["type"] == "http.response.body"] == [SSE_DONE, b""]

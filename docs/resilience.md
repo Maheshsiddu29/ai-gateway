@@ -141,3 +141,6 @@ Buffered JSON completions also check the deadline before headers and on body
 writes. Expiry before headers returns JSON 504. If a body write stalls after
 headers, the connection is aborted; the incomplete `Content-Length` response
 lets the client detect failure.
+
+After a successfully delivered `[DONE]`, the response ends immediately. A deadline
+that expires at that boundary cannot append an error after the success marker.
