@@ -75,7 +75,8 @@ async def _read_limited_body(request: Request, limit: int) -> bytes:
     )
     declared = request.headers.get("content-length")
     if declared is not None:
-        if not declared.isdigit():
+        # isdigit alone also accepts non-ASCII digits such as "²", which int() rejects.
+        if not (declared.isascii() and declared.isdigit()):
             raise InvalidRequestError("Invalid Content-Length header.", code="invalid_header")
         if int(declared) > limit:
             raise too_large

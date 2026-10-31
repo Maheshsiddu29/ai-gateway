@@ -10,7 +10,14 @@ import pytest
 from gateway.errors import ProviderRateLimitError
 from gateway.main import build_app
 from gateway.providers.base import Completion, Usage
-from tests.fakes import AUTH_HEADERS, FakeProvider, make_config, make_settings, serve
+from tests.fakes import (
+    AUTH_HEADERS,
+    GATEWAY_API_KEY,
+    FakeProvider,
+    make_config,
+    make_settings,
+    serve,
+)
 
 MAX_REQUEST_BYTES = 4096
 FAKE_CONFIG: dict[str, object] = {
@@ -285,6 +292,23 @@ class TestRequestSizeLimit:
 
         assert response.status_code == 413
         assert error_of(response)["code"] == "request_too_large"
+
+    @pytest.mark.parametrize("declared", [b"abc", b"-1", b"\xb2"])
+    async def test_malformed_content_length_is_rejected(
+        self, client: httpx.AsyncClient, declared: bytes
+    ) -> None:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=b"{}",
+            headers={
+                b"authorization": f"Bearer {GATEWAY_API_KEY}".encode(),
+                b"content-type": b"application/json",
+                b"content-length": declared,
+            },
+        )
+
+        assert response.status_code == 400
+        assert error_of(response)["code"] == "invalid_header"
 
     async def test_chunked_body_over_the_limit_is_rejected(self, client: httpx.AsyncClient) -> None:
         payload = self.body_of_size(MAX_REQUEST_BYTES + 1)
