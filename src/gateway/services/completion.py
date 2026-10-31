@@ -14,6 +14,7 @@ It emits one ``completion finished`` log event per request with the outcome.
 """
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections.abc import AsyncGenerator, Mapping
@@ -45,7 +46,7 @@ from gateway.providers.base import (
 )
 from gateway.resilience.deadline import Deadline
 from gateway.schemas.completions import ChatCompletionRequest
-from gateway.services.execution import ProviderExecutor
+from gateway.services.execution import Candidate, ProviderExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,8 @@ class ModelRoute:
     upstream_model: str
     default_max_tokens: int | None
     max_output_tokens: int | None
+    # (provider, upstream model) pairs, in the order they are tried.
+    fallbacks: tuple[tuple[str, str], ...] = ()
 
 
 def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
@@ -67,6 +70,7 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
             upstream_model=model.model,
             default_max_tokens=model.default_max_tokens,
             max_output_tokens=model.max_output_tokens,
+            fallbacks=tuple((target.provider, target.model) for target in model.fallbacks),
         )
         for alias, model in config.models.items()
     }
@@ -75,8 +79,13 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
 @dataclass(frozen=True)
 class _Plan:
     route: ModelRoute
-    provider: Provider
-    request: ProviderRequest
+    # The primary first, then usable fallbacks. All share the primary's request
+    # except for the upstream model.
+    candidates: tuple[Candidate, ...]
+
+    @property
+    def request(self) -> ProviderRequest:
+        return self.candidates[0].request
 
 
 class CompletionService:
@@ -88,7 +97,12 @@ class CompletionService:
         metrics: Metrics,
         admission: AdmissionController | None = None,
     ) -> None:
-        missing = {route.provider for route in routes.values()} - providers.keys()
+        referenced = {
+            provider
+            for route in routes.values()
+            for provider in [route.provider, *(name for name, _ in route.fallbacks)]
+        }
+        missing = referenced - providers.keys()
         if missing:
             raise ValueError(f"routes reference providers without adapters: {sorted(missing)}")
         self._routes = dict(routes)
@@ -106,9 +120,7 @@ class CompletionService:
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                completion = await self._executor.complete(
-                    plan.route.provider, plan.request, deadline, ledger
-                )
+                completion = await self._executor.complete(plan.candidates, deadline, ledger)
             finally:
                 await self._settle(admission, ledger)
         except BaseException as exc:
@@ -135,7 +147,7 @@ class CompletionService:
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                events = self._executor.stream(plan.route.provider, plan.request, deadline, ledger)
+                events = self._executor.stream(plan.candidates, deadline, ledger)
                 async with aclosing(events):
                     async for event in events:
                         if isinstance(event, TextDelta):
@@ -161,10 +173,27 @@ class CompletionService:
                 param="model",
                 status_code=404,
             )
-        provider = self._providers[route.provider]
-        provider_request = _provider_request(request, route)
-        provider.validate(provider_request)
-        return _Plan(route, provider, provider_request)
+        primary = _provider_request(request, route)
+        self._providers[route.provider].validate(primary)
+        candidates = [Candidate(route.provider, primary)]
+        for provider, model in route.fallbacks:
+            fallback = dataclasses.replace(primary, model=model)
+            try:
+                self._providers[provider].validate(fallback)
+            except GatewayError as exc:
+                # A fallback that cannot run the request as given is skipped rather
+                # than sent a modified request.
+                logger.info(
+                    "fallback skipped",
+                    extra={
+                        "model_alias": route.alias,
+                        "fallback_provider": provider,
+                        "error_code": exc.code,
+                    },
+                )
+                continue
+            candidates.append(Candidate(provider, fallback))
+        return _Plan(route, tuple(candidates))
 
     async def _admit(
         self, principal: Principal, plan: _Plan, deadline: Deadline, trace: "_CompletionTrace"

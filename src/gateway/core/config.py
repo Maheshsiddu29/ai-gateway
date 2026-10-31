@@ -130,6 +130,17 @@ ProviderConfig = Annotated[
 ]
 
 
+# Each fallback adds a possible upstream call per request.
+MAX_FALLBACKS = 3
+
+
+class FallbackTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: ProviderName
+    model: str = Field(min_length=1, max_length=256)
+
+
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -140,6 +151,9 @@ class ModelConfig(BaseModel):
     # max_tokens are sent this value (unless default_max_tokens is set), so that every
     # request has a known output bound.
     max_output_tokens: int | None = Field(default=None, ge=1, le=MAX_OUTPUT_TOKENS)
+    # Tried in order when the primary fails before running the request (see
+    # docs/resilience.md). Each names a configured provider and its model ID.
+    fallbacks: list[FallbackTarget] = Field(default_factory=list, max_length=MAX_FALLBACKS)
 
     @model_validator(mode="after")
     def _check_output_limits(self) -> "ModelConfig":
@@ -149,6 +163,9 @@ class ModelConfig(BaseModel):
             and self.default_max_tokens > self.max_output_tokens
         ):
             raise ValueError("default_max_tokens must not exceed max_output_tokens")
+        targets = [(self.provider, self.model)] + [(t.provider, t.model) for t in self.fallbacks]
+        if len(set(targets)) != len(targets):
+            raise ValueError("fallbacks must not repeat the primary or another fallback")
         return self
 
 
@@ -265,8 +282,9 @@ class GatewayConfig(BaseModel):
     @model_validator(mode="after")
     def _check_model_providers(self) -> "GatewayConfig":
         for alias, model in self.models.items():
-            if model.provider not in self.providers:
-                raise ValueError(f"model {alias!r} references unknown provider {model.provider!r}")
+            for provider in [model.provider, *(target.provider for target in model.fallbacks)]:
+                if provider not in self.providers:
+                    raise ValueError(f"model {alias!r} references unknown provider {provider!r}")
         return self
 
 

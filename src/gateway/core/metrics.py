@@ -94,3 +94,9 @@ class Metrics:
             ["provider", "state"],
             registry=self.registry,
         )
+        self.provider_fallbacks = Counter(
+            "gateway_provider_fallbacks",
+            "Requests moved from one provider to the next configured fallback.",
+            ["from_provider", "to_provider"],
+            registry=self.registry,
+        )

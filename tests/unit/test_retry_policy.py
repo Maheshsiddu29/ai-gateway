@@ -100,3 +100,21 @@ def test_status_allow_list_is_respected() -> None:
 def test_config_rejects_non_transient_statuses(status: int) -> None:
     with pytest.raises(ValueError, match="only 429 and 5xx"):
         ResilienceConfig(retry_on_status=frozenset({status}))
+
+
+@pytest.mark.parametrize(
+    ("exc", "allowed"),
+    [
+        (error_from_status(httpx.Response(503)), True),
+        (error_from_status(httpx.Response(429)), True),
+        (error_from_status(httpx.Response(401)), True),
+        (error_from_status(httpx.Response(404)), True),
+        (error_from_transport(httpx.ConnectError("refused")), True),
+        (error_from_status(httpx.Response(400)), False),
+        (error_from_status(httpx.Response(504)), False),
+        (error_from_transport(httpx.ReadTimeout("slow")), False),
+        (malformed_response_error(), False),
+    ],
+)
+def test_fallback_eligibility(exc: ProviderError, allowed: bool) -> None:
+    assert POLICY.allows_fallback(exc) is allowed

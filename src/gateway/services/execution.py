@@ -1,17 +1,25 @@
-"""Provider attempts: retries and circuit breaking.
+"""Provider attempts: retries, circuit breaking, and fallback.
+
+A request has one or more candidates: the alias's primary provider, then its
+configured fallbacks. Each candidate is tried with retries; if it still fails, and
+the failure shows the provider did not run the request, the next candidate is
+tried. Failures that may have run (timeouts after sending, interrupted streams) end
+the request instead.
 
 Every attempt runs within the request deadline, and backoff delays consume it too,
-so retries never extend a request. A streamed attempt counts as successful once its
-first event arrives; after that, a failure ends the stream and is never retried,
-because the client may already have received output.
+so neither retries nor fallback extend a request. A streamed attempt counts as
+successful once its first event arrives; after that, a failure ends the stream and
+is never retried or redirected, because the client may already have output.
 """
 
 import asyncio
+import itertools
 import logging
 import random
 import time
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import aclosing
+from dataclasses import dataclass
 
 from gateway.admission.usage import Attempt, UsageLedger
 from gateway.core.config import ResilienceConfig
@@ -25,6 +33,14 @@ from gateway.resilience.retry import RetryPolicy
 logger = logging.getLogger(__name__)
 
 type _OpenStream = tuple[AsyncGenerator[StreamEvent], StreamEvent]
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A provider and the request to send it."""
+
+    provider: str
+    request: ProviderRequest
 
 
 class ProviderExecutor:
@@ -46,19 +62,19 @@ class ProviderExecutor:
         self._random = random
 
     async def complete(
-        self, provider: str, request: ProviderRequest, deadline: Deadline, ledger: UsageLedger
+        self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
     ) -> Completion:
-        completion, attempt = await self._attempts(
-            provider, deadline, ledger, lambda adapter: adapter.complete(request)
+        completion, attempt, _ = await self._first_success(
+            candidates, deadline, ledger, lambda adapter, request: adapter.complete(request)
         )
         attempt.succeeded(completion.usage)
         return completion
 
     async def stream(
-        self, provider: str, request: ProviderRequest, deadline: Deadline, ledger: UsageLedger
+        self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
     ) -> AsyncGenerator[StreamEvent]:
-        (events, first), attempt = await self._attempts(
-            provider, deadline, ledger, lambda adapter: _open_stream(adapter, request)
+        (events, first), attempt, candidate = await self._first_success(
+            candidates, deadline, ledger, _open_stream
         )
         async with aclosing(events):
             event: StreamEvent | None = first
@@ -72,16 +88,47 @@ class ProviderExecutor:
                 except BaseException as exc:
                     attempt.failed(exc)
                     if outcome_of(exc) is AttemptOutcome.FAILURE:
-                        self._breakers[provider].record_failure()
+                        self._breakers[candidate.provider].record_failure()
                     raise
+
+    async def _first_success[T](
+        self,
+        candidates: Sequence[Candidate],
+        deadline: Deadline,
+        ledger: UsageLedger,
+        run: Callable[[Provider, ProviderRequest], Awaitable[T]],
+    ) -> tuple[T, Attempt, Candidate]:
+        for candidate, following in itertools.pairwise(candidates):
+            try:
+                result, attempt = await self._attempts(candidate, deadline, ledger, run)
+            except ProviderError as exc:
+                if not self._policy.allows_fallback(exc):
+                    raise
+                self._metrics.provider_fallbacks.labels(
+                    candidate.provider, following.provider
+                ).inc()
+                logger.warning(
+                    "falling back to another provider",
+                    extra={
+                        "provider": candidate.provider,
+                        "fallback_provider": following.provider,
+                        "error_code": exc.code,
+                    },
+                )
+                continue
+            return result, attempt, candidate
+        last = candidates[-1]
+        result, attempt = await self._attempts(last, deadline, ledger, run)
+        return result, attempt, last
 
     async def _attempts[T](
         self,
-        name: str,
+        candidate: Candidate,
         deadline: Deadline,
         ledger: UsageLedger,
-        run: Callable[[Provider], Awaitable[T]],
+        run: Callable[[Provider, ProviderRequest], Awaitable[T]],
     ) -> tuple[T, Attempt]:
+        name = candidate.provider
         provider = self._providers[name]
         breaker = self._breakers[name]
         number = 0
@@ -99,7 +146,7 @@ class ProviderExecutor:
             started = time.perf_counter()
             try:
                 async with deadline.limit():
-                    result = await run(provider)
+                    result = await run(provider, candidate.request)
             except BaseException as exc:
                 attempt.failed(exc)
                 breaker.release(permit, outcome_of(exc))

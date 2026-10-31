@@ -94,6 +94,7 @@ required.
 | `model` | required | Model identifier sent to the provider. |
 | `default_max_tokens` | none | `max_tokens` to send when the client omits it. Anthropic requires `max_tokens`; without a default, requests to an Anthropic alias must include it. |
 | `max_output_tokens` | none | Largest `max_tokens` a client may request; larger values are rejected with `max_tokens_exceeds_limit`. When the client omits `max_tokens` and there is no `default_max_tokens`, this value is sent. Must be at least `default_max_tokens`. |
+| `fallbacks` | `[]` | Up to three `{ provider, model }` entries tried in order when the primary fails without running the request. See [resilience.md](resilience.md#fallback). |
 
 Several aliases can point at the same provider and model.
 

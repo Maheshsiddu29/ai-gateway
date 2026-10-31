@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from gateway.core.config import ResilienceConfig
 from gateway.errors import (
+    ProviderConfigurationError,
     ProviderError,
     ProviderRateLimitError,
     ProviderTimeoutError,
@@ -20,6 +21,9 @@ from gateway.errors import (
 )
 
 _TRANSIENT = (ProviderRateLimitError, ProviderUnavailableError, ProviderTimeoutError)
+# A configuration error (bad credentials, unknown model) at one provider says nothing
+# about another, so it is worth falling back from, though not retrying.
+_FALLBACK = (*_TRANSIENT, ProviderConfigurationError)
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,10 @@ class RetryPolicy:
         if exc.may_have_processed or not isinstance(exc, _TRANSIENT):
             return False
         return exc.upstream_status is None or exc.upstream_status in self.retry_on_status
+
+    def allows_fallback(self, exc: ProviderError) -> bool:
+        """Whether a failure, after any retries, may be followed by the next provider."""
+        return not exc.may_have_processed and isinstance(exc, _FALLBACK)
 
     def backoff(self, attempt: int, random: Callable[[], float]) -> float:
         """Delay after the given (1-based) attempt: exponential, capped, with jitter."""

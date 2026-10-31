@@ -311,3 +311,45 @@ class TestAdmissionConfig:
         settings = make_settings(Path("unused.toml"), redis_url="redis://:hunter2@redis:6379")
 
         assert "hunter2" not in repr(settings)
+
+
+class TestFallbackConfig:
+    def with_fallbacks(self, tmp_path: Path, fallbacks: str) -> Settings:
+        config = VALID_CONFIG.replace(
+            'model = "upstream-fast"\n', f'model = "upstream-fast"\nfallbacks = {fallbacks}\n'
+        )
+        return make_settings(write_config(tmp_path, config))
+
+    def test_loads_fallbacks_in_order(self, tmp_path: Path) -> None:
+        settings = self.with_fallbacks(tmp_path, '[{ provider = "anthropic", model = "other" }]')
+
+        model = load_config(settings, PROVIDER_KEYS).gateway.models["fast"]
+
+        assert [(f.provider, f.model) for f in model.fallbacks] == [("anthropic", "other")]
+
+    @pytest.mark.parametrize(
+        ("fallbacks", "message"),
+        [
+            ('[{ provider = "missing", model = "x" }]', "unknown provider 'missing'"),
+            ('[{ provider = "openai", model = "upstream-fast" }]', "must not repeat"),
+            (
+                "[" + ", ".join(['{ provider = "anthropic", model = "x" }'] * 2) + "]",
+                "must not repeat",
+            ),
+            (
+                "["
+                + ", ".join(f'{{ provider = "anthropic", model = "m{i}" }}' for i in range(4))
+                + "]",
+                "fallbacks",
+            ),
+            ('[{ provider = "anthropic" }]', "model"),
+        ],
+    )
+    def test_rejects_invalid_fallbacks(self, tmp_path: Path, fallbacks: str, message: str) -> None:
+        with pytest.raises(ConfigurationError, match=message):
+            load_config(self.with_fallbacks(tmp_path, fallbacks), PROVIDER_KEYS)
+
+    def test_the_same_provider_may_serve_a_different_model(self, tmp_path: Path) -> None:
+        settings = self.with_fallbacks(tmp_path, '[{ provider = "openai", model = "smaller" }]')
+
+        assert load_config(settings, PROVIDER_KEYS).gateway.models["fast"].fallbacks

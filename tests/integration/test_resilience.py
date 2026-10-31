@@ -22,7 +22,7 @@ from gateway.resilience.breaker import CircuitBreaker
 from gateway.resilience.deadline import Deadline
 from gateway.resilience.retry import RetryPolicy
 from gateway.schemas.completions import ChatMessage
-from gateway.services.execution import ProviderExecutor
+from gateway.services.execution import Candidate, ProviderExecutor
 from tests.fakes import (
     AUTH_HEADERS,
     SSE_HEADERS,
@@ -307,7 +307,9 @@ async def test_cancellation_during_backoff_stops_further_attempts() -> None:
         stop=(),
         include_usage=False,
     )
-    task = asyncio.create_task(executor.complete("fake", request, Deadline(10), UsageLedger()))
+    task = asyncio.create_task(
+        executor.complete([Candidate("fake", request)], Deadline(10), UsageLedger())
+    )
     await sleeping.wait()
     task.cancel()
 

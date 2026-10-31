@@ -1,7 +1,7 @@
 # Provider resilience
 
 How the gateway behaves when providers are slow, failing, or unreachable: request
-deadlines, retries, and circuit breakers.
+deadlines, retries, fallback, and circuit breakers.
 
 ## Deadlines
 
@@ -77,6 +77,60 @@ Each attempt is charged against the key's token limit separately (see
 did not run are charged nothing; attempts with unknown usage are charged a full
 reservation.
 
+## Fallback
+
+A model alias may list fallbacks, tried in order after the primary:
+
+```toml
+[models.fast]
+provider = "primary"
+model = "primary-model-id"
+fallbacks = [
+  { provider = "secondary", model = "secondary-model-id" },
+]
+```
+
+Each fallback names a configured provider and the model ID to request from it.
+Fallbacks only reference providers, never other aliases, so chains cannot form
+cycles; the same provider and model may not appear twice. At most three fallbacks
+are allowed.
+
+**Eligibility.** After the primary's retries are exhausted, the next candidate is
+tried if the last failure shows the primary did not run the request: a connection
+failure, a 429 or 5xx status other than 504, or a provider configuration error
+(401, 403, 404, which say nothing about the other provider). An open circuit
+breaker also moves on to the next candidate without contacting the provider. The
+gateway does not fall back after read timeouts, connection drops after sending,
+malformed or interrupted responses, or client errors (400, 422). When every
+candidate fails, the last candidate's error is returned.
+
+**Same request.** A fallback receives the primary's request with only the upstream
+model changed: the same messages, `max_tokens` (including any default or ceiling
+from the alias), sampling parameters, and stop sequences. Each provider adapter
+validates the request before admission. A fallback that cannot run it faithfully,
+such as the Anthropic adapter on API version 2026-10-21 receiving `temperature`, is
+skipped and logged as `fallback skipped`; the request is never altered to fit.
+
+**Isolation.** Each provider uses its own HTTP client, base URL, and credential, so
+nothing from one provider's configuration is sent to another.
+
+**Streams.** The first upstream event is part of each attempt, so a stream can fall
+back only before any output has been sent to the client. A failure after that ends
+the stream with an error event; the client never receives output from two
+providers in one response.
+
+**Deadline and accounting.** Fallback attempts share the request deadline, and the
+admission reservation covers the whole request. Each attempt is charged against the
+token limit on its own (see [admission-control.md](admission-control.md#settlement)),
+so a fallback is not free. A primary attempt that certainly did not run costs
+nothing. Fallback does not prevent duplicate charges: it follows only failures the
+gateway believes did not run, under the same assumptions as retries.
+
+The response's `model` field is the requested alias whichever provider served it.
+The `completion finished` log event records the serving provider and the number of
+attempts, and `gateway_provider_fallbacks_total{from_provider,to_provider}` counts
+fallbacks.
+
 ## Circuit breakers
 
 Each provider has a circuit breaker in each gateway process:
@@ -114,4 +168,5 @@ attempts.
 | `gateway_provider_attempt_duration_seconds` | `provider` |
 | `gateway_provider_retries_total` | `provider` |
 | `gateway_circuit_breaker_transitions_total` | `provider`, `state` |
+| `gateway_provider_fallbacks_total` | `from_provider`, `to_provider` |
 | `gateway_deadline_exceeded_total` | `stream` |
