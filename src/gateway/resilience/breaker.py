@@ -37,9 +37,11 @@ class AttemptOutcome(StrEnum):
     NEUTRAL = "neutral"
 
 
-@dataclass(frozen=True)
+@dataclass
 class Permit:
     probe: bool
+    generation: int = 0
+    active: bool = True
 
 
 def outcome_of(exc: BaseException) -> AttemptOutcome:
@@ -65,6 +67,7 @@ class CircuitBreaker:
         self._failures: deque[float] = deque(maxlen=config.failure_threshold)
         self._opened_at = 0.0
         self._probes_in_flight = 0
+        self._generation = 0
 
     @property
     def state(self) -> BreakerState:
@@ -72,7 +75,7 @@ class CircuitBreaker:
 
     def try_acquire(self) -> Permit | None:
         if not self._config.enabled or self._state is BreakerState.CLOSED:
-            return Permit(probe=False)
+            return Permit(probe=False, generation=self._generation)
         if (
             self._state is BreakerState.OPEN
             and self._clock() - self._opened_at >= self._config.recovery_seconds
@@ -83,11 +86,14 @@ class CircuitBreaker:
             and self._probes_in_flight < self._config.half_open_max_probes
         ):
             self._probes_in_flight += 1
-            return Permit(probe=True)
+            return Permit(probe=True, generation=self._generation)
         return None
 
     def release(self, permit: Permit, outcome: AttemptOutcome) -> None:
-        if not self._config.enabled:
+        if not permit.active:
+            return
+        permit.active = False
+        if not self._config.enabled or permit.generation != self._generation:
             return
         if not permit.probe:
             if outcome is AttemptOutcome.FAILURE:
@@ -122,4 +128,6 @@ class CircuitBreaker:
     def _transition(self, state: BreakerState) -> None:
         if state is not self._state:
             self._state = state
+            self._generation += 1
+            self._probes_in_flight = 0
             self._on_transition(self._provider, state)

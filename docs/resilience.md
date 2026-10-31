@@ -77,6 +77,12 @@ withholds `[DONE]`.
 
 ## Circuit breakers
 
+A streamed probe holds its permit until the stream ends. Its first event does not
+declare recovery. Permits belong to one breaker generation; stale completions
+cannot close or consume probe capacity from a later recovery cycle. Releases are
+idempotent.
+
+
 Each provider has a circuit breaker in each gateway process:
 
 - **Closed.** Requests pass. Provider failures (5xx, connection failures, timeouts,

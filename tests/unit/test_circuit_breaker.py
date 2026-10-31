@@ -1,5 +1,5 @@
 from gateway.core.config import CircuitBreakerConfig
-from gateway.resilience.breaker import AttemptOutcome, BreakerState, CircuitBreaker, Permit
+from gateway.resilience.breaker import AttemptOutcome, BreakerState, CircuitBreaker
 
 CONFIG = CircuitBreakerConfig(
     failure_threshold=3, failure_window_seconds=10, recovery_seconds=5, half_open_max_probes=1
@@ -83,7 +83,8 @@ def test_becomes_half_open_after_recovery_and_limits_probes() -> None:
     harness.clock.now += 0.1
     probe = harness.breaker.try_acquire()
 
-    assert probe == Permit(probe=True)
+    assert probe is not None
+    assert probe.probe
     assert harness.state() is BreakerState.HALF_OPEN
     assert harness.breaker.try_acquire() is None
 
@@ -148,3 +149,35 @@ def test_disabled_breaker_never_opens() -> None:
 
     assert harness.state() is BreakerState.CLOSED
     assert harness.transitions == []
+
+
+def test_stale_probe_cannot_close_a_later_half_open_generation() -> None:
+    config = CONFIG.model_copy(update={"half_open_max_probes": 2})
+    harness = Harness(config)
+    harness.open()
+    harness.clock.now += 5
+    stale = harness.breaker.try_acquire()
+    failing = harness.breaker.try_acquire()
+    assert stale is not None
+    assert failing is not None
+    harness.breaker.release(failing, AttemptOutcome.FAILURE)
+    harness.clock.now += 5
+    current = harness.breaker.try_acquire()
+    assert current is not None
+    harness.breaker.release(stale, AttemptOutcome.SUCCESS)
+    assert harness.state() is BreakerState.HALF_OPEN
+    harness.breaker.release(current, AttemptOutcome.SUCCESS)
+    assert harness.state() is BreakerState.CLOSED
+
+
+def test_duplicate_probe_release_does_not_free_another_slot() -> None:
+    harness = Harness()
+    harness.open()
+    harness.clock.now += 5
+    probe = harness.breaker.try_acquire()
+    assert probe is not None
+    harness.breaker.release(probe, AttemptOutcome.NEUTRAL)
+    current = harness.breaker.try_acquire()
+    assert current is not None
+    harness.breaker.release(probe, AttemptOutcome.NEUTRAL)
+    assert harness.breaker.try_acquire() is None

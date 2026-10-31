@@ -24,9 +24,20 @@ from dataclasses import dataclass
 from gateway.admission.usage import Attempt, UsageLedger
 from gateway.core.config import ResilienceConfig
 from gateway.core.metrics import Metrics
-from gateway.errors import GatewayError, ProviderError, ProviderUnavailableError
+from gateway.errors import (
+    GatewayError,
+    InternalGatewayError,
+    ProviderError,
+    ProviderUnavailableError,
+)
 from gateway.providers.base import Completion, Provider, ProviderRequest, StreamEnd, StreamEvent
-from gateway.resilience.breaker import AttemptOutcome, BreakerState, CircuitBreaker, outcome_of
+from gateway.resilience.breaker import (
+    AttemptOutcome,
+    BreakerState,
+    CircuitBreaker,
+    Permit,
+    outcome_of,
+)
 from gateway.resilience.deadline import Deadline
 from gateway.resilience.retry import RetryPolicy
 
@@ -64,32 +75,42 @@ class ProviderExecutor:
     async def complete(
         self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
     ) -> Completion:
-        completion, attempt, _ = await self._first_success(
+        completion, attempt, candidate, permit = await self._first_success(
             candidates, deadline, ledger, lambda adapter, request: adapter.complete(request)
         )
         attempt.succeeded(completion.usage)
+        self._breakers[candidate.provider].release(permit, AttemptOutcome.SUCCESS)
         return completion
 
     async def stream(
         self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
     ) -> AsyncGenerator[StreamEvent]:
-        (events, first), attempt, candidate = await self._first_success(
+        (events, first), attempt, candidate, permit = await self._first_success(
             candidates, deadline, ledger, _open_stream
         )
-        async with aclosing(events):
-            event: StreamEvent | None = first
-            while event is not None:
-                if isinstance(event, StreamEnd):
-                    attempt.succeeded(event.usage)
-                yield event
-                try:
+        outcome = AttemptOutcome.NEUTRAL
+        ended = False
+        try:
+            async with aclosing(events):
+                event: StreamEvent | None = first
+                while event is not None:
+                    if isinstance(event, StreamEnd):
+                        attempt.succeeded(event.usage)
+                        ended = True
+                    yield event
                     async with deadline.limit():
                         event = await anext(events, None)
-                except BaseException as exc:
-                    attempt.failed(exc)
-                    if outcome_of(exc) is AttemptOutcome.FAILURE:
-                        self._breakers[candidate.provider].record_failure()
-                    raise
+                if not ended:
+                    raise InternalGatewayError("The provider stream ended unexpectedly.")
+            outcome = AttemptOutcome.SUCCESS
+        except BaseException as exc:
+            attempt.failed(exc)
+            outcome = outcome_of(exc)
+            raise
+        finally:
+            # A half-open probe remains occupied for the entire stream, including
+            # slow-client pauses. Cancellation frees it without declaring recovery.
+            self._breakers[candidate.provider].release(permit, outcome)
 
     async def _first_success[T](
         self,
@@ -97,10 +118,10 @@ class ProviderExecutor:
         deadline: Deadline,
         ledger: UsageLedger,
         run: Callable[[Provider, ProviderRequest], Awaitable[T]],
-    ) -> tuple[T, Attempt, Candidate]:
+    ) -> tuple[T, Attempt, Candidate, Permit]:
         for candidate, following in itertools.pairwise(candidates):
             try:
-                result, attempt = await self._attempts(candidate, deadline, ledger, run)
+                result, attempt, permit = await self._attempts(candidate, deadline, ledger, run)
             except ProviderError as exc:
                 if not self._policy.allows_fallback(exc):
                     raise
@@ -116,10 +137,10 @@ class ProviderExecutor:
                     },
                 )
                 continue
-            return result, attempt, candidate
+            return result, attempt, candidate, permit
         last = candidates[-1]
-        result, attempt = await self._attempts(last, deadline, ledger, run)
-        return result, attempt, last
+        result, attempt, permit = await self._attempts(last, deadline, ledger, run)
+        return result, attempt, last, permit
 
     async def _attempts[T](
         self,
@@ -127,7 +148,7 @@ class ProviderExecutor:
         deadline: Deadline,
         ledger: UsageLedger,
         run: Callable[[Provider, ProviderRequest], Awaitable[T]],
-    ) -> tuple[T, Attempt]:
+    ) -> tuple[T, Attempt, Permit]:
         name = candidate.provider
         provider = self._providers[name]
         breaker = self._breakers[name]
@@ -168,9 +189,8 @@ class ProviderExecutor:
                 async with deadline.limit():
                     await self._sleep(delay)
                 continue
-            breaker.release(permit, AttemptOutcome.SUCCESS)
             self._observe(name, started, "success")
-            return result, attempt
+            return result, attempt, permit
 
     def _retry_delay(self, exc: BaseException, attempt: int, deadline: Deadline) -> float | None:
         if not isinstance(exc, ProviderError):
