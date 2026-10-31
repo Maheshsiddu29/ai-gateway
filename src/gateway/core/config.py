@@ -14,7 +14,7 @@ rather than failing on the first request.
 
 import hashlib
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -419,7 +419,7 @@ class LoadedConfig:
 
 def load_config(settings: Settings, environ: Mapping[str, str]) -> LoadedConfig:
     """Read and validate the provider configuration file and resolve provider credentials."""
-    gateway = _read_gateway_config(settings.config_file)
+    gateway = read_gateway_config(settings.config_file)
     if settings.environment is Environment.PRODUCTION:
         _check_production_transport(gateway)
     if gateway.admission.enabled:
@@ -441,7 +441,7 @@ def load_config(settings: Settings, environ: Mapping[str, str]) -> LoadedConfig:
             raise ConfigurationError(
                 f"cost configuration references unknown gateway keys: {sorted(unknown)}"
             )
-    return LoadedConfig(gateway=gateway, provider_api_keys=_resolve_api_keys(gateway, environ))
+    return LoadedConfig(gateway=gateway, provider_api_keys=resolve_api_keys(gateway, environ))
 
 
 def require_redis_url(settings: Settings) -> SecretStr:
@@ -450,7 +450,7 @@ def require_redis_url(settings: Settings) -> SecretStr:
     return settings.redis_url
 
 
-def _read_gateway_config(path: Path) -> GatewayConfig:
+def read_gateway_config(path: Path) -> GatewayConfig:
     try:
         with path.open("rb") as file:
             raw = tomllib.load(file)
@@ -478,11 +478,14 @@ def _check_production_transport(gateway: GatewayConfig) -> None:
             )
 
 
-def _resolve_api_keys(
-    gateway: GatewayConfig, environ: Mapping[str, str]
+def resolve_api_keys(
+    gateway: GatewayConfig, environ: Mapping[str, str], names: Collection[str] | None = None
 ) -> dict[str, SecretStr | None]:
+    """Resolve the keys of every provider, or of only ``names``."""
     keys: dict[str, SecretStr | None] = {}
     for name, provider in gateway.providers.items():
+        if names is not None and name not in names:
+            continue
         if provider.api_key_env is None:
             keys[name] = None
             continue
