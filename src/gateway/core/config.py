@@ -37,6 +37,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from gateway.cost.config import CostConfig
 from gateway.cost.pricing import PriceCatalog
 from gateway.errors import ConfigurationError
+from gateway.routing.config import AliasRouting, Capability, RoutingConfig, RoutingPolicy
 from gateway.schemas.completions import MAX_OUTPUT_TOKENS
 
 MIN_PRODUCTION_API_KEY_LENGTH = 32
@@ -148,6 +149,11 @@ class _ProviderConfigBase(BaseModel):
 class OpenAICompatibleProviderConfig(_ProviderConfigBase):
     type: Literal["openai_compatible"]
 
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        """Request features the adapter can send to this provider."""
+        return frozenset(Capability)
+
 
 class AnthropicProviderConfig(_ProviderConfigBase):
     type: Literal["anthropic"]
@@ -155,6 +161,14 @@ class AnthropicProviderConfig(_ProviderConfigBase):
     # The adapter only sends request fields it knows each API version accepts, so
     # only versions it has been written against are allowed.
     api_version: AnthropicApiVersion = "2026-10-21"
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        """Request features the adapter can send to this provider."""
+        if self.api_version == "2026-10-21":
+            # This API version rejects temperature and top_p.
+            return frozenset(Capability) - {Capability.TEMPERATURE, Capability.TOP_P}
+        return frozenset(Capability)
 
 
 ProviderConfig = Annotated[
@@ -186,6 +200,21 @@ class ModelConfig(BaseModel):
     # Tried in order when the primary fails before running the request (see
     # docs/resilience.md). Each names a configured provider and its model ID.
     fallbacks: list[FallbackTarget] = Field(default_factory=list, max_length=MAX_FALLBACKS)
+    # Takes effect only when routing.enabled is true; see docs/routing.md.
+    routing: AliasRouting = Field(default_factory=AliasRouting)
+
+    @property
+    def output_allowance(self) -> int | None:
+        """The max_tokens sent when the client does not set it."""
+        if self.default_max_tokens is not None:
+            return self.default_max_tokens
+        return self.max_output_tokens
+
+    def route_targets(self) -> list[tuple[str, str]]:
+        """The primary followed by the routing candidates."""
+        return [(self.provider, self.model)] + [
+            (target.provider, target.model) for target in self.routing.candidates
+        ]
 
     @model_validator(mode="after")
     def _check_output_limits(self) -> "ModelConfig":
@@ -198,6 +227,13 @@ class ModelConfig(BaseModel):
         targets = [(self.provider, self.model)] + [(t.provider, t.model) for t in self.fallbacks]
         if len(set(targets)) != len(targets):
             raise ValueError("fallbacks must not repeat the primary or another fallback")
+        if self.routing.policy is not RoutingPolicy.FIXED:
+            if self.fallbacks:
+                # A routed alias falls back to its other eligible candidates, which
+                # satisfy the same policy; separate fallbacks might not.
+                raise ValueError("a routed alias uses its candidates instead of fallbacks")
+            if (self.provider, self.model) in self.route_targets()[1:]:
+                raise ValueError("routing candidates must not repeat the primary")
         return self
 
 
@@ -311,20 +347,26 @@ class GatewayConfig(BaseModel):
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     admission: AdmissionConfig = Field(default_factory=AdmissionConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
 
     @model_validator(mode="after")
     def _check_model_providers(self) -> "GatewayConfig":
         for alias, model in self.models.items():
-            for provider in [model.provider, *(target.provider for target in model.fallbacks)]:
+            for provider in [
+                model.provider,
+                *(target.provider for target in model.fallbacks),
+                *(target.provider for target in model.routing.candidates),
+            ]:
                 if provider not in self.providers:
                     raise ValueError(f"model {alias!r} references unknown provider {provider!r}")
+        self._check_routing()
         if self.cost.enabled:
             catalog = PriceCatalog(self.cost.pricing)
             for alias, model in self.models.items():
                 if model.default_max_tokens is None and model.max_output_tokens is None:
                     raise ValueError(f"model {alias!r} needs an output bound for cost accounting")
                 for provider, upstream_model in [
-                    (model.provider, model.model),
+                    *model.route_targets(),
                     *((target.provider, target.model) for target in model.fallbacks),
                 ]:
                     if not catalog.has_model(provider, upstream_model):
@@ -333,6 +375,40 @@ class GatewayConfig(BaseModel):
                         )
                     catalog.select(provider, upstream_model, datetime.now(UTC))
         return self
+
+    def _check_routing(self) -> None:
+        registry = self.routing.registry()
+        for entry in self.routing.models:
+            provider_config = self.providers.get(entry.provider)
+            if provider_config is None:
+                raise ValueError(f"routing.models references unknown provider {entry.provider!r}")
+            unsupported = entry.capabilities - provider_config.capabilities
+            if unsupported:
+                raise ValueError(
+                    f"routing.models entry {entry.provider}/{entry.model} lists capabilities"
+                    f" its provider adapter does not support: {sorted(unsupported)}"
+                )
+        for alias, model in self.models.items():
+            if model.routing.policy is RoutingPolicy.FIXED:
+                continue
+            # Cost-based selection needs prices, and a routed request must be
+            # reserved against budgets at the selected model's price.
+            if not self.cost.enabled:
+                raise ValueError(f"model {alias!r} uses dynamic routing, which requires cost")
+            for provider, upstream_model in model.route_targets():
+                capabilities = registry.get((provider, upstream_model))
+                if capabilities is None:
+                    raise ValueError(
+                        f"model {alias!r} routes to {provider}/{upstream_model},"
+                        " which has no routing.models entry"
+                    )
+                allowance = model.output_allowance
+                if allowance is not None and allowance > capabilities.max_output_tokens:
+                    raise ValueError(
+                        f"model {alias!r} sends max_tokens={allowance} by default, above the"
+                        f" limit of {capabilities.max_output_tokens} for"
+                        f" {provider}/{upstream_model}"
+                    )
 
 
 @dataclass(frozen=True)
