@@ -5,9 +5,11 @@ forwards requests to configured LLM providers. Clients call a model alias such a
 `fast`; the gateway maps the alias to a provider and an upstream model, translates
 the request, and normalizes the response.
 
-This is Phase 1: the request pipeline, two provider adapters, streaming, and
-authentication. Rate limiting, budgets, routing, caching, and failover are planned
-but not implemented (see [Roadmap](#roadmap)).
+The gateway enforces per-key request, token, and concurrency limits shared across
+instances through Redis, bounds every request with an end-to-end deadline, and
+retries or falls back between providers only when a failed provider certainly did
+not run the request. Budgets, cost-aware routing, and caching are not implemented
+(see [Roadmap](#roadmap)).
 
 ## Current capabilities
 
@@ -25,17 +27,29 @@ but not implemented (see [Roadmap](#roadmap)).
   reports it.
 - Client disconnects cancel the upstream request, for streaming and non-streaming
   calls.
-- `GET /health/live` and `GET /health/ready`.
+- Distributed admission control (optional): requests per minute, tokens per minute
+  (by reservation and settlement), and concurrent requests per gateway key,
+  enforced atomically in Redis for all instances, failing closed when Redis is
+  unavailable.
+- An end-to-end deadline per request, covering admission, all provider attempts,
+  and the whole stream.
+- Bounded retries with exponential backoff, per-provider circuit breakers, and
+  configured fallback providers per alias.
+- Prometheus metrics at `GET /metrics`; `GET /health/live` and `GET /health/ready`
+  (which checks Redis when admission control is enabled).
 
 ## Architecture
 
 ```text
-client ─► RequestContextMiddleware   request ID, access log, last-resort 500
-           └─► /v1/chat/completions
+client ─► RequestContextMiddleware   request ID, access log, metrics, last-resort 500
+           └─► /v1/chat/completions   deadline starts
                  auth ─► bounded body read ─► schema validation
-                 └─► CompletionService   alias ─► provider + upstream model
-                       └─► Provider adapter   translate, call upstream, normalize
-                             └─► httpx.AsyncClient (one per provider)
+                 └─► CompletionService
+                       plan: alias ─► primary + fallbacks, output ceiling, validation
+                       admit ─► AdmissionController ─► Redis script (all limits at once)
+                       └─► ProviderExecutor   retries, circuit breakers, fallback
+                             └─► Provider adapter ─► httpx.AsyncClient (per provider)
+                       settle ─► Redis script (release lease, charge tokens used)
 ```
 
 The API layer speaks the OpenAI wire format. The service layer is independent of
@@ -44,8 +58,9 @@ results (`Completion`, or a stream of `TextDelta` events ending in `StreamEnd`),
 which the API layer encodes back into OpenAI-format responses.
 
 See [docs/architecture.md](docs/architecture.md) for the request lifecycle,
-streaming data flow, and failure handling, and [docs/adr/](docs/adr/) for the main
-design decisions.
+[docs/admission-control.md](docs/admission-control.md) and
+[docs/resilience.md](docs/resilience.md) for limits and failure handling, and
+[docs/adr/](docs/adr/) for the main design decisions.
 
 ## Requirements
 
@@ -53,6 +68,8 @@ design decisions.
   generic functions); 3.13 is the version tested and used in the container image.
 - [uv](https://docs.astral.sh/uv/) 0.13 or later, for the locked dependency set in
   `uv.lock`.
+- Redis 7 or later when admission control is enabled. The tests start their own
+  `redis-server` processes, so the binary must be installed to run them.
 - Docker with Compose, optionally, for the container setup.
 
 ## Local setup
@@ -65,16 +82,20 @@ cp .env.example .env        # then set GATEWAY_API_KEYS
 ### Run with the mock provider
 
 `tools/mock_upstream.py` implements enough of the OpenAI and Anthropic APIs to
-exercise both adapters without vendor accounts. With Docker:
+exercise both adapters without vendor accounts. With Docker, the stack runs the
+gateway, the mock, and Redis, with admission control enabled
+(`config/gateway.compose.toml`):
 
 ```sh
 export GATEWAY_API_KEYS=$(openssl rand -hex 32)
-docker compose up --build
+docker compose up --build                    # gateway on 127.0.0.1:8000
+docker compose --profile multi up --build    # and a second gateway on 127.0.0.1:8001
 ```
 
-Without Docker, run the mock and the gateway in two terminals. The mock
-configuration addresses the mock by its Compose service name, so point it at
-localhost first:
+Without Docker, run the mock and the gateway in two terminals.
+`config/gateway.mock.toml` leaves admission control disabled, so Redis is not
+needed (the gateway logs a warning that no limits are enforced). It addresses the
+mock by its Compose service name, so point it at localhost first:
 
 ```sh
 sed 's#mock-upstream:9000#127.0.0.1:9000#' config/gateway.mock.toml > config/gateway.toml
@@ -115,9 +136,32 @@ model = "your-anthropic-model-id"
 default_max_tokens = 1024
 ```
 
+Limits, deadlines, retries, and fallbacks are configured in the same file:
+
+```toml
+[models.balanced]
+provider = "anthropic"
+model = "your-anthropic-model-id"
+max_output_tokens = 4096
+fallbacks = [{ provider = "openai", model = "your-openai-model-id" }]
+
+[resilience]
+request_deadline_seconds = 300
+max_attempts_per_provider = 2
+
+[admission]
+enabled = true            # requires GATEWAY_REDIS_URL
+
+[admission.default_limits]
+requests_per_minute = 60
+tokens_per_minute = 100000
+max_concurrent_requests = 8
+```
+
 `GATEWAY_ENVIRONMENT` defaults to `production`, which requires gateway keys of at
 least 32 characters and HTTPS provider URLs. Every setting is described in
-[docs/configuration.md](docs/configuration.md).
+[docs/configuration.md](docs/configuration.md), including changes from Phase 1
+configurations.
 
 ## API usage
 
@@ -190,6 +234,25 @@ system messages after the first user or assistant message, a missing `max_tokens
 with no configured default, and `temperature` or `top_p` on API version
 `2026-10-21` (the default), which does not accept them.
 
+### Rate limits
+
+A request over a key's limits is refused before any provider is called:
+
+```text
+HTTP/1.1 429 Too Many Requests
+retry-after: 4
+
+{"error": {"type": "rate_limited", "code": "tokens_per_minute_exceeded",
+           "message": "Token rate limit exceeded.", "param": null,
+           "request_id": "9f0c2a6d1b8e4f3a8c7d6e5f4a3b2c1d"}}
+```
+
+`code` is `requests_per_minute_exceeded`, `tokens_per_minute_exceeded`, or
+`concurrency_limit_exceeded`. `Retry-After` is the time until the bucket has
+refilled enough, rounded up to whole seconds; it is omitted for concurrency
+rejections, whose wait depends on other requests finishing. A request whose token
+reservation can never fit the key's limit gets 400 `token_reservation_exceeds_limit`.
+
 ### Errors
 
 ```json
@@ -204,13 +267,34 @@ with no configured default, and `temperature` or `top_p` on API version
 | `invalid_request` | 400, 404 (unknown alias or path), 405, 413, 415 |
 | `unsupported_capability` | 400 |
 | `provider_configuration_error` | 502 |
+| `rate_limited` | 429, with `Retry-After` when it can be calculated |
 | `provider_rate_limited` | 429, with `Retry-After` when the provider sent a delay in seconds |
 | `provider_timeout` | 504 |
-| `provider_unavailable` | 502 |
+| `provider_unavailable` | 502, including `provider_circuit_open` |
+| `admission_unavailable` | 503, when admission control cannot reach Redis |
+| `deadline_exceeded` | 504 |
 | `internal_error` | 500 |
 
 Every response carries an `X-Request-ID` header. A client may supply its own
 (8 to 128 characters from `A-Z a-z 0-9 . _ -`); other values are replaced.
+
+### Failure behaviour
+
+- Provider failures where the provider certainly did not run the request
+  (connection failures, 429, 5xx other than 504) are retried with backoff and then
+  passed to the alias's next fallback provider. Read timeouts, dropped connections,
+  and malformed responses are returned to the client, because the provider may
+  already have run, and charged for, the request.
+- A stream is retried or redirected only before its first event. Once output has
+  been sent, a failure ends the stream with a final `data: {"error": ...}` event
+  and no `[DONE]`.
+- When the deadline passes, the request ends with 504 `deadline_exceeded`, or with
+  an error event if a stream has started.
+- With admission control enabled, a Redis failure refuses requests with 503
+  instead of admitting them without limits.
+
+Details: [docs/resilience.md](docs/resilience.md) and
+[docs/admission-control.md](docs/admission-control.md).
 
 ## Testing
 
@@ -223,9 +307,16 @@ uv run pytest tests/integration
 ```
 
 The tests need no network access or provider accounts. Provider behaviour is
-simulated with httpx transports; `tests/integration/test_socket_server.py` runs the
-gateway and a fake upstream in uvicorn on localhost to test incremental delivery
-and client disconnects over real sockets.
+simulated with httpx transports and fake upstream servers. Admission tests start
+real `redis-server` processes on Unix sockets and are skipped if the binary is
+missing; set `GATEWAY_REQUIRE_REDIS_TESTS=1` (as CI does) to fail instead. Tests in
+`tests/integration/test_socket_server.py` and
+`tests/integration/test_multi_instance_load.py` run gateways and fake providers in
+uvicorn on localhost to test streaming, disconnects, and limits across two
+instances over real sockets.
+
+`tools/loadtest.py` measures latency and throughput against running gateways; see
+[docs/benchmarks.md](docs/benchmarks.md) for commands and recorded results.
 
 `tests/live/` contains a smoke test against a real provider. It is skipped unless
 `GATEWAY_LIVE_TESTS=1` and spends tokens when enabled:
@@ -235,9 +326,10 @@ GATEWAY_LIVE_TESTS=1 GATEWAY_LIVE_CONFIG_FILE=config/gateway.toml GATEWAY_LIVE_M
   uv run --env-file .env pytest tests/live
 ```
 
-The GitHub Actions workflow in `.github/workflows/ci.yml` runs the checks above,
-builds and installs the package, builds the container image, audits dependencies
-with pip-audit, and scans history with gitleaks.
+The GitHub Actions workflow in `.github/workflows/ci.yml` runs the checks above
+with Redis installed, builds and installs the package, builds the container
+images, validates the Compose files, audits dependencies with pip-audit, and scans
+history with gitleaks.
 
 ## Limitations
 
@@ -250,26 +342,32 @@ with pip-audit, and scans history with gitleaks.
   towards `max_tokens` and `completion_tokens`.
 - Anthropic stop reasons without an OpenAI equivalent (for example `pause_turn`)
   are returned as `finish_reason: null`.
-- No retries, failover, or rate limiting. Upstream errors are returned to the
-  client.
-- The read timeout limits the time between reads, not the total request time. A
-  stream that keeps producing data is never cut off, and there is no overall
-  deadline. A non-streaming upstream that sends nothing until it has finished must
-  respond within the read timeout.
+- Token limits are enforced on estimates: input tokens are estimated from UTF-8
+  size, and requests whose provider reports no usage are charged their full
+  reservation. Actual provider token consumption can differ from the configured
+  limit.
+- Limits are only as durable as Redis: if Redis loses data (restart without
+  persistence, failover to a lagging replica), buckets reset and active leases are
+  forgotten.
+- Circuit breaker state is per process, not shared between instances.
+- Retries and fallback assume that a provider answering with an error status did
+  not run, or charge for, the request. Requests that may have run are never
+  retried, but duplicate execution cannot be ruled out entirely.
 - No keep-alive comments are sent on idle streams; proxies with short idle timeouts
   may close long pauses.
 - `GET /v1/models` and other OpenAI endpoints are not implemented.
-- Gateway keys are a static list from the environment. There are no per-key
-  permissions or quotas, and changing keys requires a restart.
-- Readiness reflects local state only; it does not check provider reachability.
-- Request bodies are limited in size, but there is no limit on concurrent requests
-  beyond each provider's connection pool.
+- Gateway keys are a static list from the environment; limits are per key, with no
+  tenant grouping, and changing keys or limits requires a restart.
+- Without admission control, there is no limit on concurrent requests beyond each
+  provider's connection pool.
+- Readiness does not check provider reachability. `/metrics` and the health
+  endpoints are unauthenticated and served on the API port.
 
 ## Roadmap
 
-Planned for later phases, in no fixed order: distributed rate limiting, per-tenant
-budget enforcement, cost-aware model routing, provider failover before output has
-started, response caching, and cost analytics. None of these exist yet.
+Planned for later phases, in no fixed order: tenant-level budgets and usage
+accounting, cost-aware model routing, response caching, and cost analytics. None
+of these exist yet.
 
 ## License
 

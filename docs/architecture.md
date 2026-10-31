@@ -5,49 +5,83 @@
 | Module | Responsibility |
 | --- | --- |
 | `gateway.main` | Builds the FastAPI application; owns startup and shutdown. |
-| `gateway.api.middleware` | Request ID, access log, conversion of unhandled exceptions to 500. |
+| `gateway.api.middleware` | Request ID, access log, HTTP metrics, conversion of unhandled exceptions to 500. |
 | `gateway.api.dependencies` | Authentication, bounded body reading, request validation. |
-| `gateway.api.routes` | `/v1/chat/completions` and the health endpoints. |
+| `gateway.api.routes` | `/v1/chat/completions`, the health endpoints, and `/metrics`. |
 | `gateway.api.streaming`, `gateway.api.disconnect` | SSE encoding and response, disconnect detection. |
 | `gateway.api.encoding`, `gateway.api.errors` | OpenAI-format response and error bodies. |
-| `gateway.services.completion` | Alias resolution, provider dispatch, completion log event. |
+| `gateway.services.completion` | Request planning (alias, fallbacks, output ceiling, validation), admission and settlement, completion log event. |
+| `gateway.services.execution` | Provider attempts: retries, circuit breakers, fallback, per-attempt usage. |
+| `gateway.admission.*` | Per-key limits, token estimation, the Redis scripts, failure policy, and usage accounting. |
+| `gateway.resilience.*` | Request deadlines, retry policy, circuit breakers. |
 | `gateway.providers.*` | Provider interface, adapters, HTTP client setup, upstream error mapping, SSE parsing. |
-| `gateway.core.*` | Configuration, logging, authentication. |
+| `gateway.core.*` | Configuration, logging, metrics, Redis client, authentication. |
 | `gateway.schemas.completions` | The accepted request schema. |
 
-Dependencies point inwards: `api` uses `services`, which uses `providers`; all of
-them use `core`, `schemas`, and `errors`. Providers know nothing about HTTP
+Dependencies point inwards: `api` uses `services`, which uses `admission`,
+`resilience`, and `providers`; all of them use `core`, `schemas`, and `errors`. Providers know nothing about HTTP
 requests from clients, and the service knows nothing about wire formats.
 
 ## Request lifecycle
 
+Authentication -> validation -> model resolution -> admission -> provider attempts
+-> retry or fallback decision -> response -> reconciliation.
+
 1. **Context.** `RequestContextMiddleware` accepts a well-formed client
    `X-Request-ID` or generates one, stores it in a context variable for logging,
    and adds it to the response headers.
-2. **Authentication.** The Bearer token is checked before the body is read. Missing
+2. **Deadline.** A `Deadline` for `request_deadline_seconds` starts before any
+   other processing, measured on the monotonic clock.
+3. **Authentication.** The Bearer token is checked before the body is read. Missing
    or invalid credentials return 401 without reading the body.
-3. **Body.** The body must be `application/json`. It is read incrementally and
+4. **Body.** The body must be `application/json`. It is read incrementally and
    rejected with 413 once it exceeds `GATEWAY_MAX_REQUEST_BYTES`. A declared
    `Content-Length` over the limit is rejected without reading.
-4. **Validation.** The body is parsed strictly into `ChatCompletionRequest`. The
+5. **Validation.** The body is parsed strictly into `ChatCompletionRequest`. The
    first validation error is returned with its parameter path.
-5. **Resolution.** `CompletionService` maps the alias to a provider and upstream
-   model and builds a `ProviderRequest`, applying the alias's `default_max_tokens`
-   if the client did not set `max_tokens`.
-6. **Translation.** The adapter checks that it can represent the request and
-   raises `unsupported_capability` or `invalid_request` before any network call if
-   not. It then serializes the request in its provider's format.
-7. **Upstream call.** The provider's shared `httpx.AsyncClient` sends the request.
-   Only configured headers are sent; nothing from the client request is forwarded
-   except the validated body content.
-8. **Normalization.** The adapter validates the upstream response and converts it
-   to a `Completion` or a sequence of `TextDelta` events ending in `StreamEnd`.
-9. **Response.** The route encodes the result as an OpenAI-format JSON body or SSE
-   stream.
-10. **Logging.** The service logs one `completion finished` event (outcome, alias,
-    provider, upstream model, duration, finish reason, token usage, and error
-    category if any). The middleware logs one `request completed` event (method,
-    path, status, duration, principal, error category).
+6. **Planning.** `CompletionService` maps the alias to its primary provider and
+   fallbacks, applies `max_output_tokens` and `default_max_tokens`, and builds one
+   `ProviderRequest` per candidate. Each adapter validates its request without I/O;
+   the primary's rejection is returned to the client, and an incompatible fallback
+   is dropped from the plan.
+7. **Admission.** If admission control is enabled, one Redis script checks the
+   key's request, token, and concurrency limits and either commits all of them or
+   none. The token reservation is the estimated input plus the output allowance.
+   Rejection returns 429; a Redis failure returns 503.
+8. **Provider attempts.** `ProviderExecutor` tries the candidates in order. Each
+   attempt passes through the provider's circuit breaker and runs within the
+   remaining deadline. The adapter translates the request, the provider's
+   `httpx.AsyncClient` sends it with only configured headers, and the adapter
+   normalizes the response into a `Completion` or a stream of `TextDelta` events
+   ending in `StreamEnd`.
+9. **Retry or fallback.** A failure where the provider certainly did not run the
+   request is retried with backoff, then passed to the next candidate. Any other
+   failure ends the request. See [resilience.md](resilience.md).
+10. **Response.** The route encodes the result as an OpenAI-format JSON body or SSE
+    stream.
+11. **Reconciliation.** Whatever the outcome, including cancellation and deadline
+    expiry, the reservation is settled: the lease is released and the token
+    reservation is replaced by the usage charged for every attempt. See
+    [admission-control.md](admission-control.md).
+12. **Logging.** The service logs one `completion finished` event (outcome, alias,
+    serving provider, attempts, duration, finish reason, token usage and
+    reservation, error category). The middleware logs one `request completed` event
+    (method, path, status, duration, principal, error category).
+
+### Non-streaming path
+
+Planning, admission, the provider attempts, and settlement all run inside the route
+handler, raced against the client's disconnect (see Cancellation below). The
+response is sent after settlement has finished.
+
+### Streaming path
+
+The route runs planning, admission, and the provider attempts up to and including
+the first upstream event before it returns the response, so failures before any
+output still produce an HTTP error status. The remaining events are read while the
+response is being sent. The admission reservation is settled when the stream ends:
+after `StreamEnd`, after a mid-stream error, when the client disconnects, or when
+the deadline expires.
 
 ## Provider adapter boundary
 
@@ -55,6 +89,7 @@ requests from clients, and the service knows nothing about wire formats.
 class Provider(Protocol):
     @property
     def name(self) -> str: ...
+    def validate(self, request: ProviderRequest) -> None: ...
     async def complete(self, request: ProviderRequest) -> Completion: ...
     def stream(self, request: ProviderRequest) -> AsyncGenerator[StreamEvent]: ...
     async def aclose(self) -> None: ...
@@ -90,8 +125,14 @@ asynchronous; there are no threads or blocking calls in the request path.
 
 Each provider has one `httpx.AsyncClient`, created at startup and closed at
 shutdown, with a connection pool bounded by `max_connections`. Requests wait up to
-`pool_timeout_seconds` for a free connection. Concurrency is otherwise unbounded:
-the gateway does not queue or limit requests in Phase 1.
+`pool_timeout_seconds` for a free connection. The gateway does not queue requests:
+with admission control enabled, concurrency per key is limited by leases in Redis;
+without it, concurrency is bounded only by the connection pools. Redis connections
+come from one bounded pool per process.
+
+Background work is limited to settlement tasks: one per admitted request, and one
+per admission whose outcome was lost. Each is bounded by the Redis operation
+timeout and awaited at shutdown. There are no queues or periodic tasks.
 
 **Cancellation.** ASGI servers do not cancel a handler when its client
 disconnects; they deliver an `http.disconnect` message through `receive()`. The
@@ -99,19 +140,22 @@ gateway races the upstream work against that message (`run_until_disconnect`) an
 cancels the work if the client leaves first. Cancellation propagates through the
 service and adapter as `asyncio.CancelledError`; `async with` blocks around the
 upstream response close it, which closes the connection because the body was not
-fully read. Disconnected non-streaming requests are logged with status 499.
+fully read. The admission reservation is then settled in a task shielded from the
+cancellation, charging the full reservation because the provider may have been
+running the request. Disconnected non-streaming requests are logged with status 499.
 
 **Shutdown.** On SIGTERM uvicorn stops accepting connections and waits up to
 `--timeout-graceful-shutdown` seconds (30 in the container image) for in-flight
 requests, including streams. Requests still running after that are cancelled, which
-closes their upstream connections. The lifespan handler then closes the provider
+closes their upstream connections and settles their reservations. The lifespan
+handler then waits for pending settlements and closes the Redis and provider
 clients.
 
 ## Streaming data flow
 
 ```text
-upstream bytes ─► iter_sse ─► adapter _parse_stream ─► CompletionService.stream
-   ─► encode_stream ─► EventStreamResponse ─► ASGI send
+upstream bytes ─► iter_sse ─► adapter _parse_stream ─► ProviderExecutor.stream
+   ─► CompletionService.stream ─► encode_stream ─► EventStreamResponse ─► ASGI send
 ```
 
 Every stage is a pull-based async generator with no buffer between stages. The
@@ -174,7 +218,16 @@ pipeline does not change.
 | Upstream 429 | `provider_rate_limited` | 429 |
 | Upstream 408, 504; connect, read, write, or pool timeout | `provider_timeout` | 504 |
 | Upstream 5xx (including 529) or other unexpected status, connection failure, malformed response, incomplete stream | `provider_unavailable` | 502 |
+| Circuit breaker open for every remaining candidate | `provider_unavailable` (`provider_circuit_open`) | 502 |
+| Request, token, or concurrency limit reached | `rate_limited` | 429 |
+| Token reservation larger than the key's token bucket | `invalid_request` (`token_reservation_exceeds_limit`) | 400 |
+| Redis unavailable while admission control is enabled | `admission_unavailable` | 503 |
+| Request deadline expired | `deadline_exceeded` | 504 |
 | Unexpected exception in the gateway | `internal_error` | 500 |
+
+These statuses describe the last attempt. Before an error is returned, transient
+failures may have been retried and later candidates tried; see
+[resilience.md](resilience.md).
 
 Client messages are fixed strings written by the gateway. Upstream response bodies
 are never forwarded, because they can echo request content; only the upstream error
@@ -188,8 +241,9 @@ Configuration is loaded and validated once, before the application is created:
 environment variables into `Settings`, then the TOML file into `GatewayConfig`,
 then each provider's `api_key_env` is resolved from the environment. Any problem
 stops startup with a message naming the setting. Secrets are held as
-`pydantic.SecretStr` and never appear in `repr` or validation errors. See
-[configuration.md](configuration.md).
+`pydantic.SecretStr` and never appear in `repr` or validation errors. Admission
+limits and resilience settings live in the same file; the Redis URL, which may hold
+a password, comes from `GATEWAY_REDIS_URL`. See [configuration.md](configuration.md).
 
 ## Security controls
 
@@ -205,7 +259,17 @@ stops startup with a message naming the setting. Secrets are held as
 - Production mode requires 32-character gateway keys and HTTPS upstreams unless a
   provider explicitly opts out.
 - The container runs as an unprivileged user; Compose adds a read-only root
-  filesystem and drops all capabilities.
+  filesystem and drops all capabilities, and keeps Redis on an internal network.
+- Admission state is keyed by a digest-derived principal ID from the authenticated
+  key; callers cannot choose it, unauthenticated requests create no Redis state,
+  and reservation IDs are generated by the gateway and never accepted as input.
+- Admission fails closed: without a decision from Redis, requests are refused.
+- Each provider has its own client and credential; fallback never sends one
+  provider's credential to another.
+- Retry amplification is bounded: at most `max_attempts_per_provider` (5 or fewer)
+  attempts for each of at most four candidates, all within one deadline.
+- Readiness results are reused for one second, so unauthenticated probes cannot
+  generate unbounded Redis traffic.
 
 ## Trade-offs
 
@@ -217,8 +281,13 @@ stops startup with a message naming the setting. Secrets are held as
 - **Strict rejection of unsupported fields** breaks clients that send fields the
   gateway does not implement, instead of returning responses generated without
   them.
-- **No retries.** Retrying belongs with failover and budgets in a later phase,
-  where it can be bounded and observed.
-- **One process, no shared state.** Nothing is shared between instances, so the
-  gateway scales horizontally without coordination, but limits and budgets cannot
-  be enforced across instances yet.
+- **Retry only what certainly did not run.** This gives up recovery from read
+  timeouts and dropped connections in exchange for not running a request twice;
+  see [ADR 0005](adr/0005-retry-and-fallback-only-unprocessed-requests.md).
+- **One Redis script per admission decision** keeps admission atomic and fast, at
+  the cost of making Redis a required dependency for limits; see
+  [ADR 0004](adr/0004-atomic-admission-in-redis.md).
+- **Leases sized to the deadline** need no renewal, but a crashed gateway's
+  concurrency slots stay held until the deadline plus grace period has passed.
+- **Process-local circuit breakers** need no coordination, but replicas detect
+  provider outages independently.
