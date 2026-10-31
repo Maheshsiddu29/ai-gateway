@@ -1,6 +1,6 @@
 [project]
 name = "ai-gateway"
-version = "0.1.0"
+dynamic = ["version"]
 description = "An asynchronous HTTP gateway exposing an OpenAI-compatible chat completion API over multiple LLM providers."
 readme = "README.md"
 requires-python = ">=3.13"
@@ -24,6 +24,9 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/gateway/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gateway"]

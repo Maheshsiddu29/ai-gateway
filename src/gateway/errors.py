@@ -83,6 +83,14 @@ class ProviderError(GatewayError):
         self.upstream_error_type = upstream_error_type
 
 
+class ProviderRejectedRequestError(ProviderError):
+    """The provider refused a request the gateway considered valid."""
+
+    error_type = ErrorType.INVALID_REQUEST
+    default_status_code = 400
+    default_code = "provider_rejected_request"
+
+
 class ProviderConfigurationError(ProviderError):
     error_type = ErrorType.PROVIDER_CONFIGURATION
     default_status_code = 502

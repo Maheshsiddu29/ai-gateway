@@ -30,7 +30,7 @@ async def client(provider: FakeProvider) -> AsyncIterator[httpx.AsyncClient]:
     app = build_app(
         make_settings(max_request_bytes=MAX_REQUEST_BYTES),
         make_config(FAKE_CONFIG, {"fake": None}),
-        {"fake": provider},
+        lambda *_: provider,
     )
     async with serve(app) as client:
         yield client
@@ -112,7 +112,9 @@ class TestCompletionResponse:
             )
         )
         app = build_app(
-            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), {"fake": provider}
+            make_settings(),
+            make_config(FAKE_CONFIG, {"fake": None}),
+            lambda *_: provider,
         )
 
         async with serve(app) as client:
@@ -138,7 +140,9 @@ class TestCompletionResponse:
             error=ProviderRateLimitError("Rate limited.", retry_after_seconds=7)
         )
         app = build_app(
-            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), {"fake": provider}
+            make_settings(),
+            make_config(FAKE_CONFIG, {"fake": None}),
+            lambda *_: provider,
         )
 
         async with serve(app) as client:
@@ -151,7 +155,9 @@ class TestCompletionResponse:
     async def test_unexpected_errors_are_sanitized(self, caplog: pytest.LogCaptureFixture) -> None:
         provider = FakeProvider(error=RuntimeError("internal detail"))
         app = build_app(
-            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), {"fake": provider}
+            make_settings(),
+            make_config(FAKE_CONFIG, {"fake": None}),
+            lambda *_: provider,
         )
 
         async with serve(app) as client:
@@ -348,7 +354,7 @@ class TestRoutingErrors:
 class TestLifecycle:
     async def test_not_ready_before_startup(self) -> None:
         app = build_app(
-            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), {"fake": FakeProvider()}
+            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), lambda *_: FakeProvider()
         )
         transport = httpx.ASGITransport(app=app)
 
@@ -360,7 +366,9 @@ class TestLifecycle:
     async def test_shutdown_closes_providers(self) -> None:
         provider = FakeProvider()
         app = build_app(
-            make_settings(), make_config(FAKE_CONFIG, {"fake": None}), {"fake": provider}
+            make_settings(),
+            make_config(FAKE_CONFIG, {"fake": None}),
+            lambda *_: provider,
         )
 
         async with serve(app):
