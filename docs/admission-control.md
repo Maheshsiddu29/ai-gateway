@@ -144,7 +144,9 @@ Redis is part of the admission decision. With admission enabled:
 - redis-py's automatic command retries are disabled, because they are not aware of
   idempotency. The gateway repeats a call only after a connection error, once, with
   the same reservation ID (see Restart below).
-- `/health/ready` pings Redis and returns 503 when it does not answer.
+- `/health/ready` pings Redis and returns 503 when it does not answer. The result
+  is reused for one second, so unauthenticated probes cannot generate unbounded
+  Redis traffic; readiness may therefore lag a Redis outage by up to a second.
 
 **Lost replies.** If the admission call fails or is cancelled after the command
 may have reached Redis, the gateway cannot tell whether it committed. It refuses

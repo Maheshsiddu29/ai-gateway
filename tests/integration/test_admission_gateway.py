@@ -12,6 +12,7 @@ import pytest
 from pydantic import SecretStr
 from redis.asyncio import Redis
 
+from gateway.admission.controller import READINESS_CACHE_SECONDS
 from gateway.admission.redis_store import KEY_PREFIX
 from gateway.admission.tokens import estimate_input_tokens
 from gateway.core.security import StaticKeyAuthenticator
@@ -373,10 +374,13 @@ class TestRedisFailure:
             await redis_server.stop()
 
             refused = await post(client)
+            # Readiness results are reused for up to READINESS_CACHE_SECONDS.
+            await asyncio.sleep(READINESS_CACHE_SECONDS)
             readiness = await client.get("/health/ready")
 
             await redis_server.start()
             recovered = [(await post(client)).status_code for _ in range(3)]
+            await asyncio.sleep(READINESS_CACHE_SECONDS)
             ready_again = await client.get("/health/ready")
             metrics = (await client.get("/metrics")).text
 

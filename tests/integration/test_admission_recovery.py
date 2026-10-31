@@ -8,7 +8,11 @@ import pytest
 from pydantic import SecretStr
 from redis.asyncio import Redis
 
-from gateway.admission.controller import AdmissionController, AdmissionStore
+from gateway.admission.controller import (
+    READINESS_CACHE_SECONDS,
+    AdmissionController,
+    AdmissionStore,
+)
 from gateway.admission.limits import KeyLimits, TokenBucket
 from gateway.admission.redis_store import (
     KEY_PREFIX,
@@ -160,3 +164,31 @@ async def test_settlement_completes_even_if_the_caller_is_cancelled(
     await controller.aclose()
 
     assert await redis_client.zcard(f"{STATE}:leases") == 0
+
+
+class CountingStore(BlockingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.pings = 0
+
+    async def ping(self) -> None:
+        self.pings += 1
+
+
+async def test_readiness_checks_are_reused_for_a_second() -> None:
+    store = CountingStore()
+    now = [100.0]
+    controller = AdmissionController(
+        store,
+        AdmissionConfig(enabled=True),
+        request_deadline_seconds=60,
+        metrics=Metrics(),
+        clock=lambda: now[0],
+    )
+
+    results = [await controller.is_ready() for _ in range(50)]
+    now[0] += READINESS_CACHE_SECONDS
+    await controller.is_ready()
+
+    assert all(results)
+    assert store.pings == 2

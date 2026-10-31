@@ -51,6 +51,7 @@ from gateway.resilience.deadline import Deadline
 logger = logging.getLogger(__name__)
 
 _REDIS_FAILURES = (RedisError, TimeoutError, OSError)
+READINESS_CACHE_SECONDS = 1.0
 _REJECTIONS = {
     Rejection.REQUESTS: ("requests_per_minute_exceeded", "Request rate limit exceeded."),
     Rejection.TOKENS: ("tokens_per_minute_exceeded", "Token rate limit exceeded."),
@@ -79,6 +80,7 @@ class AdmissionController:
         *,
         request_deadline_seconds: float,
         metrics: Metrics,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._config = config
@@ -90,6 +92,8 @@ class AdmissionController:
         self._record_ttl_ms = self._lease_ttl_ms + ceil(config.reservation_retention_seconds * 1000)
         self._limits: dict[str, KeyLimits] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._clock = clock
+        self._readiness: tuple[float, bool] | None = None
 
     def limits_for(self, principal: Principal) -> KeyLimits:
         limits = self._limits.get(principal.id)
@@ -146,13 +150,21 @@ class AdmissionController:
         await asyncio.shield(self._spawn(self._settle(admission, ledger)))
 
     async def is_ready(self) -> bool:
+        # The readiness endpoint is unauthenticated, so the result is reused briefly:
+        # otherwise every probe request would cost a Redis round trip.
+        now = self._clock()
+        if self._readiness is not None and now - self._readiness[0] < READINESS_CACHE_SECONDS:
+            return self._readiness[1]
         try:
             async with asyncio.timeout(self._timeout):
                 await self._store.ping()
         except _REDIS_FAILURES:
             self._metrics.redis_errors.labels("ping").inc()
-            return False
-        return True
+            ready = False
+        else:
+            ready = True
+        self._readiness = (now, ready)
+        return ready
 
     async def aclose(self) -> None:
         await asyncio.gather(*self._tasks, return_exceptions=True)
