@@ -26,6 +26,9 @@ async def ready(request: Request) -> JSONResponse:
     if request.app.state.completion_service is None:
         return JSONResponse({"status": "not_ready"}, status_code=503)
     admission: AdmissionController | None = request.app.state.admission
+    cost_store = request.app.state.cost_store
+    if cost_store is not None and not await cost_store.ping():
+        return JSONResponse({"status": "not_ready", "cost": "unavailable"}, status_code=503)
     if admission is None:
         return JSONResponse({"status": "ready", "admission": "disabled"})
     if not await admission.is_ready():

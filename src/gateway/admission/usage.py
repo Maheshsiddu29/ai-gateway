@@ -13,6 +13,7 @@ Attempts are not free: two uncertain attempts are charged two reservations.
 """
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -32,6 +33,7 @@ class Attempt:
     started_at: float = field(default_factory=time.perf_counter)
     usage: Usage | None = None
     may_have_processed: bool = True
+    cost_attempt_id: uuid.UUID | None = None
 
     def succeeded(self, usage: Usage | None) -> None:
         self.usage = usage

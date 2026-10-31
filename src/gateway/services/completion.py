@@ -28,6 +28,8 @@ from gateway.admission.usage import UsageLedger
 from gateway.core.config import GatewayConfig
 from gateway.core.metrics import Metrics
 from gateway.core.security import Principal
+from gateway.cost.session import CostSession
+from gateway.cost.store import CostStore
 from gateway.errors import (
     DeadlineExceededError,
     GatewayError,
@@ -96,6 +98,7 @@ class CompletionService:
         executor: ProviderExecutor,
         metrics: Metrics,
         admission: AdmissionController | None = None,
+        cost_store: CostStore | None = None,
     ) -> None:
         referenced = {
             provider
@@ -110,6 +113,7 @@ class CompletionService:
         self._executor = executor
         self._metrics = metrics
         self._admission = admission
+        self._cost_store = cost_store
 
     async def complete(
         self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
@@ -120,7 +124,8 @@ class CompletionService:
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                completion = await self._executor.complete(plan.candidates, deadline, ledger)
+                cost = self._cost_session(principal, plan)
+                completion = await self._executor.complete(plan.candidates, deadline, ledger, cost)
             finally:
                 await self._settle(admission, ledger)
         except BaseException as exc:
@@ -147,7 +152,8 @@ class CompletionService:
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                events = self._executor.stream(plan.candidates, deadline, ledger)
+                cost = self._cost_session(principal, plan)
+                events = self._executor.stream(plan.candidates, deadline, ledger, cost)
                 async with aclosing(events):
                     async for event in events:
                         if isinstance(event, TextDelta):
@@ -225,6 +231,13 @@ class CompletionService:
     async def _settle(self, admission: Admission | None, ledger: UsageLedger) -> None:
         if self._admission is not None and admission is not None:
             await self._admission.settle(admission, ledger)
+
+    def _cost_session(self, principal: Principal, plan: _Plan) -> CostSession | None:
+        if self._cost_store is None:
+            return None
+        return CostSession(
+            self._cost_store, principal.id, estimate_input_tokens(plan.request.messages)
+        )
 
 
 def _provider_request(request: ChatCompletionRequest, route: ModelRoute) -> ProviderRequest:

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from gateway.admission.usage import Attempt, UsageLedger
 from gateway.core.config import ResilienceConfig
 from gateway.core.metrics import Metrics
+from gateway.cost.session import CostSession
 from gateway.errors import (
     GatewayError,
     InternalGatewayError,
@@ -73,21 +74,36 @@ class ProviderExecutor:
         self._random = random
 
     async def complete(
-        self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
+        self,
+        candidates: Sequence[Candidate],
+        deadline: Deadline,
+        ledger: UsageLedger,
+        cost: CostSession | None = None,
     ) -> Completion:
         completion, attempt, candidate, permit = await self._first_success(
-            candidates, deadline, ledger, lambda adapter, request: adapter.complete(request)
+            candidates, deadline, ledger, lambda adapter, request: adapter.complete(request), cost
         )
         attempt.succeeded(completion.usage)
         self._breakers[candidate.provider].release(permit, AttemptOutcome.SUCCESS)
         self._observe(candidate.provider, attempt.started_at, "success")
+        if cost is not None and attempt.cost_attempt_id is not None:
+            await cost.settle(
+                attempt.cost_attempt_id,
+                completion.usage,
+                may_have_processed=True,
+                classification="success",
+            )
         return completion
 
     async def stream(
-        self, candidates: Sequence[Candidate], deadline: Deadline, ledger: UsageLedger
+        self,
+        candidates: Sequence[Candidate],
+        deadline: Deadline,
+        ledger: UsageLedger,
+        cost: CostSession | None = None,
     ) -> AsyncGenerator[StreamEvent]:
         (events, first), attempt, candidate, permit = await self._first_success(
-            candidates, deadline, ledger, _open_stream
+            candidates, deadline, ledger, _open_stream, cost
         )
         outcome = AttemptOutcome.NEUTRAL
         label = "cancelled"
@@ -112,10 +128,16 @@ class ProviderExecutor:
             label = _outcome_label(exc)
             raise
         finally:
-            # A half-open probe remains occupied for the entire stream, including
-            # slow-client pauses. Cancellation frees it without declaring recovery.
+            # Release the breaker even when financial settlement fails.
             self._breakers[candidate.provider].release(permit, outcome)
             self._observe(candidate.provider, attempt.started_at, label)
+            if cost is not None and attempt.cost_attempt_id is not None:
+                await cost.settle(
+                    attempt.cost_attempt_id,
+                    attempt.usage,
+                    may_have_processed=attempt.may_have_processed,
+                    classification=label,
+                )
 
     async def _first_success[T](
         self,
@@ -123,10 +145,13 @@ class ProviderExecutor:
         deadline: Deadline,
         ledger: UsageLedger,
         run: Callable[[Provider, ProviderRequest], Awaitable[T]],
+        cost: CostSession | None,
     ) -> tuple[T, Attempt, Candidate, Permit]:
         for candidate, following in itertools.pairwise(candidates):
             try:
-                result, attempt, permit = await self._attempts(candidate, deadline, ledger, run)
+                result, attempt, permit = await self._attempts(
+                    candidate, deadline, ledger, run, cost
+                )
             except ProviderError as exc:
                 if not self._policy.allows_fallback(exc):
                     raise
@@ -144,7 +169,7 @@ class ProviderExecutor:
                 continue
             return result, attempt, candidate, permit
         last = candidates[-1]
-        result, attempt, permit = await self._attempts(last, deadline, ledger, run)
+        result, attempt, permit = await self._attempts(last, deadline, ledger, run, cost)
         return result, attempt, last, permit
 
     async def _attempts[T](
@@ -153,6 +178,7 @@ class ProviderExecutor:
         deadline: Deadline,
         ledger: UsageLedger,
         run: Callable[[Provider, ProviderRequest], Awaitable[T]],
+        cost: CostSession | None,
     ) -> tuple[T, Attempt, Permit]:
         name = candidate.provider
         provider = self._providers[name]
@@ -171,13 +197,25 @@ class ProviderExecutor:
                 )
             attempt = ledger.start(name)
             started = attempt.started_at
+            dispatched = False
             try:
+                if cost is not None:
+                    attempt.cost_attempt_id = await cost.reserve(name, candidate.request)
+                    await cost.store.dispatch(attempt.cost_attempt_id)
+                    dispatched = True
                 async with deadline.limit():
                     result = await run(provider, candidate.request)
             except BaseException as exc:
                 attempt.failed(exc)
                 breaker.release(permit, outcome_of(exc))
                 self._observe(name, started, _outcome_label(exc))
+                if cost is not None and attempt.cost_attempt_id is not None:
+                    await cost.settle(
+                        attempt.cost_attempt_id,
+                        None,
+                        may_have_processed=dispatched and attempt.may_have_processed,
+                        classification=_outcome_label(exc),
+                    )
                 delay = self._retry_delay(exc, number, deadline)
                 if delay is None:
                     raise

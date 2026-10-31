@@ -100,3 +100,47 @@ class Metrics:
             ["from_provider", "to_provider"],
             registry=self.registry,
         )
+        self.cost_admissions = Counter(
+            "gateway_cost_admissions",
+            "PostgreSQL spending decisions.",
+            ["outcome"],
+            registry=self.registry,
+        )
+        self.cost_reserved_micro_usd = Counter(
+            "gateway_cost_reserved_micro_usd",
+            "Budget capacity reserved in micro-USD.",
+            registry=self.registry,
+        )
+        self.cost_observed_micro_usd = Counter(
+            "gateway_cost_observed_micro_usd",
+            "Observed provider charges in micro-USD.",
+            registry=self.registry,
+        )
+        self.cost_unknown_usage = Counter(
+            "gateway_cost_unknown_usage",
+            "Attempts conservatively charged without usage.",
+            registry=self.registry,
+        )
+        self.cost_reconciliation_errors = Counter(
+            "gateway_cost_reconciliation_errors",
+            "Failed PostgreSQL cost settlements.",
+            registry=self.registry,
+        )
+        self.cost_expired = Counter(
+            "gateway_cost_expired",
+            "Expired reservations recovered.",
+            ["state"],
+            registry=self.registry,
+        )
+        self.cost_transaction_errors = Counter(
+            "gateway_cost_transaction_errors",
+            "PostgreSQL financial transaction failures.",
+            ["operation"],
+            registry=self.registry,
+        )
+        self.cost_admission_duration = Histogram(
+            "gateway_cost_admission_duration_seconds",
+            "PostgreSQL budget admission latency.",
+            buckets=_LATENCY_BUCKETS,
+            registry=self.registry,
+        )
