@@ -35,7 +35,7 @@ not run the request. Budgets, cost-aware routing, and caching are not implemente
   and the whole stream.
 - Bounded retries with exponential backoff, per-provider circuit breakers, and
   configured fallback providers per alias.
-- Prometheus metrics at `GET /metrics`; `GET /health/live` and `GET /health/ready`
+- Prometheus metrics at `GET /metrics` (gateway Bearer key required); `GET /health/live` and `GET /health/ready`
   (which checks Redis when admission control is enabled).
 
 ## Architecture
@@ -360,8 +360,8 @@ history with gitleaks.
   tenant grouping, and changing keys or limits requires a restart.
 - Without admission control, there is no limit on concurrent requests beyond each
   provider's connection pool.
-- Readiness does not check provider reachability. `/metrics` and the health
-  endpoints are unauthenticated and served on the API port.
+- Readiness does not check provider reachability. `/metrics` requires a gateway API key; health
+  endpoints remain unauthenticated on the API port.
 
 ## Roadmap
 

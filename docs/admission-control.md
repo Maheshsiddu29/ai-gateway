@@ -200,3 +200,12 @@ running the first call.
   `gateway_charged_tokens_total{usage}`, and `gateway_redis_errors_total{operation}`
   describe admission behaviour. The `admission decision`, `reservation settled`,
   and `reservation unresolved` log events carry the principal and reservation IDs.
+
+## Redis transport
+
+Production TCP connections require TLS (`rediss://`) with certificate and hostname
+verification. Private CAs can be supplied with `GATEWAY_REDIS_CA_FILE`. Unix
+sockets remain available for a co-located Redis. URL query parameters are rejected
+because redis-py otherwise lets them override timeouts, retries, and TLS options.
+The Compose demonstration deliberately uses plaintext on an isolated development
+network; it is not a production Redis deployment.

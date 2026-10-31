@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -42,7 +43,6 @@ EnvVarName = Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 # The non-secret identifier of a gateway key; see core.security.Principal.
 PrincipalId = Annotated[str, Field(pattern=r"^key-[0-9a-f]{12}$")]
-_REDIS_URL_SCHEMES = ("redis://", "rediss://", "unix://")
 # Keeps token-bucket arithmetic well within the exact integer range of the
 # double-precision numbers used by Redis Lua scripts.
 MAX_RATE_LIMIT = 1_000_000_000
@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     max_request_bytes: int = Field(default=1_048_576, ge=1024, le=64 * 1_048_576)
     # May embed a password, so it is held as a secret and never logged.
     redis_url: SecretStr | None = None
+    redis_ca_file: Path | None = None
 
     @field_validator("api_keys", mode="before")
     @classmethod
@@ -75,8 +76,8 @@ class Settings(BaseSettings):
     @field_validator("redis_url")
     @classmethod
     def _check_redis_url(cls, url: SecretStr | None) -> SecretStr | None:
-        if url is not None and not url.get_secret_value().startswith(_REDIS_URL_SCHEMES):
-            raise ValueError(f"redis_url must start with one of {', '.join(_REDIS_URL_SCHEMES)}")
+        if url is not None:
+            validate_redis_url(url)
         return url
 
     @model_validator(mode="after")
@@ -88,7 +89,33 @@ class Settings(BaseSettings):
                 f"gateway API keys must be at least {MIN_PRODUCTION_API_KEY_LENGTH} characters"
                 " in production"
             )
+        if (
+            self.environment is Environment.PRODUCTION
+            and self.redis_url is not None
+            and self.redis_url.get_secret_value().startswith("redis://")
+        ):
+            raise ValueError("production Redis TCP connections require rediss:// with TLS")
         return self
+
+
+def validate_redis_url(url: SecretStr) -> None:
+    try:
+        parsed = urlsplit(url.get_secret_value())
+        valid = (
+            parsed.scheme in {"redis", "rediss", "unix"}
+            and not parsed.query
+            and not parsed.fragment
+            and (bool(parsed.path) if parsed.scheme == "unix" else bool(parsed.hostname))
+        )
+        # Accessing port also validates its syntax and range.
+        if parsed.port is not None and parsed.scheme == "unix":
+            valid = False
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(
+            "Redis URL must use redis://, rediss://, or unix:// without query or fragment"
+        )
 
 
 class _ProviderConfigBase(BaseModel):

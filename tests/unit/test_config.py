@@ -261,7 +261,7 @@ request_burst = 50
 class TestAdmissionConfig:
     def test_loads_default_and_per_key_limits(self, tmp_path: Path) -> None:
         settings = make_settings(
-            write_config(tmp_path, ADMISSION_CONFIG), redis_url="redis://redis.internal:6379/0"
+            write_config(tmp_path, ADMISSION_CONFIG), redis_url="rediss://redis.internal:6379/0"
         )
 
         admission = load_config(settings, PROVIDER_KEYS).gateway.admission
@@ -310,7 +310,7 @@ class TestAdmissionConfig:
         assert "redis_url" in str(exc_info.value)
 
     def test_redis_url_is_masked_in_repr(self) -> None:
-        settings = make_settings(Path("unused.toml"), redis_url="redis://:hunter2@redis:6379")
+        settings = make_settings(Path("unused.toml"), redis_url="rediss://:hunter2@redis:6379")
 
         assert "hunter2" not in repr(settings)
 
@@ -355,3 +355,23 @@ class TestFallbackConfig:
         settings = self.with_fallbacks(tmp_path, '[{ provider = "openai", model = "smaller" }]')
 
         assert load_config(settings, PROVIDER_KEYS).gateway.models["fast"].fallbacks
+
+
+@pytest.mark.parametrize(
+    "query", ["ssl_cert_reqs=none", "socket_timeout=0", "retry_on_timeout=True"]
+)
+def test_redis_url_cannot_override_transport_policy(query: str) -> None:
+    with pytest.raises(ValidationError, match="without query or fragment"):
+        make_settings(Path("unused"), redis_url=f"rediss://redis:6379/0?{query}")
+
+
+def test_production_redis_tcp_requires_tls() -> None:
+    with pytest.raises(ValidationError, match="require rediss"):
+        make_settings(Path("unused"), redis_url="redis://redis:6379/0")
+
+
+def test_development_redis_may_use_plaintext() -> None:
+    settings = make_settings(
+        Path("unused"), redis_url="redis://redis:6379/0", environment=Environment.DEVELOPMENT
+    )
+    assert settings.redis_url is not None

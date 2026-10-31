@@ -102,7 +102,9 @@ async def _start_admission(
             "admission control is disabled: no request, token, or concurrency limits are enforced"
         )
         return None
-    redis = create_redis_client(require_redis_url(settings), config.admission)
+    redis = create_redis_client(
+        require_redis_url(settings), config.admission, settings.redis_ca_file
+    )
     stack.push_async_callback(redis.aclose, close_connection_pool=True)
     controller = AdmissionController(
         RedisAdmissionStore(redis),

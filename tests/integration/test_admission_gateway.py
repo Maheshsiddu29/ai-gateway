@@ -382,7 +382,7 @@ class TestRedisFailure:
             recovered = [(await post(client)).status_code for _ in range(3)]
             await asyncio.sleep(READINESS_CACHE_SECONDS)
             ready_again = await client.get("/health/ready")
-            metrics = (await client.get("/metrics")).text
+            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
 
         assert refused.status_code == 503
         assert refused.json()["error"]["type"] == "admission_unavailable"

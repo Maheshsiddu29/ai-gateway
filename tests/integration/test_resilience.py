@@ -123,7 +123,7 @@ class TestRetries:
     async def test_transient_failure_then_success(self, failure: Outcome) -> None:
         async with gateway(sequence(failure, ok("recovered"))) as (client, stub):
             response = await post(client)
-            metrics = (await client.get("/metrics")).text
+            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
 
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "recovered"
@@ -253,7 +253,7 @@ class TestCircuitBreaker:
             await asyncio.sleep(0.15)
             probe = await post(client)
             after = await post(client)
-            metrics = (await client.get("/metrics")).text
+            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
 
         assert failures == [502, 502]
         assert refused.status_code == 502

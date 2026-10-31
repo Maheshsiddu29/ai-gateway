@@ -252,6 +252,7 @@ a password, comes from `GATEWAY_REDIS_URL`. See [configuration.md](configuration
   direct the gateway to another host.
 - Upstream requests are built from scratch: client headers are never forwarded, so
   they cannot override upstream authorization or transport headers.
+- Production Redis TCP uses verified TLS; `/metrics` requires gateway authentication.
 - Credentials are never logged. httpx and httpcore loggers are held at WARNING;
   request bodies, prompts, and completions are never logged.
 - Requests are bounded by body size, message count (512), stop sequence count (4),

@@ -135,7 +135,7 @@ class TestNonStreaming:
 
         async with gateway(hosts) as (client, stub):
             response = await post(client)
-            metrics = (await client.get("/metrics")).text
+            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
 
         assert response.status_code == 200
         assert response.json()["model"] == "fast"

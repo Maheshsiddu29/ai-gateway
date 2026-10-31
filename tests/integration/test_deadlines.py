@@ -64,7 +64,7 @@ async def test_stalled_non_streaming_upstream_returns_504(caplog: pytest.LogCapt
 
     async with gateway(lambda _: httpx.Response(200, stream=body)) as client:
         response = await post(client, stream=False)
-        metrics = (await client.get("/metrics")).text
+        metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
 
     assert response.status_code == 504
     assert response.json()["error"]["type"] == "deadline_exceeded"

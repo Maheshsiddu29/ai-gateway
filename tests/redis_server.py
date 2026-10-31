@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.exceptions import ConnectionError as RedisConnectionError
 
 STARTUP_TIMEOUT_SECONDS = 5
@@ -19,8 +21,9 @@ _STARTUP_POLL_SECONDS = 0.01
 
 
 class RedisServer:
-    def __init__(self, binary: str) -> None:
+    def __init__(self, binary: str, extra_args: tuple[str, ...] = ()) -> None:
         self._binary = binary
+        self._extra_args = extra_args
         self._directory = Path(tempfile.mkdtemp(prefix="gw-redis-", dir="/tmp"))
         self.socket_path = self._directory / "redis.sock"
         self._process: asyncio.subprocess.Process | None = None
@@ -38,25 +41,34 @@ class RedisServer:
             "--save", "",
             "--appendonly", "no",
             "--dir", str(self._directory),
+            *self._extra_args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )  # fmt: skip
-        client = Redis(unix_socket_path=str(self.socket_path))
+        client = Redis(
+            unix_socket_path=str(self.socket_path),
+            retry=Retry(NoBackoff(), retries=0),
+            socket_connect_timeout=0.1,
+            socket_timeout=0.1,
+        )
         try:
             # There is no readiness signal from the child process, only the socket.
             for _ in range(int(STARTUP_TIMEOUT_SECONDS / _STARTUP_POLL_SECONDS)):
+                if self._process.returncode is not None:
+                    raise RuntimeError("redis-server exited during startup")
                 if await _responds(client):
                     return
                 await asyncio.sleep(_STARTUP_POLL_SECONDS)
         finally:
-            await client.aclose()
+            await client.aclose(close_connection_pool=True)
         raise RuntimeError("redis-server did not start")
 
     async def stop(self) -> None:
         if self._process is None:
             return
-        self._process.terminate()
-        await self._process.wait()
+        if self._process.returncode is None:
+            self._process.terminate()
+            await self._process.wait()
         self._process = None
         self.socket_path.unlink(missing_ok=True)
 

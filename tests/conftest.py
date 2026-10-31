@@ -21,8 +21,8 @@ async def redis_server() -> AsyncIterator[RedisServer]:
             pytest.fail("redis-server is required but not installed")
         pytest.skip("redis-server is not installed")
     server = RedisServer(binary)
-    await server.start()
     try:
+        await server.start()
         yield server
     finally:
         await server.stop()

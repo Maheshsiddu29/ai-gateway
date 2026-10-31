@@ -3,8 +3,8 @@
 Inference calls are not idempotent: a provider that received a request may run it
 and charge for it even if the gateway never sees the response. A failure is
 therefore retried only when the provider certainly did not run the request (the
-connection was never established, or it answered with an error status), the
-failure is transient (rate limiting, server errors, connect timeouts), and its
+connection was never established, or it explicitly rejected the request), the
+failure is transient (rate limiting or connect timeouts), and its
 status, if any, is in the configured allow-list.
 """
 

@@ -96,7 +96,11 @@ async def print_side_channels(args: argparse.Namespace) -> None:
             print("mock provider:", stats)
         if args.metrics:
             for url in args.url:
-                text = (await client.get(f"{url}/metrics")).text
+                text = (
+                    await client.get(
+                        f"{url}/metrics", headers={"Authorization": f"Bearer {args.api_key}"}
+                    )
+                ).text
                 lines = [line for line in text.splitlines() if line.startswith(_ADMISSION_METRICS)]
                 print(f"{url}/metrics:")
                 for line in lines:

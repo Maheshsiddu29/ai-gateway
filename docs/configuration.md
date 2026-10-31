@@ -19,7 +19,8 @@ Configuration is read once. Changes require a restart.
 | `GATEWAY_CONFIG_FILE` | `config/gateway.toml` | Path to the provider configuration file, relative to the working directory or absolute. The container image sets `/etc/gateway/gateway.toml`. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. The httpx and httpcore loggers stay at `WARNING` regardless. |
 | `GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Maximum request body size in bytes, from 1024 to 67108864. Larger bodies receive 413. |
-| `GATEWAY_REDIS_URL` | none | Redis connection URL (`redis://`, `rediss://`, or `unix://`). Required when admission control is enabled. May contain a password; it is never logged. |
+| `GATEWAY_REDIS_CA_FILE` | system trust store | Optional PEM CA file for Redis TLS. Certificates and hostnames are always verified. |
+| `GATEWAY_REDIS_URL` | none | Redis URL. Production requires `rediss://` for TCP; local `unix://` sockets are allowed. Plain `redis://` is restricted to development. Query parameters and fragments are rejected to prevent transport-policy overrides. |
 
 Provider API keys are read from whichever variables the configuration file names
 in `api_key_env`, for example `OPENAI_API_KEY`. A referenced variable that is unset
@@ -237,3 +238,13 @@ Phase 1 configuration files load unchanged. Behaviour differences:
 - `/health/ready` includes an `admission` field in its response body.
 - If a model sets `max_output_tokens`, requests without `max_tokens` are sent that
   value instead of omitting the field.
+
+### Audit hardening migration
+
+Production Redis TCP URLs must now use `rediss://`; use `GATEWAY_REDIS_CA_FILE`
+for a private certificate authority. The local Compose stack uses development mode
+on an internal network. Redis URL query options are intentionally unsupported.
+
+`GET /metrics` now requires a gateway Bearer API key. Configure the scraper's
+authorization header; health endpoints remain public. Every configured gateway
+key can read aggregate metrics; metrics have no per-key labels.
