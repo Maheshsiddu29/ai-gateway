@@ -12,6 +12,7 @@ object, and the ``[DONE]`` sentinel is withheld, so clients can tell an
 interrupted stream from a complete one.
 """
 
+import asyncio
 import logging
 from collections.abc import AsyncGenerator
 
@@ -26,6 +27,9 @@ from gateway.providers.base import StreamEnd, StreamEvent, TextDelta
 from gateway.resilience.deadline import Deadline
 
 logger = logging.getLogger(__name__)
+
+# Bounded time to report a timeout to a client that is still reading.
+ERROR_DELIVERY_SECONDS = 0.1
 
 
 async def encode_stream(
@@ -45,18 +49,24 @@ async def encode_stream(
     """
     base = chunk_base(completion_id=completion_id, created=created, model=model)
     event: StreamEvent | None = first
+    end: StreamEnd | None = None
     try:
         yield sse_frame(delta_chunk(base, {"role": "assistant", "content": ""}))
         while event is not None:
             match event:
                 case TextDelta(text=text):
                     yield sse_frame(delta_chunk(base, {"content": text}))
-                case StreamEnd(finish_reason=finish_reason, usage=usage):
-                    yield sse_frame(delta_chunk(base, {}, finish_reason))
-                    if include_usage and usage is not None:
-                        yield sse_frame(usage_chunk(base, usage))
-                    yield SSE_DONE
+                case StreamEnd():
+                    end = event
             event = await anext(events, None)
+        if end is None:
+            raise InternalGatewayError("The provider stream ended unexpectedly.")
+        # Exhaustion also finishes provider cleanup and reservation settlement. Do
+        # not report success before that work can still raise an error.
+        yield sse_frame(delta_chunk(base, {}, end.finish_reason))
+        if include_usage and end.usage is not None:
+            yield sse_frame(usage_chunk(base, end.usage))
+        yield SSE_DONE
     except GatewayError as exc:
         yield sse_frame(error_payload(exc))
     except Exception:
@@ -75,10 +85,10 @@ class EventStreamResponse(StreamingResponse):
     server and closes the generator before returning, which closes the upstream
     connection deterministically.
 
-    The deadline here is a backstop for clients that stop reading: ``send`` then
+    Each read and write is bounded by the deadline. For clients that stop reading, ``send`` then
     blocks and the generator stays suspended, so the per-event deadline in the
     completion service never runs. No error event can be delivered in that case;
-    the connection is closed.
+    the connection is closed after a bounded error-delivery grace.
     """
 
     media_type = "text/event-stream"
@@ -88,14 +98,43 @@ class EventStreamResponse(StreamingResponse):
         self._deadline = deadline
         self._content = content
 
+    async def stream_response(self, send: Send) -> None:
+        async with self._deadline.limit():
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": self.raw_headers,
+                }
+            )
+        try:
+            while True:
+                async with self._deadline.limit():
+                    chunk = await anext(self._content, None)
+                if chunk is None:
+                    break
+                async with self._deadline.limit():
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        except DeadlineExceededError as exc:
+            logger.warning("request deadline exceeded while sending a stream")
+            # Reads and writes share the deadline, but no second timer wraps the
+            # whole response. That timer raced the read timeout and suppressed the
+            # error event. A blocked client gets at most this reporting grace.
+            async with asyncio.timeout(ERROR_DELIVERY_SECONDS):
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": sse_frame(error_payload(exc)),
+                        "more_body": True,
+                    }
+                )
+        async with asyncio.timeout(ERROR_DELIVERY_SECONDS):
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            async with self._deadline.limit():
-                await run_until_disconnect(receive, self.stream_response(send))
-        except (ClientDisconnectedError, OSError):
-            # OSError is how ASGI 2.4 servers report a write to a closed connection.
-            logger.info("client disconnected during stream")
-        except DeadlineExceededError:
-            logger.warning("request deadline exceeded while sending a stream")
+            await run_until_disconnect(receive, self.stream_response(send))
+        except (ClientDisconnectedError, OSError, TimeoutError):
+            logger.info("client disconnected or stopped reading during stream")
         finally:
             await self._content.aclose()

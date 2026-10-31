@@ -22,9 +22,11 @@ def get_settings(request: Request) -> Settings:
     return settings
 
 
-def start_deadline(request: Request) -> Deadline:
+async def start_deadline(request: Request) -> Deadline:
     resilience: ResilienceConfig = request.app.state.resilience
-    return Deadline(resilience.request_deadline_seconds)
+    deadline = Deadline(resilience.request_deadline_seconds)
+    request.state.deadline = deadline
+    return deadline
 
 
 def get_completion_service(request: Request) -> CompletionService:
@@ -66,7 +68,9 @@ async def read_completion_request(
             status_code=415,
         )
 
-    body = await _read_limited_body(request, settings.max_request_bytes)
+    deadline: Deadline = request.state.deadline
+    async with deadline.limit():
+        body = await _read_limited_body(request, settings.max_request_bytes)
     try:
         return ChatCompletionRequest.model_validate_json(body)
     except ValidationError as exc:

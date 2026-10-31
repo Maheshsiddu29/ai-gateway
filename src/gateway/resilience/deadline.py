@@ -20,6 +20,10 @@ class Deadline:
     def expired(self) -> bool:
         return self.remaining() == 0.0
 
+    def check(self) -> None:
+        if self.expired:
+            raise DeadlineExceededError("The request deadline was exceeded.")
+
     @asynccontextmanager
     async def limit(self) -> AsyncIterator[None]:
         """Cancel the enclosed work when the deadline passes, raising DeadlineExceededError.
@@ -28,6 +32,7 @@ class Deadline:
         entered and exited in the same task, and a suspended generator may be resumed
         by a different one.
         """
+        self.check()
         timeout = asyncio.timeout(self.remaining())
         try:
             async with timeout:

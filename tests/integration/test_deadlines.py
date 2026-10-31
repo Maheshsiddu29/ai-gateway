@@ -1,5 +1,6 @@
 """End-to-end request deadlines through the full application."""
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -107,3 +108,30 @@ async def test_requests_within_the_deadline_are_unaffected() -> None:
         response = await post(client, stream=True)
 
     assert response.text.rstrip().endswith("data: [DONE]")
+
+
+async def test_stalled_upload_is_cut_off_before_provider_dispatch() -> None:
+    received = asyncio.Event()
+    provider_called = False
+
+    async def upload() -> AsyncIterator[bytes]:
+        yield b'{"model":"fast",'
+        received.set()
+        await asyncio.Event().wait()
+
+    def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal provider_called
+        provider_called = True
+        raise AssertionError("a stalled upload must not reach the provider")
+
+    async with gateway(upstream) as client, asyncio.timeout(2):
+        response = await client.post(
+            "/v1/chat/completions",
+            content=upload(),
+            headers={**AUTH_HEADERS, "content-type": "application/json"},
+        )
+
+    assert received.is_set()
+    assert response.status_code == 504
+    assert response.json()["error"]["type"] == "deadline_exceeded"
+    assert not provider_called

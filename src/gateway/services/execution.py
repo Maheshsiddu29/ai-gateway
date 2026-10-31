@@ -133,6 +133,7 @@ class ProviderExecutor:
         breaker = self._breakers[name]
         number = 0
         while True:
+            deadline.check()
             number += 1
             permit = breaker.try_acquire()
             if permit is None:
@@ -164,7 +165,8 @@ class ProviderExecutor:
                         "delay_ms": round(delay * 1000, 1),
                     },
                 )
-                await self._sleep(delay)
+                async with deadline.limit():
+                    await self._sleep(delay)
                 continue
             breaker.release(permit, AttemptOutcome.SUCCESS)
             self._observe(name, started, "success")

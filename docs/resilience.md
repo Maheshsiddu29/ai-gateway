@@ -170,3 +170,12 @@ attempts.
 | `gateway_circuit_breaker_transitions_total` | `provider`, `state` |
 | `gateway_provider_fallbacks_total` | `from_provider`, `to_provider` |
 | `gateway_deadline_exceeded_total` | `stream` |
+
+### Deadline termination
+
+Each SSE read and write uses the remaining request deadline. There is no competing
+whole-response timer. When the deadline expires, the gateway allows at most 100 ms
+to deliver a terminal error event to a reading client; a blocked connection is
+closed. Cleanup may additionally wait up to the configured Redis operation timeout.
+The success sentinel is sent only after provider exhaustion and settlement. Stalled
+request-body uploads are also interrupted by the same request deadline.
