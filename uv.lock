@@ -14,6 +14,7 @@ dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "starlette" },
     { name = "uvicorn" },
 ]
 
@@ -32,6 +33,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "pydantic", specifier = ">=2.14.2" },
     { name = "pydantic-settings", specifier = ">=2.16.2" },
+    { name = "starlette", specifier = ">=1.10.0" },
     { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 
