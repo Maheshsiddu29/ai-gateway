@@ -8,7 +8,7 @@ import asyncio
 import logging
 import math
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
 
 from fastapi import FastAPI
@@ -33,6 +33,9 @@ from gateway.core.security import StaticKeyAuthenticator
 from gateway.cost.store import CostStore
 from gateway.providers.base import Provider
 from gateway.providers.factory import ProviderFactory, build_provider
+from gateway.routing.config import RoutingPolicy
+from gateway.routing.evidence import EvidenceCache, EvidenceSnapshot
+from gateway.routing.router import Router
 from gateway.services.completion import CompletionService, routes_from_config
 from gateway.services.execution import build_executor
 
@@ -51,6 +54,7 @@ def build_app(
     provider_factory: ProviderFactory = build_provider,
 ) -> FastAPI:
     routes = routes_from_config(config.gateway)
+    _warn_inactive_routing(config.gateway)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -79,15 +83,18 @@ def build_app(
                     raise RuntimeError("cost accounting database is unavailable or not migrated")
                 await cost_store.recover_expired()
                 recovery_task = asyncio.create_task(_recover_costs(cost_store))
-                stack.push_async_callback(_stop_recovery, recovery_task)
+                stack.push_async_callback(_stop_background_task, recovery_task)
             app.state.cost_store = cost_store
+            executor = build_executor(providers, config.gateway.resilience, app.state.metrics)
+            router = await _start_router(stack, config.gateway, executor.available, cost_store, app)
             app.state.completion_service = CompletionService(
                 routes,
                 providers,
-                build_executor(providers, config.gateway.resilience, app.state.metrics),
+                executor,
                 app.state.metrics,
                 admission,
                 cost_store,
+                router,
             )
             try:
                 yield
@@ -130,10 +137,58 @@ async def _recover_costs(store: CostStore) -> None:
             logger.error("cost reservation recovery failed: %s", type(exc).__name__)
 
 
-async def _stop_recovery(task: asyncio.Task[None]) -> None:
+async def _stop_background_task(task: asyncio.Task[None]) -> None:
     task.cancel()
     with suppress(asyncio.CancelledError):
         await task
+
+
+def _warn_inactive_routing(config: GatewayConfig) -> None:
+    routed = sorted(
+        alias
+        for alias, model in config.models.items()
+        if model.routing.policy is not RoutingPolicy.FIXED
+    )
+    if routed and not config.routing.enabled:
+        logger.warning(
+            "routing is disabled: aliases with a routing policy use their primary model",
+            extra={"model_aliases": routed},
+        )
+
+
+async def _start_router(
+    stack: AsyncExitStack,
+    config: GatewayConfig,
+    availability: Callable[[str], bool],
+    cost_store: CostStore | None,
+    app: FastAPI,
+) -> Router | None:
+    policies = {model.routing.policy for model in config.models.values()}
+    if not config.routing.enabled or policies == {RoutingPolicy.FIXED}:
+        return None
+    evidence = None
+    if RoutingPolicy.QUALITY_CONSTRAINED in policies:
+        # Configuration validation guarantees cost accounting for routed aliases.
+        if cost_store is None:
+            raise RuntimeError("quality-constrained routing requires cost accounting")
+        evidence = EvidenceCache(cost_store.engine, app.state.metrics)
+        if not await evidence.refresh():
+            raise RuntimeError("routing evidence is unavailable; are migrations applied?")
+        refresh = asyncio.create_task(
+            _refresh_evidence(evidence, config.routing.evidence_refresh_seconds)
+        )
+        stack.push_async_callback(_stop_background_task, refresh)
+    return Router(
+        config,
+        availability,
+        (lambda: evidence.current) if evidence is not None else EvidenceSnapshot,
+    )
+
+
+async def _refresh_evidence(cache: EvidenceCache, interval: float) -> None:
+    while True:
+        await asyncio.sleep(interval)
+        await cache.refresh()
 
 
 async def _start_admission(

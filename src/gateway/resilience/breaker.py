@@ -73,6 +73,16 @@ class CircuitBreaker:
     def state(self) -> BreakerState:
         return self._state
 
+    def available(self) -> bool:
+        """Whether ``try_acquire`` would grant a permit now. Changes no state, so the
+        answer can be stale by the time a request is dispatched."""
+        if not self._config.enabled or self._state is BreakerState.CLOSED:
+            return True
+        if self._state is BreakerState.OPEN:
+            # Recovery leads to half-open with no probes in flight.
+            return self._clock() - self._opened_at >= self._config.recovery_seconds
+        return self._probes_in_flight < self._config.half_open_max_probes
+
     def try_acquire(self) -> Permit | None:
         if not self._config.enabled or self._state is BreakerState.CLOSED:
             return Permit(probe=False, generation=self._generation)

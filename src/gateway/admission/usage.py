@@ -30,6 +30,7 @@ class UsageStatus(StrEnum):
 @dataclass
 class Attempt:
     provider: str
+    model: str = ""
     started_at: float = field(default_factory=time.perf_counter)
     usage: Usage | None = None
     may_have_processed: bool = True
@@ -55,8 +56,8 @@ class Charge:
 class UsageLedger:
     attempts: list[Attempt] = field(default_factory=list)
 
-    def start(self, provider: str) -> Attempt:
-        attempt = Attempt(provider)
+    def start(self, provider: str, model: str = "") -> Attempt:
+        attempt = Attempt(provider, model)
         self.attempts.append(attempt)
         return attempt
 

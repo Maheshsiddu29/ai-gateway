@@ -73,6 +73,10 @@ class ProviderExecutor:
         self._sleep = sleep
         self._random = random
 
+    def available(self, provider: str) -> bool:
+        """Whether the provider's circuit breaker currently admits attempts."""
+        return self._breakers[provider].available()
+
     async def complete(
         self,
         candidates: Sequence[Candidate],
@@ -195,7 +199,7 @@ class ProviderExecutor:
                     code="provider_circuit_open",
                     may_have_processed=False,
                 )
-            attempt = ledger.start(name)
+            attempt = ledger.start(name, candidate.request.model)
             started = attempt.started_at
             dispatched = False
             try:

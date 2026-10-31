@@ -3,7 +3,9 @@
 The service is independent of HTTP. For each request it:
 
 1. resolves the alias and builds the provider request, applying the model's output
-   token ceiling, and lets the provider validate it;
+   token ceiling, and lets the provider validate it; for an alias with a dynamic
+   routing policy, the router chooses and orders the candidates (see
+   ``gateway.routing.router``);
 2. obtains admission (when admission control is enabled), reserving the estimated
    input tokens plus the output allowance;
 3. calls the provider within the request deadline;
@@ -17,6 +19,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+import uuid
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass
@@ -47,6 +50,14 @@ from gateway.providers.base import (
     Usage,
 )
 from gateway.resilience.deadline import Deadline
+from gateway.routing.config import RoutingPolicy
+from gateway.routing.router import (
+    RequestProfile,
+    Router,
+    RoutingDecision,
+    in_rollout,
+    required_capabilities,
+)
 from gateway.schemas.completions import ChatCompletionRequest
 from gateway.services.execution import Candidate, ProviderExecutor
 
@@ -62,6 +73,9 @@ class ModelRoute:
     max_output_tokens: int | None
     # (provider, upstream model) pairs, in the order they are tried.
     fallbacks: tuple[tuple[str, str], ...] = ()
+    # FIXED unless routing is enabled and the alias configures a dynamic policy.
+    policy: RoutingPolicy = RoutingPolicy.FIXED
+    rollout_percent: int = 100
 
 
 def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
@@ -73,6 +87,8 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
             default_max_tokens=model.default_max_tokens,
             max_output_tokens=model.max_output_tokens,
             fallbacks=tuple((target.provider, target.model) for target in model.fallbacks),
+            policy=model.routing.policy if config.routing.enabled else RoutingPolicy.FIXED,
+            rollout_percent=model.routing.rollout_percent,
         )
         for alias, model in config.models.items()
     }
@@ -81,9 +97,13 @@ def routes_from_config(config: GatewayConfig) -> dict[str, ModelRoute]:
 @dataclass(frozen=True)
 class _Plan:
     route: ModelRoute
-    # The primary first, then usable fallbacks. All share the primary's request
-    # except for the upstream model.
+    # The candidates in the order they are tried. All share one request except
+    # for the upstream model.
     candidates: tuple[Candidate, ...]
+    decision: RoutingDecision | None = None
+    # Set when a routed alias's request was served by its primary because the key
+    # is outside the policy's rollout share.
+    rollout_control: bool = False
 
     @property
     def request(self) -> ProviderRequest:
@@ -99,12 +119,20 @@ class CompletionService:
         metrics: Metrics,
         admission: AdmissionController | None = None,
         cost_store: CostStore | None = None,
+        router: Router | None = None,
     ) -> None:
         referenced = {
             provider
             for route in routes.values()
             for provider in [route.provider, *(name for name, _ in route.fallbacks)]
         }
+        if router is not None:
+            referenced |= {
+                provider
+                for alias, route in routes.items()
+                if route.policy is not RoutingPolicy.FIXED
+                for provider, _ in router.targets(alias)
+            }
         missing = referenced - providers.keys()
         if missing:
             raise ValueError(f"routes reference providers without adapters: {sorted(missing)}")
@@ -114,17 +142,18 @@ class CompletionService:
         self._metrics = metrics
         self._admission = admission
         self._cost_store = cost_store
+        self._router = router
 
     async def complete(
         self, request: ChatCompletionRequest, principal: Principal, deadline: Deadline
     ) -> Completion:
-        plan = self._plan(request)
+        plan = self._plan(request, principal)
         ledger = UsageLedger()
-        trace = _CompletionTrace(principal, plan.route, ledger, self._metrics, stream=False)
+        trace = _CompletionTrace(principal, plan, ledger, self._metrics, stream=False)
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                cost = self._cost_session(principal, plan)
+                cost = self._cost_session(principal, plan, trace)
                 completion = await self._executor.complete(plan.candidates, deadline, ledger, cost)
             finally:
                 await self._settle(admission, ledger)
@@ -145,14 +174,14 @@ class CompletionService:
         time a slow client takes to read is bounded by the response (see
         api.streaming).
         """
-        plan = self._plan(request)
+        plan = self._plan(request, principal)
         ledger = UsageLedger()
-        trace = _CompletionTrace(principal, plan.route, ledger, self._metrics, stream=True)
+        trace = _CompletionTrace(principal, plan, ledger, self._metrics, stream=True)
         end: StreamEnd | None = None
         try:
             admission = await self._admit(principal, plan, deadline, trace)
             try:
-                cost = self._cost_session(principal, plan)
+                cost = self._cost_session(principal, plan, trace)
                 events = self._executor.stream(plan.candidates, deadline, ledger, cost)
                 async with aclosing(events):
                     async for event in events:
@@ -170,7 +199,7 @@ class CompletionService:
             raise
         trace.succeeded(end.finish_reason, end.usage, provider_response_id=None)
 
-    def _plan(self, request: ChatCompletionRequest) -> _Plan:
+    def _plan(self, request: ChatCompletionRequest, principal: Principal) -> _Plan:
         route = self._routes.get(request.model)
         if route is None:
             raise InvalidRequestError(
@@ -179,6 +208,68 @@ class CompletionService:
                 param="model",
                 status_code=404,
             )
+        started = time.perf_counter()
+        try:
+            if route.policy is RoutingPolicy.FIXED or self._router is None:
+                return self._fixed_plan(request, route)
+            # The assignment depends only on the alias and the caller's own key.
+            if not in_rollout(route.alias, principal.id, route.rollout_percent):
+                return dataclasses.replace(self._fixed_plan(request, route), rollout_control=True)
+            return self._routed_plan(request, route, self._router)
+        finally:
+            self._metrics.routing_decision_duration.labels(route.policy.value).observe(
+                time.perf_counter() - started
+            )
+
+    def _routed_plan(
+        self, request: ChatCompletionRequest, route: ModelRoute, router: Router
+    ) -> _Plan:
+        base = _provider_request(request, route)
+        if base.max_tokens is None:
+            # Configuration validation requires an output bound for routed aliases.
+            raise InternalGatewayError("A routed model alias has no output token bound.")
+        profile = RequestProfile(
+            capabilities=required_capabilities(request),
+            estimated_input_tokens=estimate_input_tokens(request.messages),
+            output_allowance=base.max_tokens,
+        )
+        # The same request, apart from the model, goes to every candidate; a
+        # candidate that cannot run it unchanged is excluded, never sent an
+        # altered request.
+        adapter_errors: dict[tuple[str, str], GatewayError] = {}
+        for provider, model in router.targets(route.alias):
+            try:
+                self._providers[provider].validate(dataclasses.replace(base, model=model))
+            except GatewayError as exc:
+                adapter_errors[(provider, model)] = exc
+        try:
+            decision = router.decide(route.alias, profile, adapter_errors)
+        except GatewayError as exc:
+            self._metrics.routing_decisions.labels(
+                route.alias, route.policy.value, "rejected", "none"
+            ).inc()
+            logger.info(
+                "routing rejected",
+                extra={
+                    "model_alias": route.alias,
+                    "routing_policy": route.policy.value,
+                    "error_code": exc.code,
+                },
+            )
+            raise
+        selection = decision.selection
+        self._metrics.routing_decisions.labels(
+            route.alias, route.policy.value, selection.reason.value, decision.selected.provider
+        ).inc()
+        for _, exclusion in selection.exclusions:
+            self._metrics.routing_exclusions.labels(route.alias, exclusion.value).inc()
+        candidates = tuple(
+            Candidate(candidate.provider, dataclasses.replace(base, model=candidate.model))
+            for candidate in selection.chain
+        )
+        return _Plan(route, candidates, decision)
+
+    def _fixed_plan(self, request: ChatCompletionRequest, route: ModelRoute) -> _Plan:
         primary = _provider_request(request, route)
         self._providers[route.provider].validate(primary)
         candidates = [Candidate(route.provider, primary)]
@@ -232,12 +323,16 @@ class CompletionService:
         if self._admission is not None and admission is not None:
             await self._admission.settle(admission, ledger)
 
-    def _cost_session(self, principal: Principal, plan: _Plan) -> CostSession | None:
+    def _cost_session(
+        self, principal: Principal, plan: _Plan, trace: "_CompletionTrace"
+    ) -> CostSession | None:
         if self._cost_store is None:
             return None
-        return CostSession(
+        session = CostSession(
             self._cost_store, principal.id, estimate_input_tokens(plan.request.messages)
         )
+        trace.cost_request(session.request_id)
+        return session
 
 
 def _provider_request(request: ChatCompletionRequest, route: ModelRoute) -> ProviderRequest:
@@ -276,7 +371,7 @@ class _CompletionTrace:
     def __init__(
         self,
         principal: Principal,
-        route: ModelRoute,
+        plan: _Plan,
         ledger: UsageLedger,
         metrics: Metrics,
         *,
@@ -286,13 +381,20 @@ class _CompletionTrace:
         self._ledger = ledger
         self._metrics = metrics
         self._stream = stream
+        first = plan.candidates[0]
         self._fields: dict[str, object] = {
             "principal_id": principal.id,
-            "model_alias": route.alias,
-            "provider": route.provider,
-            "upstream_model": route.upstream_model,
+            "model_alias": plan.route.alias,
+            "provider": first.provider,
+            "upstream_model": first.request.model,
             "stream": stream,
+            "routing_policy": plan.route.policy.value,
+            **_routing_fields(plan),
         }
+
+    def cost_request(self, request_id: uuid.UUID) -> None:
+        # Joins this event to the request's rows in the cost ledger.
+        self._fields["cost_request_id"] = str(request_id)
 
     def reserved(self, estimated_input_tokens: int, reserved_tokens: int) -> None:
         self._fields["estimated_input_tokens"] = estimated_input_tokens
@@ -337,6 +439,7 @@ class _CompletionTrace:
         if attempts:
             # The provider that made the last attempt, which served any response.
             self._fields["provider"] = attempts[-1].provider
+            self._fields["upstream_model"] = attempts[-1].model
         logger.log(
             level,
             "completion finished",
@@ -347,3 +450,35 @@ class _CompletionTrace:
                 "attempts": len(attempts),
             },
         )
+
+
+def _routing_fields(plan: _Plan) -> dict[str, object]:
+    """The inputs and outcome of a routing decision, without request content."""
+    if plan.rollout_control:
+        return {"routing_reason": "rollout_control"}
+    decision = plan.decision
+    if decision is None:
+        return {}
+    selection = decision.selection
+    selected = decision.selected
+    fields: dict[str, object] = {
+        "routing_reason": selection.reason.value,
+        "routing_policy_version": decision.policy_version,
+        "routing_evidence_version": decision.evidence_version,
+        "routing_candidates": decision.candidate_count,
+        "routing_eligible": selection.eligible_count,
+        # At most MAX_ROUTE_CANDIDATES entries.
+        "routing_exclusions": [
+            f"{provider}/{model}:{exclusion.value}"
+            for (provider, model), exclusion in selection.exclusions
+        ],
+        "routing_chain": [f"{c.provider}/{c.model}" for c in selection.chain],
+    }
+    if selected.estimate is not None:
+        fields["routing_pricing_version"] = selected.estimate.pricing_version
+        fields["routing_estimated_input_tokens"] = selected.estimate.estimated_input_tokens
+        fields["routing_maximum_micro_usd"] = selected.estimate.maximum_micro_usd
+        fields["routing_expected_micro_usd"] = selected.estimate.expected_micro_usd
+    if selected.evidence is not None:
+        fields["routing_evidence_run_id"] = str(selected.evidence.run_id)
+    return fields

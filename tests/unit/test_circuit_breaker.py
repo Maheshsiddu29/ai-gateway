@@ -181,3 +181,22 @@ def test_duplicate_probe_release_does_not_free_another_slot() -> None:
     assert current is not None
     harness.breaker.release(probe, AttemptOutcome.NEUTRAL)
     assert harness.breaker.try_acquire() is None
+
+
+def test_available_predicts_try_acquire_without_changing_state() -> None:
+    harness = Harness()
+    assert harness.breaker.available()
+
+    harness.open()
+    assert not harness.breaker.available()
+
+    harness.clock.now += CONFIG.recovery_seconds
+    assert harness.breaker.available()
+    # Only try_acquire moves the breaker to half-open.
+    assert harness.state() is BreakerState.OPEN
+    probe = harness.breaker.try_acquire()
+    assert probe is not None
+    assert harness.state() is BreakerState.HALF_OPEN
+    # The single probe slot is taken.
+    assert not harness.breaker.available()
+    assert harness.breaker.try_acquire() is None
