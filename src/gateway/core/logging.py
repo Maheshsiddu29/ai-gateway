@@ -15,13 +15,19 @@ request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 _STANDARD_RECORD_FIELDS = frozenset(
     vars(logging.LogRecord("", logging.INFO, "", 0, "", None, None))
-) | {"message", "asctime"}
+) | {
+    "message",
+    "asctime",
+    # uvicorn duplicates its messages with terminal colour codes in this field.
+    "color_message",
+}
 
-# Request-level loggers that would otherwise duplicate the gateway's own access log.
 # httpx logs every upstream request URL at INFO; keeping it at WARNING also keeps
 # lower-level transport debugging out of production logs.
 _QUIET_LOGGERS = ("httpx", "httpcore")
-_SERVER_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access")
+_SERVER_LOGGERS = ("uvicorn", "uvicorn.error")
+# uvicorn's access log duplicates the gateway's own and includes query strings.
+_DISABLED_LOGGERS = ("uvicorn.access",)
 
 
 class JsonFormatter(logging.Formatter):
@@ -57,3 +63,7 @@ def configure_logging(level: str) -> None:
         server_logger.propagate = True
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    for name in _DISABLED_LOGGERS:
+        disabled_logger = logging.getLogger(name)
+        disabled_logger.handlers.clear()
+        disabled_logger.propagate = False
