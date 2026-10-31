@@ -378,3 +378,43 @@ def test_development_redis_may_use_plaintext() -> None:
         Path("unused"), redis_url="redis://redis:6379/0", environment=Environment.DEVELOPMENT
     )
     assert settings.redis_url is not None
+
+
+def test_cost_team_mapping_rejects_unknown_gateway_key(tmp_path: Path) -> None:
+    content = (
+        VALID_CONFIG.replace(
+            'model = "upstream-fast"', 'model = "upstream-fast"\nmax_output_tokens = 100'
+        )
+        + """
+[cost]
+enabled = true
+
+[cost.principal_teams]
+key-000000000000 = "team"
+
+[cost.team_limits.team]
+daily_micro_usd = 1000
+
+[[cost.pricing]]
+provider = "openai"
+model = "upstream-fast"
+version = "v1"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1"
+output_per_million_usd = "1"
+
+[[cost.pricing]]
+provider = "anthropic"
+model = "upstream-quality"
+version = "v1"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1"
+output_per_million_usd = "1"
+"""
+    )
+    settings = make_settings(
+        write_config(tmp_path, content),
+        database_url="postgresql+asyncpg://gateway:local@localhost/gateway",
+    )
+    with pytest.raises(ConfigurationError, match="unknown gateway keys"):
+        load_config(settings, PROVIDER_KEYS)

@@ -24,7 +24,7 @@ from collections.abc import AsyncGenerator, AsyncIterable
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from gateway.core.config import AnthropicApiVersion, AnthropicProviderConfig
 from gateway.errors import (
@@ -66,6 +66,8 @@ _FINISH_REASONS = {
 
 
 class _Usage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     input_tokens: int | None = None
     output_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
@@ -84,7 +86,16 @@ class _Usage(BaseModel):
             + (self.cache_creation_input_tokens or 0)
             + (self.cache_read_input_tokens or 0)
         )
-        return Usage(prompt, self.output_tokens, prompt + self.output_tokens)
+        return Usage(
+            prompt,
+            self.output_tokens,
+            prompt + self.output_tokens,
+            billing_dimensions_supported=not (
+                (self.cache_creation_input_tokens or 0)
+                or (self.cache_read_input_tokens or 0)
+                or self.model_extra
+            ),
+        )
 
 
 class _ContentBlock(BaseModel):

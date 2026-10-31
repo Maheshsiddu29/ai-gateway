@@ -144,3 +144,10 @@ class Metrics:
             buckets=_LATENCY_BUCKETS,
             registry=self.registry,
         )
+        self.cost_budget_utilization = Histogram(
+            "gateway_cost_budget_utilization_ratio",
+            "Committed budget utilization at admission by scope and period.",
+            ["scope", "period"],
+            buckets=(0, 0.25, 0.5, 0.75, 0.9, 1, 1.25, 2, 5),
+            registry=self.registry,
+        )

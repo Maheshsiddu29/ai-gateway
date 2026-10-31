@@ -86,7 +86,7 @@ class CostStore:
             async with self.engine.connect() as connection:
                 await connection.execute(text("SELECT 1 FROM cost_attempts LIMIT 0"))
             return True
-        except SQLAlchemyError:
+        except (SQLAlchemyError, OSError):
             return False
 
     @asynccontextmanager
@@ -111,7 +111,7 @@ class CostStore:
         try:
             for retry in range(3):
                 try:
-                    amount = await self._reserve(
+                    amount, utilization = await self._reserve(
                         attempt_id=attempt_id,
                         request_id=request_id,
                         principal_id=principal_id,
@@ -128,12 +128,14 @@ class CostStore:
             if self.metrics is not None:
                 self.metrics.cost_admissions.labels("accepted").inc()
                 self.metrics.cost_reserved_micro_usd.inc(amount)
+                for scope, kind, ratio in utilization:
+                    self.metrics.cost_budget_utilization.labels(scope, kind).observe(ratio)
             return amount
         except RateLimitedError:
             if self.metrics is not None:
                 self.metrics.cost_admissions.labels("rejected").inc()
             raise
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError) as exc:
             if self.metrics is not None:
                 self.metrics.cost_admissions.labels("unavailable").inc()
                 self.metrics.cost_transaction_errors.labels("reserve").inc()
@@ -153,7 +155,7 @@ class CostStore:
         model: str,
         estimated_input_tokens: int,
         maximum_output_tokens: int,
-    ) -> int:
+    ) -> tuple[int, list[tuple[str, str, float]]]:
         async with self._transaction() as connection:
             at = (await connection.execute(text("SELECT clock_timestamp()"))).scalar_one()
             price = self.catalog.select(provider, model, at)
@@ -168,6 +170,7 @@ class CostStore:
                     if limit is not None:
                         periods.append((scope, subject_id, kind, period_start(at, kind), limit))
             periods.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+            utilization: list[tuple[str, str, float]] = []
             for scope, subject_id, kind, start, limit in periods:
                 params = {"scope": scope, "subject_id": subject_id, "kind": kind, "start": start}
                 await connection.execute(
@@ -188,6 +191,15 @@ class CostStore:
                     raise RateLimitedError(
                         "Spending budget exceeded.", code=f"{scope}_{kind}_budget_exceeded"
                     )
+                ratio = (
+                    float(
+                        Decimal(balance.reserved_micro_usd + balance.spent_micro_usd + amount)
+                        / Decimal(limit)
+                    )
+                    if limit
+                    else 0.0
+                )
+                utilization.append((scope, kind, ratio))
                 await connection.execute(
                     text("""UPDATE budget_periods SET reserved_micro_usd=reserved_micro_usd+:amount
                     WHERE scope=:scope AND subject_id=:subject_id AND period_kind=:kind
@@ -233,7 +245,7 @@ class CostStore:
                     },
                 )
             await self._event(connection, attempt_id, "reserved", amount, at)
-            return amount
+            return amount, utilization
 
     async def dispatch(self, attempt_id: uuid.UUID) -> None:
         try:
@@ -247,7 +259,7 @@ class CostStore:
                 if result.rowcount != 1:
                     raise AdmissionUnavailableError("Spending reservation is no longer active.")
                 await self._event(connection, attempt_id, "dispatched", 0)
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError) as exc:
             if self.metrics is not None:
                 self.metrics.cost_transaction_errors.labels("dispatch").inc()
             logger.error("cost dispatch transaction failed: %s", type(exc).__name__)
@@ -303,7 +315,7 @@ class CostStore:
                 if state == "unresolved" and usage is None:
                     return
                 reserve = int(row["reserved_micro_usd"])
-                if usage is not None:
+                if usage is not None and usage.billing_dimensions_supported:
                     price = Price(
                         provider=row["provider"],
                         model=row["model"],
@@ -363,7 +375,7 @@ class CostStore:
                 event_type = "reconciled" if state == "unresolved" else new_state
                 await self._event(connection, attempt_id, event_type, charge - prior_spent)
                 settled_metric = (new_state, charge)
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError) as exc:
             if self.metrics is not None:
                 self.metrics.cost_transaction_errors.labels("settle").inc()
                 self.metrics.cost_reconciliation_errors.inc()

@@ -129,6 +129,22 @@ class TestComplete:
         assert completion.usage == Usage(prompt_tokens=5, completion_tokens=1, total_tokens=6)
         assert completion.provider_response_id == "resp-1"
 
+    async def test_usage_with_unpriced_dimensions_is_marked_unknown(self) -> None:
+        body = {
+            **COMPLETION,
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 1,
+                "total_tokens": 6,
+                "prompt_tokens_details": {"cached_tokens": 2},
+            },
+        }
+        provider, _ = make_provider(lambda _: httpx.Response(200, json=body))
+
+        usage = (await provider.complete(REQUEST)).usage
+        assert usage is not None
+        assert not usage.billing_dimensions_supported
+
     async def test_usage_is_not_invented_when_missing(self) -> None:
         body = {key: value for key, value in COMPLETION.items() if key != "usage"}
         provider, _ = make_provider(lambda _: httpx.Response(200, json=body))

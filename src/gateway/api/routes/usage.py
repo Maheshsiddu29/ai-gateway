@@ -44,7 +44,7 @@ async def _rows(store: CostStore, sql: str, params: dict[str, Any]) -> list[dict
         async with store.engine.connect() as connection:
             result = await connection.execute(text(sql), params)
             return [dict(row) for row in result.mappings()]
-    except SQLAlchemyError as exc:
+    except (SQLAlchemyError, OSError) as exc:
         raise AdmissionUnavailableError("Cost analytics is unavailable.") from exc
 
 

@@ -10,7 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterable
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, Field, SecretStr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from gateway.core.config import OpenAICompatibleProviderConfig
 from gateway.errors import ProviderUnavailableError
@@ -37,6 +37,8 @@ _STREAM_DONE = "[DONE]"
 
 
 class _Usage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int | None = None
@@ -45,7 +47,12 @@ class _Usage(BaseModel):
         total = self.total_tokens
         if total is None:
             total = self.prompt_tokens + self.completion_tokens
-        return Usage(self.prompt_tokens, self.completion_tokens, total)
+        return Usage(
+            self.prompt_tokens,
+            self.completion_tokens,
+            total,
+            billing_dimensions_supported=not bool(self.model_extra),
+        )
 
 
 class _ResponseMessage(BaseModel):

@@ -196,7 +196,12 @@ class TestComplete:
         completion = await provider.complete(make_request())
 
         assert completion.content == "Hello"
-        assert completion.usage == Usage(prompt_tokens=115, completion_tokens=2, total_tokens=117)
+        assert completion.usage == Usage(
+            prompt_tokens=115,
+            completion_tokens=2,
+            total_tokens=117,
+            billing_dimensions_supported=False,
+        )
         assert completion.provider_response_id == "msg_1"
 
     @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ Everything is validated at startup so that a misconfigured gateway fails to star
 rather than failing on the first request.
 """
 
+import hashlib
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -349,6 +350,21 @@ def load_config(settings: Settings, environ: Mapping[str, str]) -> LoadedConfig:
         require_redis_url(settings)
     if gateway.cost.enabled and settings.database_url is None:
         raise ConfigurationError("cost accounting is enabled but GATEWAY_DATABASE_URL is not set")
+    if gateway.cost.enabled:
+        configured_ids = {
+            f"key-{hashlib.sha256(key.get_secret_value().encode()).hexdigest()[:12]}"
+            for key in settings.api_keys
+        }
+        referenced_ids = (
+            set(gateway.cost.key_limits)
+            | set(gateway.cost.principal_teams)
+            | {reader for readers in gateway.cost.team_readers.values() for reader in readers}
+        )
+        unknown = referenced_ids - configured_ids
+        if unknown:
+            raise ConfigurationError(
+                f"cost configuration references unknown gateway keys: {sorted(unknown)}"
+            )
     return LoadedConfig(gateway=gateway, provider_api_keys=_resolve_api_keys(gateway, environ))
 
 

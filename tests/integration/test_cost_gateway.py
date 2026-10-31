@@ -286,3 +286,54 @@ async def test_stream_disconnect_retains_unknown_cost(redis_server: RedisServer)
                 return bool(result.one_or_none() == ("unresolved", 100))
 
         await eventually(unresolved)
+
+
+async def test_two_gateway_instances_do_not_over_admit_shared_budget(
+    redis_server: RedisServer,
+) -> None:
+    database_url = os.environ.get("GATEWAY_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("set GATEWAY_TEST_DATABASE_URL for PostgreSQL tests")
+    key = f"gateway-cost-test-{uuid.uuid4()}"
+    raw: dict[str, object] = {
+        "providers": {"fake": {"type": "openai_compatible", "base_url": "https://fake.test/v1"}},
+        "models": {"fast": {"provider": "fake", "model": "mock", "max_output_tokens": 100}},
+        "admission": {"enabled": True, "default_limits": {"max_concurrent_requests": 100}},
+        "cost": {
+            "enabled": True,
+            "default_key_limits": {"daily_micro_usd": 100},
+            "pricing": [
+                {
+                    "provider": "fake",
+                    "model": "mock",
+                    "version": "v1",
+                    "effective_at": "2020-01-01T00:00:00Z",
+                    "input_per_million_usd": "0",
+                    "output_per_million_usd": "1",
+                }
+            ],
+        },
+    }
+    providers = [FakeProvider(), FakeProvider()]
+    apps = [
+        build_app(
+            make_settings(redis_url=redis_server.url, database_url=database_url, api_keys=(key,)),
+            make_config(raw, {"fake": None}),
+            lambda *_, provider=provider: provider,
+        )
+        for provider in providers
+    ]
+    async with serve(apps[0]) as first, serve(apps[1]) as second:
+
+        async def post(client: httpx.AsyncClient) -> int:
+            result = await client.post(
+                "/v1/chat/completions",
+                json={"model": "fast", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            return result.status_code
+
+        statuses = await asyncio.gather(*(post(first if i % 2 else second) for i in range(20)))
+    assert statuses.count(200) == 1
+    assert statuses.count(429) == 19
+    assert sum(len(provider.requests) for provider in providers) == 1

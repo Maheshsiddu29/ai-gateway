@@ -126,7 +126,7 @@ async def _recover_costs(store: CostStore) -> None:
         await asyncio.sleep(30)
         try:
             await store.recover_expired()
-        except SQLAlchemyError as exc:
+        except (SQLAlchemyError, OSError) as exc:
             logger.error("cost reservation recovery failed: %s", type(exc).__name__)
 
 
