@@ -30,6 +30,7 @@ RUN uv sync --locked
 COPY tests ./tests
 COPY tools ./tools
 COPY config ./config
+COPY evaluations ./evaluations
 ENV GATEWAY_REQUIRE_REDIS_TESTS=1
 CMD ["uv", "run", "pytest", "-q"]
 

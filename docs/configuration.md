@@ -284,3 +284,74 @@ output_per_million_usd = "2.00"
 ```
 
 The sample IDs and prices are illustrative. A key's principal ID is the existing `key-` prefix plus the first 12 hex characters of its SHA-256 digest. Each pricing entry has an exact provider/model pair, version, UTC effective time, and decimal-string rates per million tokens. The latest effective entry is selected at attempt reservation. No substitute model price is used. Prices must be nonnegative and at most 1,000,000 USD per million tokens with at most nine fractional digits. An absent daily or monthly limit is uncapped. Team readers are explicit; team membership alone grants no analytics access. Changing configuration requires a gateway restart and does not rewrite the stored pricing snapshot on past attempts.
+
+## Routing
+
+Dynamic routing is described in [routing.md](routing.md). It is configured in
+three places, all optional:
+
+```toml
+[routing]
+enabled = true                 # default false: every alias uses its primary model
+evidence_refresh_seconds = 60  # 1 to 3600
+
+# One entry per routed provider/model. All fields except routable and
+# capabilities are required.
+[[routing.models]]
+provider = "openai"
+model = "small-model-id"
+context_window_tokens = 128000      # 1 to 100,000,000
+max_output_tokens = 16384           # 1 to 1,000,000
+capabilities = ["streaming", "stream_usage", "temperature", "top_p", "stop"]
+routable = true                     # false removes the model from dynamic routing
+
+[models.classify.routing]
+policy = "quality_constrained"      # fixed (default), lowest_cost, quality_constrained
+candidates = [{ provider = "openai", model = "small-model-id" }]  # up to 7
+rollout_percent = 100               # 0 to 100
+# quality_constrained only; all but max_p95_latency_ms are required:
+dataset = "support-ticket-category"
+dataset_version = "1"
+min_success_rate = 0.9              # compared with the 95% Wilson lower bound
+min_samples = 40
+max_evidence_age_days = 30          # 1 to 366
+max_p95_latency_ms = 2000           # optional
+on_insufficient_evidence = "primary"  # or "reject"
+```
+
+Startup validation rejects these configurations:
+
+- a routing policy other than `fixed` without `[cost] enabled = true`;
+- a routed alias that also sets `fallbacks`;
+- candidates that repeat each other or the primary;
+- a routed target without a `[[routing.models]]` entry or without a price;
+- an alias whose default output allowance exceeds a target's `max_output_tokens`;
+- a registry entry for an unknown provider, or one claiming a capability its
+  adapter does not implement. Anthropic `2026-10-21` supports `streaming`,
+  `stream_usage`, and `stop`; `2023-06-01` and OpenAI-compatible providers also
+  support `temperature` and `top_p`;
+- quality fields on a policy other than `quality_constrained`, or candidates on
+  `fixed`.
+
+Policies are validated even while `routing.enabled` is false. The gateway then
+logs a warning that names the aliases whose policies are inactive.
+`quality_constrained` needs migration `0003_evaluation_runs`; without it, startup
+fails.
+
+## Changes from Phase 3 configurations
+
+Phase 3 configuration files load unchanged and route exactly as before. To adopt
+routing:
+
+1. Apply migrations (`alembic upgrade head`). This adds the evaluation tables,
+   which `quality_constrained` needs.
+2. Add a `[[routing.models]]` entry and a `[[cost.pricing]]` entry for every model
+   an alias may route to.
+3. Add a `[models.<alias>.routing]` table. Move any `fallbacks` of that alias into
+   `candidates`.
+4. Set `[routing] enabled = true`. Setting it back to false returns every alias to
+   its primary model without removing the policies.
+
+Two log changes apply to every alias. The `completion finished` event now includes
+`routing_policy` and, when cost accounting is enabled, `cost_request_id`.
+`upstream_model` now names the model of the last attempt, not the alias's primary.

@@ -26,3 +26,6 @@ config/gateway.toml
 .idea/
 .vscode/
 .DS_Store
+
+# Evaluation results written by python -m gateway.evaluation run
+/results/

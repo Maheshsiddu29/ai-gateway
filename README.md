@@ -9,8 +9,9 @@ The gateway enforces per-key request, token, and concurrency limits shared acros
 instances through Redis, bounds every request with an end-to-end deadline, and
 retries or falls back between providers only when a failed provider certainly did
 not run the request. Optional PostgreSQL spending budgets account for each upstream
-attempt.
-Cost-aware routing and caching are planned for later phases.
+attempt. An alias can route each request to the cheapest model that supports it
+and, optionally, has passed an offline evaluation on the alias's task. Caching is
+not implemented.
 
 ## Current capabilities
 
@@ -39,6 +40,14 @@ Cost-aware routing and caching are planned for later phases.
   and the whole stream.
 - Bounded retries with exponential backoff, per-provider circuit breakers, and
   configured fallback providers per alias.
+- Policy-driven routing per alias (optional): `fixed`, `lowest_cost`, or
+  `quality_constrained`. It uses a model capability registry, cost estimates
+  from the versioned prices, circuit-breaker state, and recorded evaluation
+  evidence. Each routed attempt keeps its own budget reservation, retries, and
+  fallback.
+- Offline evaluation tooling: versioned JSONL datasets, deterministic scorers, a
+  CLI that calls real providers only when explicitly asked to, PostgreSQL storage
+  of results, and an offline comparison of routing policies.
 - Prometheus metrics at `GET /metrics` (gateway Bearer key required); `GET /health/live`
   and `GET /health/ready` (which checks required Redis and PostgreSQL dependencies).
 
@@ -49,7 +58,8 @@ client ─► RequestContextMiddleware   request ID, access log, metrics, last-r
            └─► /v1/chat/completions   deadline starts
                  auth ─► bounded body read ─► schema validation
                  └─► CompletionService
-                       plan: alias ─► primary + fallbacks, output ceiling, validation
+                       plan: alias ─► primary + fallbacks, or Router ─► ranked candidates
+                             (capabilities, price, breaker state, evaluation evidence)
                        admit ─► AdmissionController ─► Redis script (all limits at once)
                        └─► ProviderExecutor   retries, circuit breakers, fallback
                              ├─► PostgreSQL reserve + dispatch per attempt
@@ -65,6 +75,8 @@ which the API layer encodes back into OpenAI-format responses.
 See [docs/architecture.md](docs/architecture.md) for the request lifecycle,
 [docs/cost-accounting.md](docs/cost-accounting.md) for charge semantics,
 [docs/budget-enforcement.md](docs/budget-enforcement.md) for spending admission,
+[docs/routing.md](docs/routing.md) and [docs/evaluation.md](docs/evaluation.md) for
+routing and offline evaluation,
 [docs/admission-control.md](docs/admission-control.md) and
 [docs/resilience.md](docs/resilience.md) for limits and failure handling, and
 [docs/adr/](docs/adr/) for the main design decisions.
@@ -191,6 +203,88 @@ output_per_million_usd = "2.00"
 
 These are illustrative rates, not vendor prices. See
 [docs/configuration.md](docs/configuration.md) for team mapping and reader grants.
+
+## Routing
+
+With `[routing] enabled = true` and cost accounting on, an alias can choose among
+candidate models per request. Every routed model needs a registry entry with its
+limits and supported request features, and a price:
+
+```toml
+[models.classify]
+provider = "anthropic"
+model = "large-model-id"
+max_output_tokens = 16
+
+[models.classify.routing]
+policy = "quality_constrained"    # or "lowest_cost"; "fixed" is the default
+candidates = [{ provider = "openai", model = "small-model-id" }]
+dataset = "support-ticket-category"
+dataset_version = "1"
+min_success_rate = 0.9            # against the 95% lower confidence bound
+min_samples = 40
+max_evidence_age_days = 30
+
+[routing]
+enabled = true
+
+[[routing.models]]
+provider = "openai"
+model = "small-model-id"
+context_window_tokens = 128000
+max_output_tokens = 16384
+capabilities = ["streaming", "stream_usage", "temperature", "top_p", "stop"]
+# ... one entry per routed model, and a [[cost.pricing]] entry for each.
+```
+
+The router drops candidates for these reasons:
+
+- they lack a feature the request uses;
+- the request would not fit their context or output limits;
+- their adapter rejects the request;
+- they are unpriced;
+- their circuit is open;
+- (for `quality_constrained`) they have no fresh, large enough evaluation run
+  that passes the threshold.
+
+It then picks the lowest maximum cost, with configuration order breaking ties.
+The remaining eligible candidates become the fallbacks.
+
+If nothing qualifies, `quality_constrained` uses the alias's primary model by
+default, or rejects the request with `on_insufficient_evidence = "reject"`. Each
+decision is logged with policy and evidence versions, exclusions, and estimates.
+See [docs/routing.md](docs/routing.md).
+
+### Offline evaluation
+
+```sh
+# No provider calls; results are marked simulated and never used for routing.
+uv run python -m gateway.evaluation run --config config/gateway.toml \
+  --dataset evaluations/datasets/support-ticket-category-v1.jsonl \
+  --target openai/small-model-id --max-tokens 8 --output results/ \
+  --simulate openai/small-model-id=0.9
+
+# Real provider calls (costs money): requires --live and a worst-case cost ceiling.
+uv run --env-file .env python -m gateway.evaluation run --config config/gateway.toml \
+  --dataset evaluations/datasets/support-ticket-category-v1.jsonl \
+  --target openai/small-model-id --max-tokens 8 --output results/ \
+  --live --max-cost-micro-usd 200000
+
+# Record results as routing evidence.
+GATEWAY_DATABASE_URL=... uv run python -m gateway.evaluation record results/*.json
+
+# Compare fixed, lowest_cost, and quality_constrained on recorded results.
+uv run python tools/routing_experiment.py --config config/gateway.toml --alias classify \
+  --dataset evaluations/datasets/support-ticket-category-v1.jsonl --results results/*.json
+```
+
+The experiment report shows cost, success rate with a confidence interval,
+latency, and routing distribution for each policy. Savings against the
+fixed-model baseline are reported only when both policies served the same cases
+with recorded usage. Results from simulated runs, or from runs that also served as
+evidence (in-sample), are labelled as such. The cost figures are gateway
+accounting at configured prices, not invoices. See
+[docs/evaluation.md](docs/evaluation.md).
 
 `GATEWAY_ENVIRONMENT` defaults to `production`, which requires gateway keys of at
 least 32 characters and HTTPS provider URLs. Every setting is described in
@@ -367,8 +461,18 @@ docker run --rm ai-gateway:validation
 
 CI pins Ubuntu 24.04 and verifies the installed Redis is from the 7.0 series.
 
-`tools/loadtest.py` measures latency and throughput against running gateways; see
+`tools/loadtest.py` measures latency and throughput against running gateways, and
+`tools/bench_routing.py` measures routing overhead in process. See
 [docs/benchmarks.md](docs/benchmarks.md) for commands and recorded results.
+
+Evaluation tests use simulated or fake providers only. The PostgreSQL integration
+tests (cost ledger, evaluation storage, routing) need a migrated database in
+`GATEWAY_TEST_DATABASE_URL` and are skipped without one:
+
+```sh
+GATEWAY_DATABASE_URL=$GATEWAY_TEST_DATABASE_URL uv run alembic upgrade head
+GATEWAY_TEST_DATABASE_URL=postgresql+asyncpg://... uv run pytest tests/integration
+```
 
 `tests/live/` contains a smoke test against a real provider. It is skipped unless
 `GATEWAY_LIVE_TESTS=1` and spends tokens when enabled:
@@ -394,6 +498,13 @@ history with gitleaks.
   towards `max_tokens` and `completion_tokens`.
 - Anthropic stop reasons without an OpenAI equivalent (for example `pause_turn`)
   are returned as `finish_reason: null`.
+- Routing quality rests on offline evaluation datasets. The two shipped datasets
+  are small and synthetic. No evaluation against a real provider has been run for
+  this repository, so no measured savings or quality figures exist for any
+  vendor model.
+- Routing ranks by maximum cost (full output allowance), not by predicted output
+  length. Latency constraints use evaluation-run latency, not live traffic.
+  Circuit-breaker state, one routing input, is per instance.
 - Token limits are enforced on estimates: input tokens are estimated from UTF-8
   size, and requests whose provider reports no usage are charged their full
   reservation. Actual provider token consumption can differ from the configured
@@ -417,8 +528,7 @@ history with gitleaks.
 
 ## Roadmap
 
-Planned for later phases: cost- and quality-aware model routing, response caching,
-and richer tenant administration. The current cost APIs report ledger amounts; they
+Planned for later phases: response caching and richer tenant administration. The current cost APIs report ledger amounts; they
 do not generate vendor invoices.
 
 ## License

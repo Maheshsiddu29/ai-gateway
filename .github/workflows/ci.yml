@@ -52,8 +52,11 @@ jobs:
         run: uv run mypy
       - name: Unit tests
         run: uv run pytest tests/unit
-      - name: Migrate test database
-        run: uv run alembic upgrade head
+      - name: Migrate test database, including a downgrade round trip
+        run: |
+          uv run alembic upgrade head
+          uv run alembic downgrade base
+          uv run alembic upgrade head
         env:
           GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway-test-only@127.0.0.1:5432/gateway_test
       - name: Integration tests

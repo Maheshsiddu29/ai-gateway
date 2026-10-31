@@ -10,7 +10,9 @@
 | `gateway.api.routes` | `/v1/chat/completions`, authenticated usage and budget reads, health, and `/metrics`. |
 | `gateway.api.streaming`, `gateway.api.disconnect` | SSE encoding and response, disconnect detection. |
 | `gateway.api.encoding`, `gateway.api.errors` | OpenAI-format response and error bodies. |
-| `gateway.services.completion` | Request planning (alias, fallbacks, output ceiling, validation), admission and settlement, completion log event. |
+| `gateway.services.completion` | Request planning (alias, fallbacks or routing, output ceiling, validation), admission and settlement, completion log event. |
+| `gateway.routing.*` | Capability registry and routing configuration, cost estimates, evaluation evidence snapshot, and the routing decision. |
+| `gateway.evaluation.*` | Offline evaluation: datasets, scorers, runner, simulated provider, PostgreSQL recording, and the `python -m gateway.evaluation` CLI. Not used on the request path. |
 | `gateway.services.execution` | Provider attempts: retries, circuit breakers, fallback, per-attempt usage. |
 | `gateway.admission.*` | Per-key limits, token estimation, the Redis scripts, failure policy, and usage accounting. |
 | `gateway.cost.*` | Versioned pricing, PostgreSQL ledger, per-attempt reservations and spending budgets. |
@@ -20,7 +22,7 @@
 | `gateway.schemas.completions` | The accepted request schema. |
 
 Dependencies point inwards: `api` uses `services`, which uses `admission`,
-`resilience`, and `providers`; all of them use `core`, `schemas`, and `errors`. Providers know nothing about HTTP
+`resilience`, `routing`, and `providers`; all of them use `core`, `schemas`, and `errors`. Providers know nothing about HTTP
 requests from clients, and the service knows nothing about wire formats.
 
 ## Request lifecycle
@@ -44,7 +46,9 @@ Authentication -> validation -> model resolution -> admission -> provider attemp
    fallbacks, applies `max_output_tokens` and `default_max_tokens`, and builds one
    `ProviderRequest` per candidate. Each adapter validates its request without I/O;
    the primary's rejection is returned to the client, and an incompatible fallback
-   is dropped from the plan.
+   is dropped from the plan. For an alias with a dynamic routing policy, the
+   router filters and ranks the alias's candidates instead and returns the
+   ordered attempt chain, without I/O (see [routing.md](routing.md)).
 7. **Admission.** If admission control is enabled, one Redis script checks the
    key's request, token, and concurrency limits and either commits all of them or
    none. The token reservation is the estimated input plus the output allowance.
