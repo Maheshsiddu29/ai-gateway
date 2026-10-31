@@ -139,6 +139,7 @@ def evidence_snapshot(runs: dict[Target, EvaluationRun], dataset: Dataset) -> Ev
                 latency_samples=run.summary.latency_samples,
                 latency_p95_ms=run.summary.latency_p95_ms,
                 expected_output_tokens=mean_completion_tokens(run.summary),
+                max_output_tokens=run.identity.max_output_tokens,
             )
             for (provider, model), run in runs.items()
         }

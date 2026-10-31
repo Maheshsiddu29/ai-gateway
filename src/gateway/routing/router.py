@@ -77,6 +77,9 @@ class Exclusion(StrEnum):
     MISSING_PRICE = "missing_price"
     CIRCUIT_OPEN = "circuit_open"
     NO_EVIDENCE = "no_evidence"
+    # The evaluation allowed more output than this request does, so truncation the
+    # request may suffer was not measured.
+    EVIDENCE_OUTPUT_LIMIT = "evidence_output_limit"
     INVALID_EVIDENCE_TIME = "invalid_evidence_time"
     STALE_EVIDENCE = "stale_evidence"
     INSUFFICIENT_SAMPLES = "insufficient_samples"
@@ -204,15 +207,17 @@ def _exclusion(
     if not candidate.available:
         return Exclusion.CIRCUIT_OPEN
     if rules is not None:
-        return _quality_exclusion(rules, candidate.evidence, now)
+        return _quality_exclusion(rules, candidate.evidence, profile, now)
     return None
 
 
 def _quality_exclusion(
-    rules: QualityRules, evidence: Evidence | None, now: datetime
+    rules: QualityRules, evidence: Evidence | None, profile: RequestProfile, now: datetime
 ) -> Exclusion | None:
     if evidence is None:
         return Exclusion.NO_EVIDENCE
+    if evidence.max_output_tokens > profile.output_allowance:
+        return Exclusion.EVIDENCE_OUTPUT_LIMIT
     if evidence.completed_at > now:
         return Exclusion.INVALID_EVIDENCE_TIME
     if now - evidence.completed_at > rules.max_evidence_age:

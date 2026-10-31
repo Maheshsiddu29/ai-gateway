@@ -143,6 +143,7 @@ def evidence_for(candidates: int) -> EvidenceSnapshot:
                 latency_samples=100,
                 latency_p95_ms=500.0,
                 expected_output_tokens=2,
+                max_output_tokens=16,
             )
             for index in range(candidates)
         }

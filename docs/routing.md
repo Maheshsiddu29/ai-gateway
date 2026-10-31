@@ -72,7 +72,8 @@ request is never sent to a second model for comparison.
 
 Rejection reasons are recorded per candidate: `missing_capability`,
 `output_limit`, `context_window`, `adapter_rejected`, `not_routable`,
-`missing_price`, `circuit_open`, `no_evidence`, `invalid_evidence_time`,
+`missing_price`, `circuit_open`, `no_evidence`, `evidence_output_limit`,
+`invalid_evidence_time`,
 `stale_evidence`, `insufficient_samples`, `below_quality`, `no_latency_evidence`,
 and `latency_above_limit`.
 
@@ -170,6 +171,7 @@ For a run to qualify it must:
 
 | Rule | Configuration |
 | --- | --- |
+| Have been run with `max_tokens` no larger than this request's output allowance; output truncation beyond what was measured is not assumed harmless | request and alias |
 | Have completed no longer ago than the limit, and not in the future | `max_evidence_age_days` |
 | Contain at least this many cases | `min_samples` |
 | Have a 95% Wilson lower bound of the pass rate at least this value | `min_success_rate` |

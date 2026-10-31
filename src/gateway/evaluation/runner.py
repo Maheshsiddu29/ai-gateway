@@ -115,6 +115,8 @@ class EvaluationRun:
             }
         )
         results = tuple(CaseResult(**result) for result in data["results"])
+        for result in results:
+            _check_case(result)
         summary = summarize(results)
         if asdict(summary) != data["summary"]:
             raise ValueError("the results file summary does not match its case results")
@@ -123,6 +125,21 @@ class EvaluationRun:
         if identity.started_at > identity.completed_at:
             raise ValueError("the results file ends before it starts")
         return cls(identity, summary, results)
+
+
+def _check_case(result: CaseResult) -> None:
+    if not 0 <= result.score <= 1:
+        raise ValueError(f"case {result.case_id} has a score outside [0, 1]")
+    measurements = (
+        result.latency_ms,
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.cost_micro_usd,
+    )
+    if any(value is not None and value < 0 for value in measurements):
+        raise ValueError(f"case {result.case_id} has a negative measurement")
+    if result.passed and (result.invalid_response or result.error_code is not None):
+        raise ValueError(f"case {result.case_id} passed despite an invalid response or error")
 
 
 def summarize(results: Sequence[CaseResult]) -> RunSummary:

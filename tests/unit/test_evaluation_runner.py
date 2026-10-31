@@ -207,6 +207,34 @@ async def test_results_file_round_trip_and_tamper_detection() -> None:
         EvaluationRun.from_json(data)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("latency_ms", -1.0, "negative measurement"),
+        ("completion_tokens", -5, "negative measurement"),
+        ("score", 1.5, "outside"),
+        ("error_code", "provider_unavailable", "passed despite"),
+    ],
+)
+async def test_results_file_rejects_impossible_case_values(
+    field: str, value: object, message: str
+) -> None:
+    dataset = tickets()
+    run = await run_evaluation(
+        SimulatedProvider("sim", dataset, {"m": 1.0}),
+        "m",
+        dataset,
+        max_output_tokens=8,
+        price=PRICE,
+        simulated=True,
+    )
+    data = json.loads(json.dumps(run.to_json()))
+    data["results"][0][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        EvaluationRun.from_json(data)
+
+
 def write_config(tmp_path: Path) -> Path:
     path = tmp_path / "gateway.toml"
     path.write_text(

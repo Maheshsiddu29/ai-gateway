@@ -119,3 +119,11 @@ async def test_database_constraints_reject_inconsistent_counts(engine: AsyncEngi
 
     with pytest.raises(IntegrityError, match="evaluation_counts_bounded"):
         await record_run(engine, bad)
+
+
+async def test_database_rejects_negative_latency(engine: AsyncEngine) -> None:
+    run = await simulated_run()
+    bad = dataclasses.replace(run, summary=dataclasses.replace(run.summary, latency_p95_ms=-1.0))
+
+    with pytest.raises(IntegrityError, match="evaluation_measurements_nonnegative"):
+        await record_run(engine, bad)

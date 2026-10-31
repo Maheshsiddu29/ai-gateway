@@ -245,6 +245,11 @@ metrics, and assembling log fields. About 1 µs of it is each
 | lowest_cost / 8 | 49.6, 49.6 µs | 53.1, 53.5 µs | 60.8, 62.0 µs |
 | quality_constrained / 8 | 62.4, 62.5 µs | 67.1, 66.8 µs | 74.5, 73.5 µs |
 
+These runs were taken before the evidence output-limit rule was added. One
+re-run afterwards measured `decide` p50 between 6.2 µs (lowest_cost / 2) and
+27.9 µs (quality_constrained / 8), and `complete` p50 between 27.5 µs and 65.9 µs.
+Those are within 6% of the figures above, comparable to the run-to-run variation.
+
 Memory allocated during one decision (tracemalloc peak) was 1,168 bytes for
 lowest_cost with 2 candidates and 3,152 bytes for quality_constrained with 8.
 Decisions retain nothing after the request.

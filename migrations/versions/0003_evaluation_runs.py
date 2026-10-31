@@ -55,6 +55,13 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint("mean_score BETWEEN 0 AND 1", name="evaluation_score_bounded"),
         sa.CheckConstraint(
+            "max_output_tokens > 0 AND prompt_tokens >= 0 AND completion_tokens >= 0"
+            " AND estimated_cost_micro_usd >= 0"
+            " AND (latency_p50_ms IS NULL OR latency_p50_ms >= 0)"
+            " AND (latency_p95_ms IS NULL OR latency_p95_ms >= 0)",
+            name="evaluation_measurements_nonnegative",
+        ),
+        sa.CheckConstraint(
             "started_at <= completed_at AND completed_at <= recorded_at",
             name="evaluation_times_ordered",
         ),
@@ -77,6 +84,13 @@ def upgrade() -> None:
         sa.Column("cost_micro_usd", sa.BigInteger()),
         sa.Column("error_code", sa.String(64)),
         sa.CheckConstraint("score BETWEEN 0 AND 1", name="evaluation_case_score_bounded"),
+        sa.CheckConstraint(
+            "(latency_ms IS NULL OR latency_ms >= 0)"
+            " AND (prompt_tokens IS NULL OR prompt_tokens >= 0)"
+            " AND (completion_tokens IS NULL OR completion_tokens >= 0)"
+            " AND (cost_micro_usd IS NULL OR cost_micro_usd >= 0)",
+            name="evaluation_case_measurements_nonnegative",
+        ),
     )
     op.execute("""CREATE FUNCTION reject_evaluation_mutation() RETURNS trigger AS $$
         BEGIN RAISE EXCEPTION 'evaluation results are append-only'; END;

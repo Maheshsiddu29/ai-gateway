@@ -89,6 +89,11 @@ GATEWAY_DATABASE_URL=postgresql+asyncpg://... \
   uv run python -m gateway.evaluation record results/*.json
 ```
 
+Use a `--max-tokens` no larger than the output allowance of the aliases that
+will rely on the run. Routing ignores a run made with a larger allowance than a
+request's, because that run did not measure the truncation the request may
+suffer.
+
 `run` writes one results file per target. Each file has the run identity
 (provider, model, dataset, version, SHA-256, evaluator version, simulated flag,
 pricing version, start and completion times), a summary, and one record per case
@@ -108,9 +113,11 @@ Safeguards:
   wrong answer otherwise. Its token counts are estimates and its latency is an
   in-process function call. It tests the pipeline and nothing else, and routing
   never accepts its runs.
-- `record` recomputes each file's summary from its case records and refuses files
-  whose summary does not match. The database refuses runs completed in the future
-  and counts that exceed the case count.
+- `record` recomputes each file's summary from its case records. It refuses files
+  whose summary does not match, and cases with negative measurements, scores
+  outside [0, 1], or a pass alongside an error. The database also refuses runs
+  completed in the future, counts that exceed the case count, and negative
+  latencies, token counts, or costs.
 
 The default test suite uses only simulated or fake providers and needs no vendor
 credentials. Real evaluations are run manually by the operator.

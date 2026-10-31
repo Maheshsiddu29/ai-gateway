@@ -57,6 +57,7 @@ def evidence(
     age: timedelta = timedelta(days=1),
     p95: float | None = 200.0,
     latency_samples: int | None = None,
+    max_output: int = 50,
 ) -> Evidence:
     return Evidence(
         run_id=uuid.uuid4(),
@@ -66,6 +67,7 @@ def evidence(
         latency_samples=cases if latency_samples is None else latency_samples,
         latency_p95_ms=p95,
         expected_output_tokens=10,
+        max_output_tokens=max_output,
     )
 
 
@@ -218,6 +220,7 @@ class TestQualityConstrained:
             (evidence(age=-timedelta(seconds=1)), Exclusion.INVALID_EVIDENCE_TIME),
             (evidence(39, 39), Exclusion.INSUFFICIENT_SAMPLES),
             (evidence(40, 50), Exclusion.BELOW_QUALITY),
+            (evidence(max_output=51), Exclusion.EVIDENCE_OUTPUT_LIMIT),
         ],
     )
     def test_evidence_rules(self, item: Evidence | None, exclusion: Exclusion) -> None:

@@ -47,6 +47,8 @@ class Evidence:
     latency_p95_ms: float | None
     # Mean output tokens per case with reported usage, rounded up.
     expected_output_tokens: int | None
+    # The max_tokens each case was sent with.
+    max_output_tokens: int
 
     @property
     def success_rate_low(self) -> float:
@@ -75,7 +77,7 @@ async def load_evidence(engine: AsyncEngine) -> EvidenceSnapshot:
                 (provider, model, dataset, dataset_version, method, evaluator_version)
                 run_id, provider, model, dataset, dataset_version, method, evaluator_version,
                 completed_at, case_count, passed_count, latency_samples, latency_p95_ms,
-                usage_reported_count, completion_tokens
+                usage_reported_count, completion_tokens, max_output_tokens
                 FROM evaluation_runs WHERE NOT simulated
                 ORDER BY provider, model, dataset, dataset_version, method, evaluator_version,
                 completed_at DESC, run_id
@@ -101,6 +103,7 @@ async def load_evidence(engine: AsyncEngine) -> EvidenceSnapshot:
                     expected_output_tokens=(
                         (row["completion_tokens"] + reported - 1) // reported if reported else None
                     ),
+                    max_output_tokens=row["max_output_tokens"],
                 )
             )
     return EvidenceSnapshot.of(runs)
