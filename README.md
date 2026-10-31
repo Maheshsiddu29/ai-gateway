@@ -273,4 +273,4 @@ started, response caching, and cost analytics. None of these exist yet.
 
 ## License
 
-This repository does not include a license yet.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
