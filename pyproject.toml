@@ -12,6 +12,7 @@ dependencies = [
     "prometheus-client>=0.26.0",
     "pydantic>=2.14.2",
     "pydantic-settings>=2.16.2",
+    "redis>=8.1.0",
     "starlette>=1.10.0",
     "uvicorn>=0.54.0",
 ]

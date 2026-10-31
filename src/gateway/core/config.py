@@ -39,6 +39,11 @@ ProviderName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
 ModelAlias = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")]
 EnvVarName = Annotated[str, Field(pattern=r"^[A-Z_][A-Z0-9_]{0,127}$")]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+# The non-secret identifier of a gateway key; see core.security.Principal.
+PrincipalId = Annotated[str, Field(pattern=r"^key-[0-9a-f]{12}$")]
+# Keeps token-bucket arithmetic well within the exact integer range of the
+# double-precision numbers used by Redis Lua scripts.
+MAX_RATE_LIMIT = 1_000_000_000
 AnthropicApiVersion = Literal["2023-06-01", "2026-10-21"]
 
 
@@ -120,6 +125,54 @@ class ModelConfig(BaseModel):
     provider: ProviderName
     model: str = Field(min_length=1, max_length=256)
     default_max_tokens: int | None = Field(default=None, ge=1)
+
+
+RateLimit = Annotated[int, Field(ge=1, le=MAX_RATE_LIMIT)]
+
+
+class RateLimitsConfig(BaseModel):
+    """Limits for one gateway key. An omitted limit is not enforced."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    requests_per_minute: RateLimit | None = None
+    # Bucket capacity: how many requests may be made at once after a quiet period.
+    # Defaults to requests_per_minute.
+    request_burst: RateLimit | None = None
+    tokens_per_minute: RateLimit | None = None
+    token_burst: RateLimit | None = None
+    max_concurrent_requests: Annotated[int, Field(ge=1, le=100_000)] | None = None
+
+    @model_validator(mode="after")
+    def _check_bursts(self) -> "RateLimitsConfig":
+        if self.request_burst is not None and self.requests_per_minute is None:
+            raise ValueError("request_burst requires requests_per_minute")
+        if self.token_burst is not None and self.tokens_per_minute is None:
+            raise ValueError("token_burst requires tokens_per_minute")
+        return self
+
+
+class AdmissionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    default_limits: RateLimitsConfig = Field(default_factory=RateLimitsConfig)
+    # Replaces default_limits entirely for the listed keys, identified by the
+    # non-secret principal ID that appears in logs (key- plus 12 hex characters).
+    key_limits: dict[PrincipalId, RateLimitsConfig] = Field(default_factory=dict)
+    # Concurrency leases live for the request deadline plus this grace period, so a
+    # lease cannot expire while its request may still be running.
+    lease_grace_seconds: float = Field(default=30.0, gt=0, le=600)
+    # How long a settled reservation is remembered after its lease, to recognise
+    # duplicate settlement.
+    reservation_retention_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    redis_connect_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
+    redis_operation_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
+    redis_pool_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
+    redis_max_connections: int = Field(default=50, ge=1, le=10_000)
+
+    def limits_for(self, principal_id: str) -> RateLimitsConfig:
+        return self.key_limits.get(principal_id, self.default_limits)
 
 
 # One hour; longer requests are better served by an asynchronous API.
