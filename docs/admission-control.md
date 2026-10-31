@@ -223,3 +223,7 @@ logs `reservation unresolved` with reason `settlement_capacity_exhausted`; the
 original token reservation is retained and its concurrency lease expires normally.
 No detached queue grows during a Redis outage. Readiness probes are coalesced
 under one lock, so concurrent probes share the same cached result.
+
+An exception after dispatch is unknown usage unless a `ProviderError` explicitly
+identifies a pre-execution rejection. Internal gateway errors while consuming
+partial output retain the full reservation; they must not refund the request.

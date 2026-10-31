@@ -7,7 +7,7 @@ from gateway.admission.tokens import (
     estimate_input_tokens,
 )
 from gateway.admission.usage import Charge, UsageLedger, UsageStatus
-from gateway.errors import DeadlineExceededError, InvalidRequestError
+from gateway.errors import DeadlineExceededError, InternalGatewayError, InvalidRequestError
 from gateway.providers.base import Usage
 from gateway.providers.http import error_from_status, error_from_transport
 from gateway.schemas.completions import ChatMessage
@@ -60,7 +60,8 @@ def test_success_without_usage_is_charged_the_reservation() -> None:
         (error_from_status(httpx.Response(504)), RESERVED),
         (error_from_transport(httpx.ReadTimeout("slow")), RESERVED),
         (error_from_transport(httpx.RemoteProtocolError("closed")), RESERVED),
-        (InvalidRequestError("rejected by the adapter"), 0),
+        (InvalidRequestError("unexpected after dispatch"), RESERVED),
+        (InternalGatewayError("stream ended after partial output"), RESERVED),
         (DeadlineExceededError("late"), RESERVED),
         (RuntimeError("bug"), RESERVED),
     ],

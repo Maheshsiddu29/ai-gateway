@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from gateway.errors import DeadlineExceededError, GatewayError, ProviderError
+from gateway.errors import ProviderError
 from gateway.providers.base import Usage
 
 
@@ -39,11 +39,8 @@ class Attempt:
     def failed(self, exc: BaseException) -> None:
         if isinstance(exc, ProviderError):
             self.may_have_processed = exc.may_have_processed
-        elif isinstance(exc, GatewayError) and not isinstance(exc, DeadlineExceededError):
-            # Rejected by the gateway or adapter before any I/O.
-            self.may_have_processed = False
-        # Cancellation, deadline expiry, and unexpected errors keep the default:
-        # the request may have reached the provider.
+        # Every other exception after dispatch remains uncertain, including an
+        # internal gateway failure while consuming partial provider output.
 
 
 @dataclass(frozen=True)
