@@ -8,8 +8,9 @@ the request, and normalizes the response.
 The gateway enforces per-key request, token, and concurrency limits shared across
 instances through Redis, bounds every request with an end-to-end deadline, and
 retries or falls back between providers only when a failed provider certainly did
-not run the request. Budgets, cost-aware routing, and caching are not implemented
-(see [Roadmap](#roadmap)).
+not run the request. Optional PostgreSQL spending budgets account for each upstream
+attempt.
+Cost-aware routing and caching are planned for later phases.
 
 ## Current capabilities
 
@@ -31,12 +32,15 @@ not run the request. Budgets, cost-aware routing, and caching are not implemente
   (by reservation and settlement), and concurrent requests per gateway key,
   enforced atomically in Redis for all instances, failing closed when Redis is
   unavailable.
+- PostgreSQL usage ledger with versioned per-model prices, exact micro-USD charges,
+  daily and monthly key/team budgets, and authenticated usage APIs when cost accounting
+  is enabled.
 - An end-to-end deadline per request, covering admission, all provider attempts,
   and the whole stream.
 - Bounded retries with exponential backoff, per-provider circuit breakers, and
   configured fallback providers per alias.
-- Prometheus metrics at `GET /metrics` (gateway Bearer key required); `GET /health/live` and `GET /health/ready`
-  (which checks Redis when admission control is enabled).
+- Prometheus metrics at `GET /metrics` (gateway Bearer key required); `GET /health/live`
+  and `GET /health/ready` (which checks required Redis and PostgreSQL dependencies).
 
 ## Architecture
 
@@ -48,8 +52,9 @@ client ─► RequestContextMiddleware   request ID, access log, metrics, last-r
                        plan: alias ─► primary + fallbacks, output ceiling, validation
                        admit ─► AdmissionController ─► Redis script (all limits at once)
                        └─► ProviderExecutor   retries, circuit breakers, fallback
+                             ├─► PostgreSQL reserve + dispatch per attempt
                              └─► Provider adapter ─► httpx.AsyncClient (per provider)
-                       settle ─► Redis script (release lease, charge tokens used)
+                       settle ─► PostgreSQL cost ledger + Redis token lease
 ```
 
 The API layer speaks the OpenAI wire format. The service layer is independent of
@@ -58,6 +63,8 @@ results (`Completion`, or a stream of `TextDelta` events ending in `StreamEnd`),
 which the API layer encodes back into OpenAI-format responses.
 
 See [docs/architecture.md](docs/architecture.md) for the request lifecycle,
+[docs/cost-accounting.md](docs/cost-accounting.md) for charge semantics,
+[docs/budget-enforcement.md](docs/budget-enforcement.md) for spending admission,
 [docs/admission-control.md](docs/admission-control.md) and
 [docs/resilience.md](docs/resilience.md) for limits and failure handling, and
 [docs/adr/](docs/adr/) for the main design decisions.
@@ -70,6 +77,7 @@ See [docs/architecture.md](docs/architecture.md) for the request lifecycle,
   `uv.lock`.
 - Redis 7 or later when admission control is enabled. The tests start their own
   `redis-server` processes, so the binary must be installed to run them.
+- PostgreSQL 16 for cost accounting. Apply Alembic migrations before gateway startup.
 - Docker with Compose, optionally, for the container setup.
 
 ## Local setup
@@ -83,7 +91,7 @@ cp .env.example .env        # then set GATEWAY_API_KEYS
 
 `tools/mock_upstream.py` implements enough of the OpenAI and Anthropic APIs to
 exercise both adapters without vendor accounts. With Docker, the stack runs the
-gateway, the mock, and Redis, with admission control enabled
+gateway, the mock, Redis, and PostgreSQL, with admission and cost accounting enabled
 (`config/gateway.compose.toml`):
 
 ```sh
@@ -110,6 +118,9 @@ Copy `config/gateway.example.toml` to `config/gateway.toml`, replace the placeho
 model identifiers, and set the provider keys it references (`OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`) in `.env`. The container image expects the file at
 `/etc/gateway/gateway.toml`:
+
+If you enable `[cost]`, configure prices, set `GATEWAY_DATABASE_URL`, and apply
+`GATEWAY_DATABASE_URL=... uv run alembic upgrade head` before starting the gateway.
 
 ```sh
 docker build -t ai-gateway .
@@ -157,6 +168,29 @@ requests_per_minute = 60
 tokens_per_minute = 100000
 max_concurrent_requests = 8
 ```
+
+When `[cost] enabled = true`, set `GATEWAY_DATABASE_URL` and configure a price for
+every primary and fallback provider/model. For example:
+
+```toml
+[cost]
+enabled = true
+
+[cost.default_key_limits]
+daily_micro_usd = 1000000   # $1.00
+monthly_micro_usd = 10000000 # $10.00
+
+[[cost.pricing]]
+provider = "anthropic"
+model = "your-anthropic-model-id"
+version = "internal-2026-10"
+effective_at = 2026-10-01T00:00:00Z
+input_per_million_usd = "0.50"
+output_per_million_usd = "2.00"
+```
+
+These are illustrative rates, not vendor prices. See
+[docs/configuration.md](docs/configuration.md) for team mapping and reader grants.
 
 `GATEWAY_ENVIRONMENT` defaults to `production`, which requires gateway keys of at
 least 32 characters and HTTPS provider URLs. Every setting is described in
@@ -253,6 +287,15 @@ refilled enough, rounded up to whole seconds; it is omitted for concurrency
 rejections, whose wait depends on other requests finishing. A request whose token
 reservation can never fit the key's limit gets 400 `token_reservation_exceeds_limit`.
 
+### Spending APIs
+
+With cost accounting enabled, authenticated keys can call `GET /v1/usage`,
+`GET /v1/usage/summary`, and `GET /v1/budgets`. Usage queries accept `start`,
+`end` (timezone-aware, at most 31 days), `provider`, and `model`; `/v1/usage`
+also accepts bounded `limit` and `offset`. A `team_id` query is allowed only for
+keys explicitly listed as readers of that configured team. All amounts are integer
+micro-USD.
+
 ### Errors
 
 ```json
@@ -271,7 +314,7 @@ reservation can never fit the key's limit gets 400 `token_reservation_exceeds_li
 | `provider_rate_limited` | 429, with `Retry-After` when the provider sent a delay in seconds |
 | `provider_timeout` | 504 |
 | `provider_unavailable` | 502, including `provider_circuit_open` |
-| `admission_unavailable` | 503, when admission control cannot reach Redis |
+| `admission_unavailable` | 503, when Redis or required PostgreSQL accounting is unavailable |
 | `deadline_exceeded` | 504 |
 | `internal_error` | 500 |
 
@@ -365,18 +408,18 @@ history with gitleaks.
 - No keep-alive comments are sent on idle streams; proxies with short idle timeouts
   may close long pauses.
 - `GET /v1/models` and other OpenAI endpoints are not implemented.
-- Gateway keys are a static list from the environment; limits are per key, with no
-  tenant grouping, and changing keys or limits requires a restart.
-- Without admission control, there is no limit on concurrent requests beyond each
-  provider's connection pool.
+- Gateway keys are a static list from the environment. Team mapping and budgets are
+  configuration based; changing them requires a restart.
+- Without Redis admission, there is no request, token, or concurrency limit beyond
+  each provider's connection pool. PostgreSQL budgets can still be enabled.
 - Readiness does not check provider reachability. `/metrics` requires a gateway API key; health
   endpoints remain unauthenticated on the API port.
 
 ## Roadmap
 
-Planned for later phases, in no fixed order: tenant-level budgets and usage
-accounting, cost-aware model routing, response caching, and cost analytics. None
-of these exist yet.
+Planned for later phases: cost- and quality-aware model routing, response caching,
+and richer tenant administration. The current cost APIs report ledger amounts; they
+do not generate vendor invoices.
 
 ## License
 

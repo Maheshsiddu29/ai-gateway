@@ -227,3 +227,7 @@ under one lock, so concurrent probes share the same cached result.
 An exception after dispatch is unknown usage unless a `ProviderError` explicitly
 identifies a pre-execution rejection. Internal gateway errors while consuming
 partial output retain the full reservation; they must not refund the request.
+
+## Coordination with spending budgets
+
+When cost accounting is enabled, Redis admission runs before PostgreSQL budget reservation. The executor reserves monetary capacity for each upstream attempt, including retries and fallbacks, then records dispatch before provider I/O. A PostgreSQL rejection prevents provider execution; the request's Redis token and concurrency reservation follows the existing settlement path. Redis leases bound leaks after a crash between the two systems. PostgreSQL recovery releases expired pre-dispatch reservations but retains conservative liability for dispatched attempts with unknown usage. There is no atomic cross-store transaction. See [budget enforcement](budget-enforcement.md).

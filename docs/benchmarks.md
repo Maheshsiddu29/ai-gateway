@@ -162,3 +162,43 @@ docker compose -p gateway-audit --profile multi down
 
 `FLUSHDB` above targets only this disposable, unpersisted Compose Redis. Do not run
 that command against an existing admission database.
+
+## Phase 3 cost-accounting measurements (2026-10-31)
+
+These are local measurements, not service-level targets or vendor API results. Host: macOS 26.2 arm64, PostgreSQL 16.2 on loopback for the store benchmark, Docker Desktop 29.6.2 for the gateway stack. The mock provider is deterministic and charges no real tokens. Results depend on the host, connection pool, and workload.
+
+The store benchmark used `tools/bench_cost.py` with 200 attempts, concurrency 20, 50 estimated input tokens, 50 maximum output tokens, 60 observed tokens, and an illustrative $1 per million input/output token price:
+
+```sh
+uv run python tools/bench_cost.py \
+  --database-url "$GATEWAY_TEST_DATABASE_URL" \
+  --requests 200 --concurrency 20
+```
+
+| Measurement | Observed |
+| --- | ---: |
+| Reservation latency p50 / p95 / p99 | 10.088 / 44.004 / 49.920 ms |
+| Concurrent reserve-dispatch-settle throughput | 580.09 attempts/s |
+| PostgreSQL `BEGIN` + `SELECT 1` + `COMMIT` p50 / p95 / p99 | 0.474 / 0.622 / 0.622 ms |
+| `EXPLAIN ANALYZE` provider/model summary query on 200 attempts | 0.170 ms execution time |
+| Four independent processes, 40 simultaneous reservations, 10-unit shared budget | 10 accepted, 30 rejected (`test_multiple_processes_share_one_budget`) |
+| Two gateway instances, 20 concurrent requests, one-attempt shared budget | 1 accepted, 19 rejected (`test_two_gateway_instances_do_not_over_admit_shared_budget`) |
+
+For the gateway measurement, Compose ran one gateway, Redis, PostgreSQL, and the local mock provider. The mock used a fixed 50 ms response delay. The command below issued 500 requests with concurrency 20 and `max_tokens=64`; container memory was sampled with `docker stats --no-stream` during the run:
+
+```sh
+MOCK_RESPONSE_DELAY_SECONDS=0.05 GATEWAY_API_KEYS=local-test-key-0123456789abcdef docker compose up -d --build
+uv run python tools/loadtest.py --url http://127.0.0.1:8000 \
+  --api-key local-test-key-0123456789abcdef --model fast --requests 500 \
+  --concurrency 20 --max-tokens 64 --mock-url http://127.0.0.1:9000 --reset-mock
+```
+
+| Measurement | Observed |
+| --- | ---: |
+| HTTP statuses | 500 × 200 |
+| Gateway latency p50 / p95 / p99 | 103.6 / 185.7 / 354.9 ms |
+| Throughput | 170.6 requests/s |
+| Mock peak concurrent requests | 20 |
+| Gateway container memory samples | 75.95 and 77.39 MiB; sampled peak 77.39 MiB |
+
+The memory figure is the highest of two sampled container readings, not a continuous high-water mark. The store throughput includes three financial transactions per attempt; reservation latency covers the first transaction only. The query timing is PostgreSQL's execution time and excludes HTTP serialization and client network time.

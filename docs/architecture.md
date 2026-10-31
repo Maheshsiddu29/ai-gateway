@@ -7,12 +7,13 @@
 | `gateway.main` | Builds the FastAPI application; owns startup and shutdown. |
 | `gateway.api.middleware` | Request ID, access log, HTTP metrics, conversion of unhandled exceptions to 500. |
 | `gateway.api.dependencies` | Authentication, bounded body reading, request validation. |
-| `gateway.api.routes` | `/v1/chat/completions`, the health endpoints, and `/metrics`. |
+| `gateway.api.routes` | `/v1/chat/completions`, authenticated usage and budget reads, health, and `/metrics`. |
 | `gateway.api.streaming`, `gateway.api.disconnect` | SSE encoding and response, disconnect detection. |
 | `gateway.api.encoding`, `gateway.api.errors` | OpenAI-format response and error bodies. |
 | `gateway.services.completion` | Request planning (alias, fallbacks, output ceiling, validation), admission and settlement, completion log event. |
 | `gateway.services.execution` | Provider attempts: retries, circuit breakers, fallback, per-attempt usage. |
 | `gateway.admission.*` | Per-key limits, token estimation, the Redis scripts, failure policy, and usage accounting. |
+| `gateway.cost.*` | Versioned pricing, PostgreSQL ledger, per-attempt reservations and spending budgets. |
 | `gateway.resilience.*` | Request deadlines, retry policy, circuit breakers. |
 | `gateway.providers.*` | Provider interface, adapters, HTTP client setup, upstream error mapping, SSE parsing. |
 | `gateway.core.*` | Configuration, logging, metrics, Redis client, authentication. |
@@ -49,7 +50,9 @@ Authentication -> validation -> model resolution -> admission -> provider attemp
    none. The token reservation is the estimated input plus the output allowance.
    Rejection returns 429; a Redis failure returns 503.
 8. **Provider attempts.** `ProviderExecutor` tries the candidates in order. Each
-   attempt passes through the provider's circuit breaker and runs within the
+   attempt passes through the provider's circuit breaker. When cost accounting is
+   enabled, it obtains a PostgreSQL budget reservation and commits a dispatch mark
+   before calling the provider. The provider call runs within the
    remaining deadline. The adapter translates the request, the provider's
    `httpx.AsyncClient` sends it with only configured headers, and the adapter
    normalizes the response into a `Completion` or a stream of `TextDelta` events
@@ -60,9 +63,11 @@ Authentication -> validation -> model resolution -> admission -> provider attemp
 10. **Response.** The route encodes the result as an OpenAI-format JSON body or SSE
     stream.
 11. **Reconciliation.** Whatever the outcome, including cancellation and deadline
-    expiry, the reservation is settled: the lease is released and the token
-    reservation is replaced by the usage charged for every attempt. See
-    [admission-control.md](admission-control.md).
+    expiry, each PostgreSQL cost attempt is settled with observed usage or a
+    conservative liability. The Redis lease is released and its token reservation
+    is replaced by usage charged for every attempt. See
+    [admission-control.md](admission-control.md) and
+    [cost-accounting.md](cost-accounting.md).
 12. **Logging.** The service logs one `completion finished` event (outcome, alias,
     serving provider, attempts, duration, finish reason, token usage and
     reservation, error category). The middleware logs one `request completed` event
@@ -202,7 +207,8 @@ a truncated digest of its key and is safe to log.
 
 Replacing the static list with a tenant-aware store means providing another
 `Authenticator` that returns a `Principal` carrying tenant information; the request
-pipeline does not change.
+pipeline does not change. Phase 3 uses static configuration to map existing key
+fingerprints to budget teams and explicit team analytics readers.
 
 ## Failure handling
 
@@ -292,3 +298,7 @@ a password, comes from `GATEWAY_REDIS_URL`. See [configuration.md](configuration
   concurrency slots stay held until the deadline plus grace period has passed.
 - **Process-local circuit breakers** need no coordination, but replicas detect
   provider outages independently.
+
+## Phase 3 financial accounting
+
+When cost accounting is enabled, `gateway.cost` adds a PostgreSQL reservation and ledger transaction around each provider attempt. Redis admission still occurs first. The executor reserves and marks each attempt dispatched before provider I/O, then settles its observed charge or unresolved liability after completion, failure, or cancellation. A retry or fallback performs this sequence again with a new attempt UUID. Readiness probes PostgreSQL; a background recovery task resolves expired reservations. `gateway.api.routes.usage` reads authenticated, bounded spending views. See [cost accounting](cost-accounting.md) and [budget enforcement](budget-enforcement.md) for transaction and period semantics.

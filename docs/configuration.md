@@ -248,3 +248,39 @@ on an internal network. Redis URL query options are intentionally unsupported.
 `GET /metrics` now requires a gateway Bearer API key. Configure the scraper's
 authorization header; health endpoints remain public. Every configured gateway
 key can read aggregate metrics; metrics have no per-key labels.
+
+## Cost accounting and spending budgets
+
+`[cost] enabled = true` requires `GATEWAY_DATABASE_URL` (a SQLAlchemy `postgresql+asyncpg://` URL) and an effective price for every configured primary and fallback provider/model. Run `GATEWAY_DATABASE_URL=... uv run alembic upgrade head` before startup. The gateway checks the accounting table at startup and in readiness probes. PostgreSQL credentials belong in the environment, not the TOML file. The Docker Compose example uses isolated local-only credentials; replace them for any non-local deployment.
+
+```toml
+[cost]
+enabled = true
+
+[cost.default_key_limits]
+daily_micro_usd = 1000000
+monthly_micro_usd = 10000000
+
+[cost.key_limits.key-123456789abc]
+daily_micro_usd = 500000
+
+[cost.principal_teams]
+key-123456789abc = "engineering"
+
+[cost.team_limits.engineering]
+daily_micro_usd = 10000000
+monthly_micro_usd = 100000000
+
+[cost.team_readers]
+engineering = ["key-123456789abc"]
+
+[[cost.pricing]]
+provider = "openai"
+model = "configured-model-id"
+version = "internal-2026-10"
+effective_at = 2026-10-01T00:00:00Z
+input_per_million_usd = "0.50"
+output_per_million_usd = "2.00"
+```
+
+The sample IDs and prices are illustrative. A key's principal ID is the existing `key-` prefix plus the first 12 hex characters of its SHA-256 digest. Each pricing entry has an exact provider/model pair, version, UTC effective time, and decimal-string rates per million tokens. The latest effective entry is selected at attempt reservation. No substitute model price is used. Prices must be nonnegative and at most 1,000,000 USD per million tokens with at most nine fractional digits. An absent daily or monthly limit is uncapped. Team readers are explicit; team membership alone grants no analytics access. Changing configuration requires a gateway restart and does not rewrite the stored pricing snapshot on past attempts.
