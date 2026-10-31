@@ -15,6 +15,7 @@ rather than failing on the first request.
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
@@ -32,6 +33,8 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from gateway.cost.config import CostConfig
+from gateway.cost.pricing import PriceCatalog
 from gateway.errors import ConfigurationError
 from gateway.schemas.completions import MAX_OUTPUT_TOKENS
 
@@ -65,6 +68,7 @@ class Settings(BaseSettings):
     # May embed a password, so it is held as a secret and never logged.
     redis_url: SecretStr | None = None
     redis_ca_file: Path | None = None
+    database_url: SecretStr | None = None
 
     @field_validator("api_keys", mode="before")
     @classmethod
@@ -305,6 +309,7 @@ class GatewayConfig(BaseModel):
     models: dict[ModelAlias, ModelConfig] = Field(min_length=1)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     admission: AdmissionConfig = Field(default_factory=AdmissionConfig)
+    cost: CostConfig = Field(default_factory=CostConfig)
 
     @model_validator(mode="after")
     def _check_model_providers(self) -> "GatewayConfig":
@@ -312,6 +317,20 @@ class GatewayConfig(BaseModel):
             for provider in [model.provider, *(target.provider for target in model.fallbacks)]:
                 if provider not in self.providers:
                     raise ValueError(f"model {alias!r} references unknown provider {provider!r}")
+        if self.cost.enabled:
+            catalog = PriceCatalog(self.cost.pricing)
+            for alias, model in self.models.items():
+                if model.default_max_tokens is None and model.max_output_tokens is None:
+                    raise ValueError(f"model {alias!r} needs an output bound for cost accounting")
+                for provider, upstream_model in [
+                    (model.provider, model.model),
+                    *((target.provider, target.model) for target in model.fallbacks),
+                ]:
+                    if not catalog.has_model(provider, upstream_model):
+                        raise ValueError(
+                            f"model {alias!r} has no price for {provider}/{upstream_model}"
+                        )
+                    catalog.select(provider, upstream_model, datetime.now(UTC))
         return self
 
 
@@ -328,6 +347,8 @@ def load_config(settings: Settings, environ: Mapping[str, str]) -> LoadedConfig:
         _check_production_transport(gateway)
     if gateway.admission.enabled:
         require_redis_url(settings)
+    if gateway.cost.enabled and settings.database_url is None:
+        raise ConfigurationError("cost accounting is enabled but GATEWAY_DATABASE_URL is not set")
     return LoadedConfig(gateway=gateway, provider_api_keys=_resolve_api_keys(gateway, environ))
 
 
