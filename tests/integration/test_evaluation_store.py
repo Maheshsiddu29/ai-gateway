@@ -225,3 +225,25 @@ async def test_database_rejects_negative_latency(engine: AsyncEngine) -> None:
 
     with pytest.raises(IntegrityError, match="evaluation_measurements_nonnegative"):
         await record_run(engine, bad)
+
+
+async def test_a_failure_while_storing_cases_leaves_nothing_behind(engine: AsyncEngine) -> None:
+    run = await simulated_run()
+    # The run row is valid; a case row violates a constraint after it is inserted.
+    broken = dataclasses.replace(
+        run, results=(dataclasses.replace(run.results[0], score=2.0), *run.results[1:])
+    )
+
+    with pytest.raises(IntegrityError, match="evaluation_case_score_bounded"):
+        await record_run(engine, broken)
+
+    async with engine.connect() as connection:
+        runs = (
+            await connection.execute(
+                text("SELECT COUNT(*) FROM evaluation_runs WHERE run_id=:id"),
+                {"id": run.identity.run_id},
+            )
+        ).scalar_one()
+    assert (runs, await case_rows(engine, run)) == (0, 0)
+    # The rollback left no digest behind, so the intact file can still be recorded.
+    assert await record_run(engine, run) is True

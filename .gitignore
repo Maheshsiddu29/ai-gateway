@@ -29,3 +29,6 @@ config/gateway.toml
 
 # Evaluation results written by python -m gateway.evaluation run
 /results/
+
+# Raw benchmark output (summaries are recorded in docs/benchmarks.md)
+/benchmark-results/

@@ -302,6 +302,10 @@ run.
 
 ### Simulated policy comparison
 
+These Phase 4 commands predate holdout partitions and compare in-sample. The
+Phase 5 section below repeats the comparison with development evidence and a
+holdout workload.
+
 The commands below exercise the evaluation and experiment tooling with
 `SimulatedProvider`. The prices in `evaluations/experiments/ticket-routing.toml`
 are fictional. The accuracies are inputs to the simulation, not measurements.
@@ -344,3 +348,143 @@ measured cost or quality comparison for any vendor model. To produce one, run
 dataset versions (one as evidence, one as workload). Then publish the dataset,
 sample size, model IDs, prices and their dates, and the run dates with the
 results.
+
+## Phase 5 measurements (2026-11-01)
+
+Same machine and Docker Desktop as above. Raw output was written to the
+untracked `benchmark-results/` directory. The gateway code measured is commit
+`c919a58` (the metrics credential change); later commits change tests,
+documentation, and tools only.
+
+### Routing decision overhead
+
+`uv run python tools/bench_routing.py --iterations 20000`, in process with an
+instant provider, no Redis or PostgreSQL:
+
+| Candidates | `Router.decide`, lowest_cost p50 / p99 | quality_constrained p50 / p99 | Allocation per decision |
+| --- | --- | --- | --- |
+| 2 | 5.8 / 6.1 µs | 9.3 / 10.6 µs | 1,168 / 1,488 B |
+| 4 | 9.8 / 10.2 µs | 15.2 / 15.6 µs | 1,680 / 2,000 B |
+| 8 | 18.1 / 20.6 µs | 27.2 / 29.0 µs | 2,832 / 3,152 B |
+
+`CompletionService.complete` took 10.7 µs at p50 for a fixed alias, 26.8 µs for
+lowest_cost and 31.7 µs for quality_constrained with two candidates, and 49.9 µs
+and 62.6 µs with eight. The difference covers adapter validation, the decision,
+and building per-candidate requests. It is planning time on one event loop, not
+end-to-end latency.
+
+### Evaluation tooling
+
+`uv run python tools/bench_evaluation.py --repeat 20 --database-url <throwaway> --runs 500`,
+with `SimulatedProvider` and a PostgreSQL 16.10 container on the same machine:
+
+| Measurement | Result |
+| --- | --- |
+| Runner, 60 holdout cases, concurrency 16, no journal | 0.72 ms per run (81,000 cases/s) |
+| Runner with the synced journal (two fsynced lines per case) | 4.5 ms per run (13,000 cases/s) |
+| `score_output`, exact_label / field_f1 | 531,000 / 112,000 scores/s |
+| `routing_experiment.compare`, 3 targets x 60 cases | 4.5 ms p50, 5.0 ms p95 |
+| `record_run`, 60 cases, 500 runs | 4.3 ms p50, 4.7 ms p95 |
+| Re-recording an identical run (idempotent no-op) | 1.9 ms p50 |
+| `load_evidence` with 501 runs in the table | 0.97 ms p50, 1.1 ms p95 |
+
+The journal costs about 60 µs per case on this machine's SSD, small next to any
+real provider call. These figures are for the tooling. A live evaluation's
+duration is set by provider latency and the chosen concurrency.
+
+### Gateway latency and memory through Compose
+
+`docker compose --profile multi up --build --wait`: two gateways, Redis,
+PostgreSQL, and the mock provider without response delay. Admission control,
+cost accounting, and routing were enabled. Redis was restarted before each
+scenario. Requests were non-streaming with `max_tokens = 64` and round-robin
+across both gateways (`tools/loadtest.py`). `fast` is a fixed alias, `routed`
+picks `mock-routed-small` by `lowest_cost`, and `routed-quality` has no evidence
+and falls back to its primary (logged as not quality-verified).
+
+| Scenario | Requests, concurrency | Throughput | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- | --- |
+| Mock directly (baseline) | 500, 4 | 1,536 req/s | 1.9 ms | 2.5 ms | 10.0 ms |
+| fast | 500, 4 (two runs) | 217, 226 req/s | 17.4, 17.1 ms | 22.5, 21.1 ms | 27.3, 24.9 ms |
+| routed | 500, 4 (two runs) | 214, 222 req/s | 17.7, 17.4 ms | 22.8, 21.2 ms | 26.1, 24.2 ms |
+| routed-quality | 500, 4 (two runs) | 216, 210 req/s | 17.4, 17.6 ms | 24.1, 24.1 ms | 32.0, 50.8 ms |
+| fast | 1000, 20 | 213 req/s | 77.5 ms | 199.6 ms | 271.7 ms |
+| routed | 1000, 20 | 214 req/s | 80.8 ms | 192.5 ms | 265.9 ms |
+| routed-quality | 1000, 20 | 215 req/s | 80.0 ms | 202.7 ms | 286.7 ms |
+| fast, streaming | 500, 4 | 9.8 req/s | 405 ms | 426 ms | 475 ms |
+
+All 6,500 requests returned 200. At concurrency 4, the p50 differences between
+policies (up to 0.6 ms) are smaller than the variation between repeated runs of
+the same alias. The p99 values come from only 500 samples each and vary between
+runs (32.0 and 50.8 ms for the same scenario). The streaming row is limited by
+the mock's 50 ms delay between streamed words, not by the gateway. As in earlier
+phases, the client, Docker Desktop port forwarding, and the single-process mock
+bound throughput at higher concurrency.
+
+Gateway container memory (`docker stats --no-stream`, sampled five times per
+scenario) was 72.0 MiB per container after startup and rose steadily to 81.3 MiB
+by the end of the session. The runs were too short to tell warm-up (connection
+pools, metric series, allocator growth) from slow growth. A longer soak test
+would be needed to rule out a leak.
+
+### Simulated holdout comparison
+
+Development runs as evidence and holdout runs as the workload, with
+`SimulatedProvider` and the fictional prices in
+`evaluations/experiments/ticket-routing.toml`. The accuracies are inputs to the
+simulation. **These numbers show what the tools report. They are not evidence
+of savings or quality for any real model.**
+
+```sh
+C=evaluations/experiments/ticket-routing.toml
+for part in "" "-holdout"; do
+  uv run python -m gateway.evaluation run --config $C \
+    --dataset evaluations/datasets/support-ticket-category-v1$part.jsonl \
+    --target sim/small --target sim/medium --target sim/large --max-tokens 8 \
+    --output results/tickets$part \
+    --simulate sim/small=0.80 --simulate sim/medium=0.93 --simulate sim/large=0.98
+done
+uv run python tools/routing_experiment.py --config $C --alias classify \
+  --evidence-dataset evaluations/datasets/support-ticket-category-v1.jsonl \
+  --evidence results/tickets/*.json \
+  --dataset evaluations/datasets/support-ticket-category-v1-holdout.jsonl \
+  --results results/tickets-holdout/*.json --allow-simulated
+```
+
+The invoice rows use the same commands with `invoice-fields`, `--max-tokens 128`,
+and `--alias extract`. Thresholds: `min_success_rate = 0.75` at the Wilson lower
+bound, `min_samples = 40`. The simulation is deterministic, so the commands
+reproduce these figures.
+
+| Task (holdout cases) | Policy | Routed to | Success (95% CI) | Difference from fixed (95% CI) | Threshold | Cost | Savings |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| tickets (60) | fixed | sim/large | 0.950 (0.863–0.983) | baseline | passes | 47,481 µUSD | baseline |
+| | lowest_cost | sim/small | 0.783 (0.664–0.869) | −0.167 (−0.281 to −0.041) | inconclusive | 1,566 µUSD | 96.70% |
+| | quality_constrained | sim/medium | 0.900 (0.799–0.953) | −0.050 (−0.153 to +0.056) | passes | 7,837 µUSD | 83.49% |
+| invoices (40) | fixed | sim/large | 0.975 (0.871–0.996) | baseline | passes | 48,627 µUSD | baseline |
+| | lowest_cost | sim/small | 0.825 (0.681–0.913) | −0.150 (−0.284 to −0.002) | inconclusive | 1,445 µUSD | 97.03% |
+| | quality_constrained | sim/large | 0.975 (0.871–0.996) | +0.000 (−0.066 to +0.066) | passes | 48,627 µUSD | 0.00% |
+
+What the rows show about the tooling:
+
+- On tickets, quality-constrained routing chose `sim/medium` from development
+  evidence (43/44). On the holdout it passed 54/60, and its lower bound of 0.799
+  clears 0.75. The interval for its difference from the fixed model runs from
+  −0.153 to +0.056, so 60 cases cannot show the two are equivalent.
+- `lowest_cost` is significantly worse than fixed on both tasks (both upper
+  bounds below zero). Its threshold verdict is `inconclusive` because its point
+  rate clears 0.75 and its lower bound does not.
+- On invoices, `sim/medium` passed 35/40 in development (lower bound 0.739), so
+  quality-constrained routing stayed on the expensive model and saved nothing,
+  even though `sim/medium` would have passed 38/40 on the holdout.
+
+### Pending: real-provider comparison
+
+No real-provider evaluation has been run for this repository. Live cost,
+quality, and latency comparisons stay pending until the owner approves paid runs.
+The procedure is: development and holdout runs for each candidate with
+`--live`, review of the printed plan, `--approve`, `record` for the development
+runs, and `tools/routing_experiment.py` on the holdout runs (see
+[evaluation.md](evaluation.md)). Publish the model IDs, prices and their dates,
+run dates, and sample sizes with any result.
+

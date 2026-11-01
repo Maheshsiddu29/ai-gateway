@@ -12,7 +12,7 @@
 | `gateway.api.encoding`, `gateway.api.errors` | OpenAI-format response and error bodies. |
 | `gateway.services.completion` | Request planning (alias, fallbacks or routing, output ceiling, validation), admission and settlement, completion log event. |
 | `gateway.routing.*` | Capability registry and routing configuration, cost estimates, evaluation evidence snapshot, and the routing decision. |
-| `gateway.evaluation.*` | Offline evaluation: datasets, scorers, runner, simulated provider, PostgreSQL recording, and the `python -m gateway.evaluation` CLI. Not used on the request path. |
+| `gateway.evaluation.*` | Offline evaluation: partitioned datasets, scorers, runner, live-run plans and cost ceiling, progress journal, simulated provider, PostgreSQL recording, and the `python -m gateway.evaluation` CLI. The request path loads only datasets, scorers, and statistics (through `gateway.routing.evidence`); a test enforces that the runner, plan, and CLI stay unloaded. |
 | `gateway.services.execution` | Provider attempts: retries, circuit breakers, fallback, per-attempt usage. |
 | `gateway.admission.*` | Per-key limits, token estimation, the Redis scripts, failure policy, and usage accounting. |
 | `gateway.cost.*` | Versioned pricing, PostgreSQL ledger, per-attempt reservations and spending budgets. |

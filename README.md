@@ -192,6 +192,7 @@ recorded results.
 | [docs/admission-control.md](docs/admission-control.md), [docs/resilience.md](docs/resilience.md) | Limits, deadlines, retries, circuit breakers, fallback. |
 | [docs/cost-accounting.md](docs/cost-accounting.md), [docs/budget-enforcement.md](docs/budget-enforcement.md) | Ledger semantics and spending admission. |
 | [docs/routing.md](docs/routing.md), [docs/evaluation.md](docs/evaluation.md) | Routing policies, evaluation datasets, live-run safeguards, comparisons. |
+| [docs/security.md](docs/security.md) | Trust boundaries, controls, database roles, and open risks. |
 | [docs/benchmarks.md](docs/benchmarks.md) | Measurements and how to reproduce them. |
 | [docs/adr/](docs/adr/) | Design decisions. |
 
