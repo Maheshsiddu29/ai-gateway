@@ -103,7 +103,7 @@ class DecisionReason(StrEnum):
     LOWEST_COST = "lowest_cost"
     QUALIFIED_LOWEST_COST = "qualified_lowest_cost"
     # Quality-constrained, nothing qualified, and the policy sends such requests
-    # to the alias's primary model.
+    # to the alias's primary model. The primary's quality was not verified.
     NO_QUALIFIED_CANDIDATE = "no_qualified_candidate"
 
 
@@ -146,6 +146,12 @@ class RoutingDecision:
     @property
     def selected(self) -> CandidateFacts:
         return self.selection.chain[0]
+
+    @property
+    def quality_verified(self) -> bool:
+        """The selected model passed the alias's quality rules. False for
+        lowest_cost and for a primary used because no candidate qualified."""
+        return self.selection.reason is DecisionReason.QUALIFIED_LOWEST_COST
 
 
 def select(
@@ -207,16 +213,17 @@ def _exclusion(
     if not candidate.available:
         return Exclusion.CIRCUIT_OPEN
     if rules is not None:
-        return _quality_exclusion(rules, candidate.evidence, profile, now)
+        return quality_exclusion(rules, candidate.evidence, profile.output_allowance, now)
     return None
 
 
-def _quality_exclusion(
-    rules: QualityRules, evidence: Evidence | None, profile: RequestProfile, now: datetime
+def quality_exclusion(
+    rules: QualityRules, evidence: Evidence | None, output_allowance: int, now: datetime
 ) -> Exclusion | None:
+    """Why ``evidence`` does not qualify a model under ``rules``, or None if it does."""
     if evidence is None:
         return Exclusion.NO_EVIDENCE
-    if evidence.max_output_tokens > profile.output_allowance:
+    if evidence.max_output_tokens > output_allowance:
         return Exclusion.EVIDENCE_OUTPUT_LIMIT
     if evidence.completed_at > now:
         return Exclusion.INVALID_EVIDENCE_TIME

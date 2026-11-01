@@ -352,8 +352,13 @@ async def test_capability_requirements_filter_candidates(redis_server: RedisServ
     assert providers[names.cheap].requests[0].stop == ("\n",)
 
 
+def completion_fields(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
+    [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]
+    return vars(record)
+
+
 async def test_quality_constrained_routing_uses_recorded_evidence(
-    redis_server: RedisServer,
+    redis_server: RedisServer, caplog: pytest.LogCaptureFixture
 ) -> None:
     names = Names.random()
     await record_measured_evidence(names.cheap, "small", 1.0)
@@ -361,21 +366,31 @@ async def test_quality_constrained_routing_uses_recorded_evidence(
         names.cheap: ok_provider(names.cheap),
         names.premium: ok_provider(names.premium),
     }
+    caplog.set_level(logging.INFO, logger="gateway.services.completion")
     async with routed_gateway(redis_server.url, raw_config(names), names, providers) as gateway:
         response = await gateway.post("quality")
 
     assert response.status_code == 200
     assert len(providers[names.cheap].requests) == 1
+    fields = completion_fields(caplog)
+    assert fields["routing_reason"] == "qualified_lowest_cost"
+    assert fields["routing_quality_verified"] is True
+    assert "routing_evidence_run_id" in fields
+    assert "routing_primary_exclusion" not in fields
 
 
-async def test_failing_evidence_keeps_requests_on_the_primary(redis_server: RedisServer) -> None:
+async def test_failing_evidence_keeps_requests_on_the_primary(
+    redis_server: RedisServer, caplog: pytest.LogCaptureFixture
+) -> None:
     names = Names.random()
     # About 0.7 accuracy is below the 0.85 lower-bound threshold.
     await record_measured_evidence(names.cheap, "small", 0.7)
+    await record_measured_evidence(names.premium, "large", 0.7)
     providers = {
         names.cheap: ok_provider(names.cheap),
         names.premium: ok_provider(names.premium),
     }
+    caplog.set_level(logging.INFO, logger="gateway.services.completion")
     async with routed_gateway(redis_server.url, raw_config(names), names, providers) as gateway:
         response = await gateway.post("quality")
         [row] = await gateway.ledger()
@@ -383,6 +398,13 @@ async def test_failing_evidence_keeps_requests_on_the_primary(redis_server: Redi
     assert response.status_code == 200
     assert row["provider"] == names.premium
     assert providers[names.cheap].requests == []
+    # The primary serves the request without being presented as qualified: its own
+    # failing run is reported as the reason, not as supporting evidence.
+    fields = completion_fields(caplog)
+    assert fields["routing_reason"] == "no_qualified_candidate"
+    assert fields["routing_quality_verified"] is False
+    assert fields["routing_primary_exclusion"] == "below_quality"
+    assert "routing_evidence_run_id" not in fields
 
 
 async def test_insufficient_evidence_can_reject_before_any_reservation(
@@ -740,10 +762,10 @@ async def test_completion_log_records_the_decision_without_content(
         assert (await gateway.post()).status_code == 200
         [row] = await gateway.ledger()
 
-    [record] = [r for r in caplog.records if r.getMessage() == "completion finished"]
-    fields = vars(record)
+    fields = completion_fields(caplog)
     assert fields["routing_policy"] == "lowest_cost"
     assert fields["routing_reason"] == "lowest_cost"
+    assert fields["routing_quality_verified"] is False
     assert fields["provider"] == names.cheap
     assert fields["upstream_model"] == "small"
     assert fields["routing_chain"] == [f"{names.cheap}/small", f"{names.premium}/large"]

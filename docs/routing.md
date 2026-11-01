@@ -24,14 +24,29 @@ every routed attempt must be reserved against budgets at its own price.
 ### When nothing qualifies
 
 For `quality_constrained`, `on_insufficient_evidence` decides what happens when no
-candidate passes the rules:
+candidate passes the rules. The operator chooses between availability and a
+quality guarantee:
 
-- `primary` (default): use the alias's primary model, as `fixed` would. The log
-  records `routing_reason = no_qualified_candidate` and why each candidate was
-  excluded. This keeps the alias available when evidence is missing, stale, or
-  failing. It does not claim the primary is qualified.
-- `reject`: refuse with 502 `provider_unavailable` / `no_eligible_route` before any
-  budget reservation or provider call.
+| Setting | Behaviour | Quality claim |
+| --- | --- | --- |
+| `primary` (default) | Use the alias's primary model, the operator-approved baseline that `fixed` would use. | None. The primary is used even if its own evidence is missing, stale, or failing. |
+| `reject` | Refuse with 502 `provider_unavailable` / `no_eligible_route`, before any budget reservation or provider call. | Every served request went to a qualified model. |
+
+`primary` keeps the alias available. It is a permissive fallback, and the
+gateway identifies it as one in every place a decision is recorded:
+
+- the completion log has `routing_reason = no_qualified_candidate`,
+  `routing_quality_verified = false`, and `routing_primary_exclusion` with the
+  reason the primary itself did not qualify (for example `no_evidence` or
+  `below_quality`). It does not log `routing_evidence_run_id`, so a failing run
+  is never presented as supporting evidence;
+- `gateway_routing_decisions_total` counts these decisions under
+  `reason="no_qualified_candidate"`;
+- the routing experiment reports them as `unverified_fallbacks`.
+
+Choose `reject` when serving an unverified answer is worse than serving none. Use
+`python -m gateway.evaluation status` to see which candidates qualify before
+switching.
 
 The primary is used only if it can run the request (see capability filtering). If
 it cannot, the request fails the same way as under `reject`.
@@ -163,8 +178,9 @@ rows are never re-priced.
 ## Quality evidence
 
 Evidence is the latest evaluation run recorded in PostgreSQL for the candidate's
-provider and model on the alias's `dataset` and `dataset_version`. Only runs that
-were not simulated and were scored by the current evaluator version count. See
+provider and model on the alias's `dataset` and `dataset_version`. Only complete,
+non-simulated runs on a development partition, scored by the current evaluator
+version, count. Holdout runs are never evidence. See
 [evaluation.md](evaluation.md) for how runs are produced.
 
 For a run to qualify it must:
@@ -233,12 +249,14 @@ other eligible candidates.
 
 The `completion finished` log event gains these fields for every alias:
 `routing_policy`, `cost_request_id`, and `upstream_model` (the model of the last
-attempt). Routed requests also get `routing_reason`, `routing_policy_version`,
+attempt). Routed requests also get `routing_reason`, `routing_quality_verified` (true only
+when the selected model passed the alias's quality rules), `routing_policy_version`,
 `routing_evidence_version`, `routing_candidates`, `routing_eligible`,
 `routing_exclusions` (`provider/model:reason`, at most eight),
 `routing_chain`, `routing_pricing_version`, `routing_estimated_input_tokens`,
-`routing_maximum_micro_usd`, `routing_expected_micro_usd`, and
-`routing_evidence_run_id`. A refused routing decision logs `routing rejected` with
+`routing_maximum_micro_usd`, `routing_expected_micro_usd`, and either
+`routing_evidence_run_id` (the qualifying run) or `routing_primary_exclusion`
+(for an unverified primary fallback). A refused routing decision logs `routing rejected` with
 the alias, policy, and error code. No prompt or output text is logged.
 
 Prometheus metrics, labelled only by configured aliases and providers and by

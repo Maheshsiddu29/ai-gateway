@@ -113,7 +113,16 @@ uv run --env-file .env python -m gateway.evaluation run ... --approve <plan sha2
 # Store results as routing evidence.
 GATEWAY_DATABASE_URL=postgresql+asyncpg://... \
   uv run python -m gateway.evaluation record results/*.json
+
+# Show which candidates of each quality-constrained alias qualify now.
+GATEWAY_DATABASE_URL=postgresql+asyncpg://... \
+  uv run python -m gateway.evaluation status --config config/gateway.toml
 ```
+
+`status` loads evidence the way the gateway does and applies each alias's rules
+at the current time. For every candidate it prints `qualifies` or the exclusion
+(`no_evidence`, `stale_evidence`, `insufficient_samples`, `below_quality`, ...),
+with the run ID, pass count, lower bound, and age.
 
 Use a `--max-tokens` no larger than the output allowance of the aliases that
 will rely on the run. Routing ignores a run made with a larger allowance than a

@@ -14,6 +14,9 @@ file; an interrupted run keeps its journal and is never resumed automatically.
 ``check`` verifies that a holdout partition shares its development partition's
 task definition and none of its cases.
 
+``status`` shows, for each quality-constrained alias, the evidence the gateway
+would load for each candidate and whether it qualifies now.
+
 Exit codes: 0 success, 2 invalid request or failed check, 3 live plan printed
 and awaiting approval, 4 stopped at the cost ceiling, 130 interrupted.
 """
@@ -48,6 +51,8 @@ from gateway.evaluation.simulated import SimulatedProvider
 from gateway.evaluation.store import EvaluationRecordError, record_run
 from gateway.providers.base import Provider
 from gateway.providers.factory import build_provider
+from gateway.routing.evidence import load_evidence
+from gateway.routing.router import quality_exclusion
 from gateway.schemas.completions import MAX_OUTPUT_TOKENS
 
 APPROVAL_REQUIRED = 3
@@ -66,6 +71,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return asyncio.run(_run(args))
         if args.command == "record":
             asyncio.run(_record([Path(path) for path in args.results]))
+        elif args.command == "status":
+            asyncio.run(_status(args.config))
         else:
             _check(args.development, args.holdout)
     except (
@@ -130,6 +137,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--development", type=Path, required=True, help="development JSONL")
     check.add_argument("--holdout", type=Path, required=True, help="holdout JSONL")
+    status = commands.add_parser(
+        "status", help="show which routing candidates have qualifying evidence now"
+    )
+    status.add_argument("--config", type=Path, required=True, help="gateway TOML configuration")
     return parser
 
 
@@ -309,6 +320,44 @@ async def _record(paths: list[Path]) -> None:
             print(f"{action} {identity.run_id} ({identity.provider}/{identity.model})")
     finally:
         await engine.dispose()
+
+
+async def _status(config_path: Path) -> None:
+    config = read_gateway_config(config_path)
+    url = os.environ.get("GATEWAY_DATABASE_URL")
+    if not url:
+        raise UsageError("set GATEWAY_DATABASE_URL to read routing evidence")
+    engine = create_async_engine(url)
+    try:
+        snapshot = await load_evidence(engine)
+    finally:
+        await engine.dispose()
+    now = datetime.now(UTC)
+    if not config.routing.enabled:
+        print("routing is disabled ([routing] enabled = false): every alias uses its primary")
+    for alias, model in config.models.items():
+        rules = model.routing.quality_rules()
+        allowance = model.output_allowance
+        if rules is None or allowance is None:
+            continue
+        print(
+            f"{alias}: {rules.dataset} v{rules.dataset_version}, lower bound >="
+            f" {rules.min_success_rate}, at least {rules.min_samples} cases, at most"
+            f" {rules.max_evidence_age.days} days old; when nothing qualifies:"
+            f" {model.routing.on_insufficient_evidence.value}"
+        )
+        for provider, upstream in model.route_targets():
+            evidence = snapshot.runs.get((provider, upstream, rules.dataset, rules.dataset_version))
+            exclusion = quality_exclusion(rules, evidence, allowance, now)
+            detail = (
+                "no development run recorded"
+                if evidence is None
+                else f"run {evidence.run_id}, {evidence.passed_count}/{evidence.case_count} passed"
+                f" (lower bound {evidence.success_rate_low:.3f}),"
+                f" {(now - evidence.completed_at).days} days old"
+            )
+            verdict = "qualifies" if exclusion is None else exclusion.value
+            print(f"  {provider}/{upstream}: {verdict}; {detail}")
 
 
 def _check(development_path: Path, holdout_path: Path) -> None:

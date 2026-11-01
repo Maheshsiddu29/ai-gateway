@@ -52,6 +52,7 @@ from gateway.providers.base import (
 from gateway.resilience.deadline import Deadline
 from gateway.routing.config import RoutingPolicy
 from gateway.routing.router import (
+    DecisionReason,
     RequestProfile,
     Router,
     RoutingDecision,
@@ -463,6 +464,7 @@ def _routing_fields(plan: _Plan) -> dict[str, object]:
     selected = decision.selected
     fields: dict[str, object] = {
         "routing_reason": selection.reason.value,
+        "routing_quality_verified": decision.quality_verified,
         "routing_policy_version": decision.policy_version,
         "routing_evidence_version": decision.evidence_version,
         "routing_candidates": decision.candidate_count,
@@ -479,6 +481,9 @@ def _routing_fields(plan: _Plan) -> dict[str, object]:
         fields["routing_estimated_input_tokens"] = selected.estimate.estimated_input_tokens
         fields["routing_maximum_micro_usd"] = selected.estimate.maximum_micro_usd
         fields["routing_expected_micro_usd"] = selected.estimate.expected_micro_usd
-    if selected.evidence is not None:
+    if decision.quality_verified and selected.evidence is not None:
         fields["routing_evidence_run_id"] = str(selected.evidence.run_id)
+    elif selection.reason is DecisionReason.NO_QUALIFIED_CANDIDATE:
+        # Why the primary itself did not qualify; its evidence, if any, failed.
+        fields["routing_primary_exclusion"] = dict(selection.exclusions)[selected.target].value
     return fields
