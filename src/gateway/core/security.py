@@ -34,9 +34,9 @@ def _digest(value: str) -> bytes:
 
 
 class StaticKeyAuthenticator:
-    def __init__(self, api_keys: Iterable[SecretStr]) -> None:
+    def __init__(self, api_keys: Iterable[SecretStr], id_prefix: str = "key") -> None:
         self._entries = [
-            (digest, Principal(id=f"key-{digest.hex()[:12]}"))
+            (digest, Principal(id=f"{id_prefix}-{digest.hex()[:12]}"))
             for digest in (_digest(key.get_secret_value()) for key in api_keys)
         ]
 

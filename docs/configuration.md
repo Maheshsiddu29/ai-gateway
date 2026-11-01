@@ -17,6 +17,7 @@ Configuration is read once. Changes require a restart.
 | `GATEWAY_API_KEYS` | required | Comma-separated keys accepted in `Authorization: Bearer`. Whitespace around keys is ignored. At least one key is required. |
 | `GATEWAY_ENVIRONMENT` | `production` | `production` or `development`. See [Production checks](#production-checks). |
 | `GATEWAY_CONFIG_FILE` | `config/gateway.toml` | Path to the provider configuration file, relative to the working directory or absolute. The container image sets `/etc/gateway/gateway.toml`. |
+| `GATEWAY_METRICS_API_KEYS` | none | Comma-separated credentials for `GET /metrics` only. They must differ from every gateway key and are held to the same production length rule. Without one, `/metrics` refuses every request. See [Metrics access](#metrics-access). |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. The httpx and httpcore loggers stay at `WARNING` regardless. |
 | `GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Maximum request body size in bytes, from 1024 to 67108864. Larger bodies receive 413. |
 | `GATEWAY_REDIS_CA_FILE` | system trust store | Optional PEM CA file for Redis TLS. Certificates and hostnames are always verified. |
@@ -34,6 +35,33 @@ openssl rand -hex 32
 
 To rotate keys without rejecting clients, list both the old and new key, restart,
 move clients to the new key, then remove the old one and restart again.
+
+### Metrics access
+
+`GET /metrics` accepts only a key from `GATEWAY_METRICS_API_KEYS`, sent as
+`Authorization: Bearer <key>`. Gateway API keys grant inference and usage access
+and are refused by `/metrics` with 401. A metrics key is refused by every other
+authenticated endpoint. With no metrics key configured, the gateway logs a
+warning at startup and `/metrics` answers 401 to every request. Keys are compared
+as SHA-256 digests in constant time, never logged, and access logs record only
+the non-secret fingerprint `metrics-<12 hex>`. The metrics carry no per-key
+labels. Health endpoints stay unauthenticated.
+
+A Prometheus scrape configuration reads the key from a file:
+
+```yaml
+scrape_configs:
+  - job_name: ai-gateway
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/gateway-metrics-key
+    static_configs:
+      - targets: ["gateway:8000"]
+```
+
+Rotate metrics keys like gateway keys: list both, restart, update the scraper,
+remove the old key, restart.
 
 ## Configuration file
 
@@ -245,9 +273,15 @@ Production Redis TCP URLs must now use `rediss://`; use `GATEWAY_REDIS_CA_FILE`
 for a private certificate authority. The local Compose stack uses development mode
 on an internal network. Redis URL query options are intentionally unsupported.
 
-`GET /metrics` now requires a gateway Bearer API key. Configure the scraper's
-authorization header; health endpoints remain public. Every configured gateway
-key can read aggregate metrics; metrics have no per-key labels.
+`GET /metrics` required a gateway Bearer API key in this revision. Phase 5
+replaced that with a separate metrics credential; see below.
+
+### Metrics credential migration (Phase 5)
+
+`GET /metrics` no longer accepts gateway API keys, so any client could otherwise
+read aggregate traffic, error, and spending-related counters. Before upgrading,
+generate a key (`openssl rand -hex 32`), set it in `GATEWAY_METRICS_API_KEYS`, and
+switch the scraper's bearer credential to it. Until then, scrapes receive 401.
 
 ## Cost accounting and spending budgets
 

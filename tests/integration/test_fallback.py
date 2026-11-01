@@ -14,6 +14,7 @@ from gateway.main import build_app
 from gateway.providers.factory import build_provider
 from tests.fakes import (
     AUTH_HEADERS,
+    METRICS_HEADERS,
     SSE_HEADERS,
     ControlledStream,
     UpstreamStub,
@@ -135,7 +136,7 @@ class TestNonStreaming:
 
         async with gateway(hosts) as (client, stub):
             response = await post(client)
-            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
+            metrics = (await client.get("/metrics", headers=METRICS_HEADERS)).text
 
         assert response.status_code == 200
         assert response.json()["model"] == "fast"

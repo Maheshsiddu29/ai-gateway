@@ -25,6 +25,7 @@ from gateway.schemas.completions import ChatMessage
 from gateway.services.execution import Candidate, ProviderExecutor
 from tests.fakes import (
     AUTH_HEADERS,
+    METRICS_HEADERS,
     SSE_HEADERS,
     ControlledStream,
     FakeProvider,
@@ -123,7 +124,7 @@ class TestRetries:
     async def test_transient_failure_then_success(self, failure: Outcome) -> None:
         async with gateway(sequence(failure, ok("recovered"))) as (client, stub):
             response = await post(client)
-            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
+            metrics = (await client.get("/metrics", headers=METRICS_HEADERS)).text
 
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["content"] == "recovered"
@@ -253,7 +254,7 @@ class TestCircuitBreaker:
             await asyncio.sleep(0.15)
             probe = await post(client)
             after = await post(client)
-            metrics = (await client.get("/metrics", headers=AUTH_HEADERS)).text
+            metrics = (await client.get("/metrics", headers=METRICS_HEADERS)).text
 
         assert failures == [502, 502]
         assert refused.status_code == 502

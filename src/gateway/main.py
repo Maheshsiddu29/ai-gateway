@@ -112,6 +112,11 @@ def build_app(
     )
     app.state.settings = settings
     app.state.authenticator = StaticKeyAuthenticator(settings.api_keys)
+    app.state.metrics_authenticator = StaticKeyAuthenticator(
+        settings.metrics_api_keys, id_prefix="metrics"
+    )
+    if not settings.metrics_api_keys:
+        logger.warning("GET /metrics refuses every request: GATEWAY_METRICS_API_KEYS is not set")
     app.state.completion_service = None
     app.state.admission = None
     app.state.cost_store = None

@@ -91,6 +91,39 @@ class TestSettings:
 
         assert Settings().environment is Environment.DEVELOPMENT
 
+    def test_metrics_keys_are_separate_from_gateway_keys(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        metrics_key = "m" * 40
+        monkeypatch.setenv("GATEWAY_API_KEYS", LONG_KEY)
+        monkeypatch.setenv("GATEWAY_METRICS_API_KEYS", f" {metrics_key} , ")
+
+        settings = Settings()
+
+        assert [key.get_secret_value() for key in settings.metrics_api_keys] == [metrics_key]
+        monkeypatch.delenv("GATEWAY_METRICS_API_KEYS")
+        assert Settings().metrics_api_keys == ()
+
+    def test_a_metrics_key_cannot_reuse_a_gateway_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GATEWAY_API_KEYS", LONG_KEY)
+        monkeypatch.setenv("GATEWAY_METRICS_API_KEYS", LONG_KEY)
+
+        with pytest.raises(ValidationError, match="must differ") as exc_info:
+            Settings()
+        assert LONG_KEY not in str(exc_info.value)
+
+    def test_short_metrics_keys_are_rejected_in_production(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GATEWAY_API_KEYS", LONG_KEY)
+        monkeypatch.setenv("GATEWAY_METRICS_API_KEYS", "short-metrics")
+
+        with pytest.raises(ValidationError) as exc_info:
+            Settings()
+        assert "short-metrics" not in str(exc_info.value)
+
     def test_api_keys_are_masked_in_repr(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("GATEWAY_API_KEYS", LONG_KEY)
 

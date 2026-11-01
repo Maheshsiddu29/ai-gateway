@@ -37,13 +37,21 @@ async def get_completion_service(request: Request) -> CompletionService:
 
 
 async def require_principal(request: Request) -> Principal:
+    return _authenticate(request, request.app.state.authenticator)
+
+
+async def require_metrics_reader(request: Request) -> Principal:
+    """A caller holding a metrics credential; gateway API keys are not accepted."""
+    return _authenticate(request, request.app.state.metrics_authenticator)
+
+
+def _authenticate(request: Request, authenticator: Authenticator) -> Principal:
     token = parse_bearer_token(request.headers.get("authorization"))
     if token is None:
         raise AuthenticationError(
             "Missing or malformed Authorization header; expected a Bearer token.",
             code="missing_api_key",
         )
-    authenticator: Authenticator = request.app.state.authenticator
     principal = authenticator.authenticate(token)
     if principal is None:
         raise AuthenticationError("Invalid API key.")
@@ -127,5 +135,6 @@ def _validation_error(exc: ValidationError) -> GatewayError:
 
 DeadlineDep = Annotated[Deadline, Depends(start_deadline)]
 PrincipalDep = Annotated[Principal, Depends(require_principal)]
+MetricsReaderDep = Annotated[Principal, Depends(require_metrics_reader)]
 CompletionRequestDep = Annotated[ChatCompletionRequest, Depends(read_completion_request)]
 CompletionServiceDep = Annotated[CompletionService, Depends(get_completion_service)]

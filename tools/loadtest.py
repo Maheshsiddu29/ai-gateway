@@ -3,13 +3,13 @@
 Sends a fixed number of chat completion requests with bounded concurrency,
 round-robin across the given base URLs, and reports status counts, throughput, and
 latency percentiles. With --mock-url it also reports the mock provider's peak
-concurrency per model; with --metrics it prints the gateways' admission counters.
+concurrency per model; with --metrics-key it prints the gateways' admission counters.
 
 Example, against two gateways started with `docker compose --profile multi up`:
 
     uv run python tools/loadtest.py --url http://127.0.0.1:8000 --url http://127.0.0.1:8001 \\
         --api-key "$GATEWAY_API_KEYS" --requests 2000 --concurrency 64 \\
-        --mock-url http://127.0.0.1:9000 --metrics
+        --mock-url http://127.0.0.1:9000 --metrics-key "$GATEWAY_METRICS_API_KEYS"
 
 Baseline without the gateway (the mock accepts any bearer token):
 
@@ -94,11 +94,11 @@ async def print_side_channels(args: argparse.Namespace) -> None:
         if args.mock_url:
             stats = (await client.get(f"{args.mock_url}/stats")).json()
             print("mock provider:", stats)
-        if args.metrics:
+        if args.metrics_key:
             for url in args.url:
                 text = (
                     await client.get(
-                        f"{url}/metrics", headers={"Authorization": f"Bearer {args.api_key}"}
+                        f"{url}/metrics", headers={"Authorization": f"Bearer {args.metrics_key}"}
                     )
                 ).text
                 lines = [line for line in text.splitlines() if line.startswith(_ADMISSION_METRICS)]
@@ -119,7 +119,11 @@ async def main() -> None:
     parser.add_argument("--timeout", type=float, default=60)
     parser.add_argument("--mock-url", help="mock provider URL, to report peak concurrency")
     parser.add_argument("--reset-mock", action="store_true", help="clear mock stats first")
-    parser.add_argument("--metrics", action="store_true", help="print gateway admission metrics")
+    parser.add_argument(
+        "--metrics-key",
+        default=os.environ.get("LOADTEST_METRICS_KEY"),
+        help="metrics credential; prints the gateways' admission metrics",
+    )
     args = parser.parse_args()
 
     if args.reset_mock and args.mock_url:

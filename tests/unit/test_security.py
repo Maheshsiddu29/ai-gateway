@@ -46,3 +46,12 @@ def test_principal_id_does_not_reveal_the_key() -> None:
 )
 def test_parse_bearer_token(header: str | None, expected: str | None) -> None:
     assert parse_bearer_token(header) == expected
+
+
+def test_principal_ids_carry_the_credential_kind() -> None:
+    principal = StaticKeyAuthenticator([SecretStr("m-key")], id_prefix="metrics").authenticate(
+        "m-key"
+    )
+
+    assert principal is not None
+    assert principal.id.startswith("metrics-")

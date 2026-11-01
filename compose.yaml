@@ -21,6 +21,8 @@ x-gateway: &gateway
   environment:
     GATEWAY_ENVIRONMENT: development
     GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:?set GATEWAY_API_KEYS in the shell or .env}
+    # Optional; without it GET /metrics refuses every request.
+    GATEWAY_METRICS_API_KEYS: ${GATEWAY_METRICS_API_KEYS:-}
     GATEWAY_LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-INFO}
     GATEWAY_REDIS_URL: redis://redis:6379/0
     GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway-local-only@postgres:5432/gateway

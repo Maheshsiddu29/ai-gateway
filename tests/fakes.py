@@ -15,13 +15,16 @@ from gateway.core.config import Environment, GatewayConfig, LoadedConfig, Settin
 from gateway.providers.base import Completion, ProviderRequest, StreamEvent
 
 GATEWAY_API_KEY = "test-gateway-key-0123456789abcdef"
+METRICS_API_KEY = "test-metrics-key-0123456789abcdef"
 FAKE_UPSTREAM_KEY = "sk-upstream-secret-value"
 AUTH_HEADERS = {"Authorization": f"Bearer {GATEWAY_API_KEY}"}
+METRICS_HEADERS = {"Authorization": f"Bearer {METRICS_API_KEY}"}
 
 
 def make_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "api_keys": (GATEWAY_API_KEY,),
+        "metrics_api_keys": (METRICS_API_KEY,),
         "environment": Environment.DEVELOPMENT,
     }
     values.update(overrides)

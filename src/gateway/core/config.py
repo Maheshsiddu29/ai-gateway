@@ -64,6 +64,9 @@ class Settings(BaseSettings):
 
     environment: Environment = Environment.PRODUCTION
     api_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(min_length=1)
+    # Credentials for GET /metrics only. Gateway API keys do not grant access, and
+    # with none configured the endpoint refuses every request.
+    metrics_api_keys: Annotated[tuple[SecretStr, ...], NoDecode] = ()
     config_file: Path = Path("config/gateway.toml")
     log_level: LogLevel = "INFO"
     max_request_bytes: int = Field(default=1_048_576, ge=1024, le=64 * 1_048_576)
@@ -72,7 +75,7 @@ class Settings(BaseSettings):
     redis_ca_file: Path | None = None
     database_url: SecretStr | None = None
 
-    @field_validator("api_keys", mode="before")
+    @field_validator("api_keys", "metrics_api_keys", mode="before")
     @classmethod
     def _split_api_keys(cls, value: object) -> object:
         if isinstance(value, str):
@@ -89,12 +92,17 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def _check_production_keys(self) -> "Settings":
         if self.environment is Environment.PRODUCTION and any(
-            len(key.get_secret_value()) < MIN_PRODUCTION_API_KEY_LENGTH for key in self.api_keys
+            len(key.get_secret_value()) < MIN_PRODUCTION_API_KEY_LENGTH
+            for key in (*self.api_keys, *self.metrics_api_keys)
         ):
             raise ValueError(
-                f"gateway API keys must be at least {MIN_PRODUCTION_API_KEY_LENGTH} characters"
-                " in production"
+                f"gateway and metrics API keys must be at least {MIN_PRODUCTION_API_KEY_LENGTH}"
+                " characters in production"
             )
+        inference = {key.get_secret_value() for key in self.api_keys}
+        if any(key.get_secret_value() in inference for key in self.metrics_api_keys):
+            # A shared key would let every holder of that inference key read metrics.
+            raise ValueError("metrics API keys must differ from gateway API keys")
         if (
             self.environment is Environment.PRODUCTION
             and self.redis_url is not None

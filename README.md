@@ -48,7 +48,7 @@ not implemented.
 - Offline evaluation tooling: versioned JSONL datasets, deterministic scorers, a
   CLI that calls real providers only when explicitly asked to, PostgreSQL storage
   of results, and an offline comparison of routing policies.
-- Prometheus metrics at `GET /metrics` (gateway Bearer key required); `GET /health/live`
+- Prometheus metrics at `GET /metrics` (separate metrics credential required); `GET /health/live`
   and `GET /health/ready` (which checks required Redis and PostgreSQL dependencies).
 
 ## Architecture
@@ -525,7 +525,7 @@ history with gitleaks.
   configuration based; changing them requires a restart.
 - Without Redis admission, there is no request, token, or concurrency limit beyond
   each provider's connection pool. PostgreSQL budgets can still be enabled.
-- Readiness does not check provider reachability. `/metrics` requires a gateway API key; health
+- Readiness does not check provider reachability. `/metrics` requires a metrics credential; health
   endpoints remain unauthenticated on the API port.
 
 ## Roadmap
