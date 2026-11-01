@@ -67,7 +67,7 @@ accounting disabled, so neither Redis nor PostgreSQL is needed:
 uv sync --locked
 sed 's#mock-upstream:9000#127.0.0.1:9000#' config/gateway.mock.toml > config/gateway.toml
 uv run uvicorn mock_upstream:app --app-dir tools --port 9000 &
-GATEWAY_ENVIRONMENT=development GATEWAY_API_KEYS=dev-key \
+GATEWAY_ENVIRONMENT=development GATEWAY_API_KEYS=dev-key MOCK_UPSTREAM_API_KEY=mock-upstream-key \
   uv run uvicorn gateway.main:create_app --factory --port 8000 --no-access-log
 ```
 
