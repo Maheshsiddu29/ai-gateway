@@ -81,6 +81,9 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="with --live: refuse to start if the worst-case estimated cost is higher",
     )
+    run.add_argument(
+        "--stream", action="store_true", help="stream each response and record time to first token"
+    )
     run.add_argument("--concurrency", type=int, default=4)
     run.add_argument("--timeout-seconds", type=float, default=60.0)
     record = commands.add_parser("record", help="store results files in PostgreSQL")
@@ -132,6 +135,10 @@ async def _run(args: argparse.Namespace) -> None:
                 max_output_tokens=args.max_tokens,
                 price=prices[(provider_name, model)],
                 simulated=not args.live,
+                stream=args.stream,
+                provider_base_url=(
+                    str(config.providers[provider_name].base_url) if args.live else None
+                ),
                 concurrency=args.concurrency,
                 call_timeout_seconds=args.timeout_seconds,
             )
@@ -156,8 +163,9 @@ async def _record(paths: list[Path]) -> None:
     engine = create_async_engine(url)
     try:
         for run in runs:
-            await record_run(engine, run)
-            print(f"recorded {run.identity.run_id} ({run.identity.provider}/{run.identity.model})")
+            action = "recorded" if await record_run(engine, run) else "already recorded"
+            identity = run.identity
+            print(f"{action} {identity.run_id} ({identity.provider}/{identity.model})")
     finally:
         await engine.dispose()
 

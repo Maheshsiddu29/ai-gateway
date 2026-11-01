@@ -17,9 +17,9 @@ from gateway.evaluation.simulated import SimulatedProvider
 from gateway.evaluation.store import record_run
 from gateway.routing.evidence import EvidenceCache, load_evidence
 
-TICKETS = (
-    Path(__file__).parents[2] / "evaluations" / "datasets" / "support-ticket-category-v1.jsonl"
-)
+DATASETS = Path(__file__).parents[2] / "evaluations" / "datasets"
+TICKETS = DATASETS / "support-ticket-category-v1.jsonl"
+TICKETS_HOLDOUT = DATASETS / "support-ticket-category-v1-holdout.jsonl"
 
 
 @pytest.fixture
@@ -41,9 +41,11 @@ async def measured_run(
     age: timedelta = timedelta(0),
     simulated: bool = False,
     evaluator_version: str | None = None,
+    dataset_path: Path = TICKETS,
+    stop_reason: str | None = None,
 ) -> EvaluationRun:
     """A run presented as a real measurement, as tests need non-simulated evidence."""
-    dataset = load_dataset(TICKETS)
+    dataset = load_dataset(dataset_path)
     run = await run_evaluation(
         SimulatedProvider(provider, dataset, {"m": accuracy}),
         "m",
@@ -60,6 +62,7 @@ async def measured_run(
             completed_at=run.identity.completed_at - age,
             simulated=simulated,
             evaluator_version=evaluator_version or run.identity.evaluator_version,
+            stop_reason=stop_reason,
         ),
     )
 
@@ -83,6 +86,28 @@ async def test_loads_the_latest_qualifying_run_per_model(engine: AsyncEngine) ->
     assert evidence.latency_samples == 44
     assert evidence.expected_output_tokens is not None
     assert snapshot.version != "empty"
+
+
+async def test_holdout_and_incomplete_runs_are_never_evidence(engine: AsyncEngine) -> None:
+    provider = f"p{uuid.uuid4().hex[:8]}"
+    development = await measured_run(provider, 0.5, age=timedelta(days=1))
+    # Newer than the development run, but never evidence.
+    recent = timedelta(seconds=1)
+    holdout = await measured_run(provider, 1.0, age=recent, dataset_path=TICKETS_HOLDOUT)
+    incomplete = await measured_run(provider, 1.0, age=recent, stop_reason="cost_ceiling")
+    for run in (development, holdout, incomplete):
+        await record_run(engine, run)
+
+    snapshot = await load_evidence(engine)
+
+    evidence = snapshot.runs[(provider, "m", "support-ticket-category", "1")]
+    assert evidence.run_id == development.identity.run_id
+    holdout_only = f"p{uuid.uuid4().hex[:8]}"
+    await record_run(
+        engine, await measured_run(holdout_only, 1.0, age=recent, dataset_path=TICKETS_HOLDOUT)
+    )
+    snapshot = await load_evidence(engine)
+    assert (holdout_only, "m", "support-ticket-category", "1") not in snapshot.runs
 
 
 async def test_failed_refresh_keeps_the_previous_snapshot(engine: AsyncEngine) -> None:

@@ -38,6 +38,12 @@ class Score:
     passed: bool
     # The output did not have the required form (an unknown label, not a JSON object).
     invalid_response: bool
+    # Field scoring only: matching (field, value) pairs, non-null predicted fields,
+    # and expected fields. They are reported for micro-averaged precision and recall
+    # and do not change the score.
+    fields_correct: int | None = None
+    fields_predicted: int | None = None
+    fields_expected: int | None = None
 
 
 def score_output(case: EvaluationCase, output: str) -> Score:
@@ -46,6 +52,13 @@ def score_output(case: EvaluationCase, output: str) -> Score:
     if isinstance(case.expected, FieldsExpectation):
         return _score_fields(case.expected, output)
     raise TypeError(f"no scorer for method {case.method}")
+
+
+def unanswered(case: EvaluationCase) -> Score:
+    """The score of a case that got no response (a provider error or timeout)."""
+    if isinstance(case.expected, FieldsExpectation):
+        return Score(0.0, False, False, 0, 0, len(case.expected.fields))
+    return Score(0.0, passed=False, invalid_response=False)
 
 
 def _normalize(text: str) -> str:
@@ -62,15 +75,16 @@ def _score_label(expected: LabelExpectation, output: str) -> Score:
 
 
 def _score_fields(expected: FieldsExpectation, output: str) -> Score:
+    invalid = Score(0.0, False, True, 0, 0, len(expected.fields))
     text = output.strip()
     if fenced := _FENCED.match(text):
         text = fenced["body"]
     try:
         parsed = json.loads(text)
     except ValueError:
-        return Score(0.0, passed=False, invalid_response=True)
+        return invalid
     if not isinstance(parsed, dict):
-        return Score(0.0, passed=False, invalid_response=True)
+        return invalid
     # A null value means the model found no value; it is not a prediction. Non-string
     # values are predictions that cannot match, since every expected value is text.
     predicted = {_normalize(key): value for key, value in parsed.items() if value is not None}
@@ -80,9 +94,10 @@ def _score_fields(expected: FieldsExpectation, output: str) -> Score:
         for key, value in wanted.items()
         if isinstance(predicted.get(key), str) and _normalize(predicted[key]) == value
     )
+    counts = (correct, len(predicted), len(wanted))
     if correct == 0:
-        return Score(0.0, passed=False, invalid_response=False)
+        return Score(0.0, False, False, *counts)
     precision = Fraction(correct, len(predicted))
     recall = Fraction(correct, len(wanted))
     f1 = 2 * precision * recall / (precision + recall)
-    return Score(float(f1), passed=f1 >= Fraction(expected.min_f1), invalid_response=False)
+    return Score(float(f1), f1 >= Fraction(expected.min_f1), False, *counts)

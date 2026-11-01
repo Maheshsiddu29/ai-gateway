@@ -69,7 +69,8 @@ data. Do not add real customer prompts to the repository.
 Scorers are pure functions of the case and the output text. Each method has a
 version string (`EVALUATOR_VERSIONS` in `gateway/evaluation/scoring.py`) that must
 change whenever its behaviour changes. Routing ignores runs scored by any other
-version.
+version. The field counts added in results format 2 are reported alongside the
+score and do not change it, so the versions are unchanged.
 
 `exact_label-1`
 : The output, after trimming whitespace, ignoring case, collapsing internal
@@ -117,11 +118,37 @@ will rely on the run. Routing ignores a run made with a larger allowance than a
 request's, because that run did not measure the truncation the request may
 suffer.
 
-`run` writes one results file per target. Each file has the run identity
-(provider, model, dataset, version, SHA-256, evaluator version, simulated flag,
-pricing version, start and completion times), a summary, and one record per case
-(passed, score, invalid, latency, token usage, cost, error code). Model output
-text is not stored.
+`run` writes one results file per target (`format_version` 2; files from
+earlier versions must be regenerated). Model output text is not stored. Each file
+has:
+
+- the run identity: run ID, provider, model, the provider's base URL (live runs),
+  dataset, version, partition, SHA-256, task, method, evaluator version,
+  simulated flag, streaming flag, `max_tokens`, pricing version, start and
+  completion times, and `stop_reason` (set only when the run stopped before every
+  case was sent);
+- one record per case: passed, score, invalid response, latency, time to first
+  token (streaming runs), finish reason, reported token usage, cost, the
+  unresolved cost bound, error code, and for extraction the field counts behind
+  the F1 score;
+- a summary computed only from the case records.
+
+| Summary field | Meaning |
+| --- | --- |
+| `case_count`, `passed_count`, `success_rate`, `success_rate_low/high` | Pass rate over every case, including failed calls, with its 95% Wilson interval. |
+| `invalid_count` | Responses without the required form: not one allowed label, or not a JSON object. A refusal written as text lands here. |
+| `error_count`, `timeout_count` | Calls that returned no response; timeouts are the `evaluation_timeout` subset. |
+| `refusal_count`, `truncated_count` | Finish reason `content_filter` (provider-signalled refusal) or `length` (output allowance reached). The response is still scored. |
+| `mean_score` | Mean of per-case scores (1/0 for labels, F1 for fields). |
+| `field_precision`, `field_recall`, `field_f1` | Extraction only, micro-averaged over all (field, value) pairs. Failed and invalid responses predict nothing, so their fields count against recall. |
+| `latency_p50/p95/p99_ms`, `first_token_p50/p95_ms` | Nearest-rank percentiles of successful calls, or `null` with fewer than 1/(1−q) samples (2, 20, 100), where the percentile would just be the slowest call. |
+| `usage_reported_count`, `prompt_tokens`, `completion_tokens` | Provider-reported token counts. Missing usage is never filled in. |
+| `estimated_cost_micro_usd` | Sum of known per-case costs: reported usage at the configured price, or 0 for calls the provider certainly did not run. |
+| `cost_complete`, `unresolved_case_count`, `unresolved_max_micro_usd` | Cases whose cost is unknown (no usage, or a timeout or error after the request may have been sent) and the most they could cost at full output. |
+
+Costs are estimates from the configured prices. Providers do not report charges
+per call, so there is no observed charge to compare them with, and they are not
+invoice amounts.
 
 Safeguards:
 
@@ -155,9 +182,23 @@ Migration `0003_evaluation_runs` adds two tables, separate from the cost ledger:
   and `recorded_at`.
 - `evaluation_case_results`: one row per case.
 
+Migration `0004_evaluation_partitions` adds the partition, base URL, streaming
+flag, `stop_reason`, and a `results_sha256` digest to runs, and the per-case
+detail above to case rows. Runs recorded before it keep their meaning: they used
+development data, ran every case, and did not stream. Their new per-case columns
+are `NULL`. New runs must have a digest (a `NOT VALID` check that applies only to
+new rows). Downgrading below 0004 is refused while holdout or incomplete runs
+exist, because revision 0003 would treat them as evidence.
+
 A run and its cases are inserted in one transaction. A trigger rejects `UPDATE`
-and `DELETE` on both tables. To retire evidence, record a newer run or change
+and `DELETE` on both tables. Recording is idempotent: recording the same results
+file again reports `already recorded` and changes nothing. A different file with
+an already recorded run ID is refused. Concurrent `record` commands for one run
+store one copy. To retire evidence, record a newer run or change
 `dataset_version`, `max_evidence_age_days`, or the model's `routable` flag.
+
+Holdout runs and incomplete runs are stored for audit and comparison, but the
+gateway never loads them as evidence.
 
 ## Uncertainty and evidence rules
 
@@ -173,7 +214,10 @@ rate to qualify:
 | 950 / 1000 | 0.950 | 0.935 |
 
 `min_samples` also sets a hard floor. Evidence older than
-`max_evidence_age_days` stops counting. Choose these per task. A small dataset
+`max_evidence_age_days` stops counting. Only complete, non-simulated runs on a
+development partition, scored by the current evaluator version, are evidence. A
+`max_p95_latency_ms` rule needs at least 20 successful calls, because p95 is not
+reported with fewer. Choose these per task. A small dataset
 with a high threshold will often leave a cheaper model unqualified, which is
 intended.
 

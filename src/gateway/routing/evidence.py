@@ -6,8 +6,9 @@ and dataset version, and a background task replaces the whole snapshot
 periodically. A decision reads the snapshot reference once, so it never mixes
 two snapshots.
 
-A run qualifies when it is not simulated and was scored with the current
-evaluator version for its method. Freshness and sample-size rules are applied per
+A run qualifies when it is not simulated, used a development (not holdout)
+dataset partition, ran every case, and was scored with the current evaluator
+version for its method. Freshness and sample-size rules are applied per
 decision (see ``gateway.routing.router``), so a snapshot that cannot be refreshed
 while the database is unavailable does not keep evidence valid for longer.
 """
@@ -78,7 +79,8 @@ async def load_evidence(engine: AsyncEngine) -> EvidenceSnapshot:
                 run_id, provider, model, dataset, dataset_version, method, evaluator_version,
                 completed_at, case_count, passed_count, latency_samples, latency_p95_ms,
                 usage_reported_count, completion_tokens, max_output_tokens
-                FROM evaluation_runs WHERE NOT simulated
+                FROM evaluation_runs
+                WHERE NOT simulated AND partition = 'development' AND stop_reason IS NULL
                 ORDER BY provider, model, dataset, dataset_version, method, evaluator_version,
                 completed_at DESC, run_id
                 LIMIT :limit"""),

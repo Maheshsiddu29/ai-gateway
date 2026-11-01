@@ -34,3 +34,15 @@ def percentile(samples: Sequence[float], quantile: float) -> float:
         raise ValueError("quantile must be in (0, 1]")
     ordered = sorted(samples)
     return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
+
+
+def reported_percentile(samples: Sequence[float], quantile: float) -> float | None:
+    """The nearest-rank percentile, or None when there are too few samples for it.
+
+    With fewer than 1 / (1 - quantile) samples (2 for p50, 20 for p95, 100 for
+    p99), the nearest-rank percentile is the largest sample, so reporting it under
+    the percentile's name would overstate what was measured.
+    """
+    if len(samples) < math.ceil(1 / (1 - quantile) - 1e-9):
+        return None
+    return percentile(samples, quantile)

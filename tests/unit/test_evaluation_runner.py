@@ -1,8 +1,10 @@
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -10,7 +12,13 @@ from gateway.cost.pricing import Price
 from gateway.errors import ProviderUnavailableError
 from gateway.evaluation.cli import main
 from gateway.evaluation.dataset import Dataset, load_dataset
-from gateway.evaluation.runner import EvaluationRun, mean_completion_tokens, run_evaluation
+from gateway.evaluation.runner import (
+    CaseResult,
+    EvaluationRun,
+    case_max_cost,
+    mean_completion_tokens,
+    run_evaluation,
+)
 from gateway.evaluation.scoring import EVALUATOR_VERSIONS
 from gateway.evaluation.simulated import SimulatedProvider
 from gateway.providers.base import Completion, ProviderRequest, Usage
@@ -326,3 +334,209 @@ def test_cli_rejects_unknown_targets(tmp_path: Path, capsys: pytest.CaptureFixtu
 
     assert code == 2
     assert "unconfigured provider" in capsys.readouterr().err
+
+
+async def test_streaming_runs_record_time_to_first_token() -> None:
+    dataset = tickets()
+    provider = SimulatedProvider("sim", dataset, {"m": 1.0})
+
+    streamed = await run_evaluation(
+        provider, "m", dataset, max_output_tokens=8, price=PRICE, simulated=True, stream=True
+    )
+    whole = await run_evaluation(
+        provider, "m", dataset, max_output_tokens=8, price=PRICE, simulated=True
+    )
+
+    assert streamed.identity.stream
+    assert all(r.first_token_ms is not None for r in streamed.results)
+    assert streamed.summary.first_token_samples == streamed.summary.case_count
+    assert streamed.summary.first_token_p95_ms is not None
+    assert streamed.summary.cost_complete
+    assert whole.summary.first_token_samples == 0
+    assert {r.first_token_ms for r in whole.results} == {None}
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "field"), [("content_filter", "refusal_count"), ("length", "truncated_count")]
+)
+async def test_refusals_and_truncation_are_counted(finish_reason: str, field: str) -> None:
+    provider = FakeProvider(
+        "f", completion=Completion(content="", finish_reason=finish_reason, usage=Usage(5, 8, 13))
+    )
+
+    run = await run_evaluation(
+        provider, "m", tickets(), max_output_tokens=8, price=PRICE, simulated=False
+    )
+
+    assert getattr(run.summary, field) == run.summary.case_count
+    assert run.summary.invalid_count == run.summary.case_count
+    assert run.summary.passed_count == 0
+
+
+async def test_certain_and_uncertain_failures_are_costed_differently() -> None:
+    dataset = tickets()
+    refused = FakeProvider(
+        "f",
+        error=ProviderUnavailableError("refused", code="connect_error", may_have_processed=False),
+    )
+    uncertain = FakeProvider("f", error=ProviderUnavailableError("5xx", code="upstream_error"))
+
+    not_run = await run_evaluation(
+        refused, "m", dataset, max_output_tokens=8, price=PRICE, simulated=False
+    )
+    maybe_run = await run_evaluation(
+        uncertain, "m", dataset, max_output_tokens=8, price=PRICE, simulated=False
+    )
+
+    assert not_run.summary.cost_complete
+    assert not_run.summary.estimated_cost_micro_usd == 0
+    assert not_run.summary.unresolved_case_count == 0
+    assert not maybe_run.summary.cost_complete
+    assert maybe_run.summary.unresolved_case_count == len(dataset.cases)
+    assert maybe_run.summary.unresolved_max_micro_usd == sum(
+        case_max_cost(PRICE, case, 8) for case in dataset.cases
+    )
+
+
+async def test_unknown_costs_without_a_price_have_no_bound() -> None:
+    run = await run_evaluation(
+        FakeProvider(), "m", tickets(), max_output_tokens=8, price=None, simulated=False
+    )
+
+    assert run.summary.unresolved_case_count == run.summary.case_count
+    assert run.summary.unresolved_max_micro_usd is None
+
+
+async def test_extraction_reports_micro_averaged_field_scores() -> None:
+    dataset = load_dataset(INVOICES)
+    run = await run_evaluation(
+        SimulatedProvider("sim", dataset, {"m": 0.5}),
+        "m",
+        dataset,
+        max_output_tokens=128,
+        price=None,
+        simulated=True,
+    )
+
+    summary = run.summary
+    expected = sum(result.fields_expected or 0 for result in run.results)
+    wrong = summary.case_count - summary.passed_count
+    # Each wrong simulated answer omits exactly one field and invents none.
+    assert expected > 0
+    assert summary.field_precision == 1.0
+    assert summary.field_recall == pytest.approx((expected - wrong) / expected)
+    assert summary.field_f1 is not None
+    labels = await run_evaluation(
+        SimulatedProvider("sim", tickets(), {"m": 0.5}),
+        "m",
+        tickets(),
+        max_output_tokens=8,
+        price=None,
+        simulated=True,
+    )
+    assert (labels.summary.field_precision, labels.summary.field_f1) == (None, None)
+
+
+async def test_latency_percentiles_need_enough_samples() -> None:
+    dataset = tickets()
+    run = await run_evaluation(
+        SimulatedProvider("sim", dataset, {"m": 1.0}),
+        "m",
+        dataset,
+        max_output_tokens=8,
+        price=None,
+        simulated=True,
+    )
+
+    assert run.summary.latency_samples == 44
+    assert run.summary.latency_p95_ms is not None
+    # 44 samples cannot distinguish p99 from the maximum.
+    assert run.summary.latency_p99_ms is None
+
+
+async def test_cancellation_reports_in_flight_cases_and_propagates() -> None:
+    dataset = tickets()
+    started = asyncio.Event()
+
+    class Hanging(FakeProvider):
+        async def complete(self, request: ProviderRequest) -> Completion:
+            started.set()
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+    dispatched: list[str] = []
+    finished: list[CaseResult] = []
+
+    class Observer:
+        def dispatched(self, case_id: str) -> None:
+            dispatched.append(case_id)
+
+        def finished(self, result: CaseResult) -> None:
+            finished.append(result)
+
+    task = asyncio.create_task(
+        run_evaluation(
+            Hanging("h"),
+            "m",
+            dataset,
+            max_output_tokens=8,
+            price=PRICE,
+            simulated=False,
+            concurrency=3,
+            observer=Observer(),
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Only the three calls in flight were sent; queued cases were never dispatched.
+    assert len(dispatched) == 3
+    assert sorted(r.case_id for r in finished) == sorted(dispatched)
+    assert {r.error_code for r in finished} == {"evaluation_interrupted"}
+    assert all(r.cost_micro_usd is None for r in finished)
+    assert all(r.unresolved_max_micro_usd for r in finished)
+
+
+async def test_results_digest_identifies_the_exact_file() -> None:
+    dataset = tickets()
+    provider = SimulatedProvider("sim", dataset, {"m": 0.5})
+    run = await run_evaluation(
+        provider, "m", dataset, max_output_tokens=8, price=None, simulated=True
+    )
+    copy = EvaluationRun.from_json(json.loads(json.dumps(run.to_json())))
+    other = await run_evaluation(
+        provider, "m", dataset, max_output_tokens=8, price=None, simulated=True
+    )
+
+    assert copy.results_sha256() == run.results_sha256()
+    assert other.results_sha256() != run.results_sha256()
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda data: data.pop("format_version"), "format_version"),
+        (lambda data: data["results"][0].update(first_token_ms=1.0), "first-token time"),
+        (lambda data: data["results"][0].update(fields_expected=3), "field counts"),
+    ],
+    ids=["format", "first-token", "field-counts"],
+)
+async def test_results_files_from_other_formats_or_methods_are_rejected(
+    change: Callable[[dict[str, Any]], object], message: str
+) -> None:
+    dataset = tickets()
+    run = await run_evaluation(
+        SimulatedProvider("sim", dataset, {"m": 1.0}),
+        "m",
+        dataset,
+        max_output_tokens=8,
+        price=None,
+        simulated=True,
+    )
+    data = json.loads(json.dumps(run.to_json()))
+    change(data)
+
+    with pytest.raises(ValueError, match=message):
+        EvaluationRun.from_json(data)

@@ -5,8 +5,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from gateway.evaluation.dataset import EvaluationCase
-from gateway.evaluation.scoring import Score, score_output
-from gateway.evaluation.stats import percentile, wilson_interval
+from gateway.evaluation.scoring import Score, score_output, unanswered
+from gateway.evaluation.stats import percentile, reported_percentile, wilson_interval
 
 
 def label_case() -> EvaluationCase:
@@ -63,7 +63,7 @@ def test_anything_but_one_label_is_invalid(output: str) -> None:
 def test_all_fields_correct_pass() -> None:
     output = json.dumps({"invoice_number": "a-1", "total": " 10.00 ", "currency": "eur"})
 
-    assert score_output(fields_case(), output) == Score(1.0, passed=True, invalid_response=False)
+    assert score_output(fields_case(), output) == Score(1.0, True, False, 3, 3, 3)
 
 
 def test_fenced_json_is_accepted() -> None:
@@ -82,6 +82,7 @@ def test_partial_extraction_scores_f1() -> None:
     score = score_output(fields_case(), output)
 
     assert score.value == pytest.approx(4 / 7)
+    assert (score.fields_correct, score.fields_predicted, score.fields_expected) == (2, 4, 3)
     assert not score.passed
     assert score_output(fields_case(min_f1=0.5), output).passed
 
@@ -105,11 +106,16 @@ def test_non_string_values_cannot_match() -> None:
 
 @pytest.mark.parametrize("output", ["not json", "[1, 2]", '"A-1"', "", "```\n{}"])
 def test_non_object_output_is_invalid(output: str) -> None:
-    assert score_output(fields_case(), output) == Score(0.0, passed=False, invalid_response=True)
+    assert score_output(fields_case(), output) == Score(0.0, False, True, 0, 0, 3)
 
 
 def test_no_correct_fields_scores_zero() -> None:
-    assert score_output(fields_case(), "{}") == Score(0.0, passed=False, invalid_response=False)
+    assert score_output(fields_case(), "{}") == Score(0.0, False, False, 0, 0, 3)
+
+
+def test_unanswered_cases_count_every_expected_field_as_missed() -> None:
+    assert unanswered(fields_case()) == Score(0.0, False, False, 0, 0, 3)
+    assert unanswered(label_case()) == Score(0.0, passed=False, invalid_response=False)
 
 
 @given(st.text(max_size=200))
@@ -146,3 +152,14 @@ def test_nearest_rank_percentile() -> None:
     assert percentile([7.0], 0.95) == 7.0
     with pytest.raises(ValueError, match="no samples"):
         percentile([], 0.5)
+
+
+def test_percentiles_need_enough_samples_to_differ_from_the_maximum() -> None:
+    samples = [float(value) for value in range(1, 101)]
+
+    assert reported_percentile(samples[:19], 0.95) is None
+    assert reported_percentile(samples[:20], 0.95) == 19.0
+    assert reported_percentile(samples[:99], 0.99) is None
+    assert reported_percentile(samples, 0.99) == 99.0
+    assert reported_percentile([], 0.5) is None
+    assert reported_percentile([3.0, 1.0], 0.5) == 1.0
