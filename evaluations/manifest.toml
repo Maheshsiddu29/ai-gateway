@@ -1,0 +1,35 @@
+# Released evaluation dataset files. A test checks every file against this list,
+# so editing a released file in place fails the build. Add a new file with a new
+# dataset_version instead, and append its entry here.
+
+[[datasets]]
+file = "invoice-fields-v1-holdout.jsonl"
+dataset = "invoice-fields"
+version = "1"
+partition = "holdout"
+cases = 40
+sha256 = "585148bedd10daab44f2c378cc754a013f674ff69178ecac42d3bc39d00c0fa9"
+
+[[datasets]]
+file = "invoice-fields-v1.jsonl"
+dataset = "invoice-fields"
+version = "1"
+partition = "development"
+cases = 40
+sha256 = "4351aa76591f49f36d404f416b13bac052c47582b64926d54b7f29283783f3f5"
+
+[[datasets]]
+file = "support-ticket-category-v1-holdout.jsonl"
+dataset = "support-ticket-category"
+version = "1"
+partition = "holdout"
+cases = 60
+sha256 = "aba0df582020fdfc1516ec4163aeee213dfa3abc99e53078ad7706b13c07a5b0"
+
+[[datasets]]
+file = "support-ticket-category-v1.jsonl"
+dataset = "support-ticket-category"
+version = "1"
+partition = "development"
+cases = 44
+sha256 = "93b697ce2f8f3bc8267827b91bd93e445eaf38de694a707fd4c499866fbec7b4"

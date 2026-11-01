@@ -25,21 +25,44 @@ Datasets are JSONL files under `evaluations/datasets/`. Each line is one case:
 | --- | --- |
 | `id` | Unique in the file; letters, digits, `._-`, at most 64 characters. |
 | `dataset`, `dataset_version` | The same on every line. Routing evidence is matched on both. |
+| `partition` | `development` (the default, for files released before partitions) or `holdout`; the same on every line. |
 | `task` | `classification` or `extraction`. |
 | `method` | `exact_label` for classification, `field_f1` for extraction. |
 | `messages` | 1 to 32 chat messages, the same message schema the API accepts. |
 | `expected` | `{"label", "labels"}` for `exact_label`; `{"fields", "min_f1"}` for `field_f1`. |
 
 The loader rejects unknown fields, missing expectations, a label outside its label
-set, mixed datasets or versions, duplicate IDs, lines over 64 KiB, and more than
-5000 cases. The run records the file's SHA-256, which identifies exactly which
-bytes produced a result. A released dataset file is never edited; a change gets a
-new `dataset_version`.
+set, mixed datasets, versions, or partitions, duplicate IDs, lines over 64 KiB,
+and more than 5000 cases. The run records the file's SHA-256, which identifies
+exactly which bytes produced a result. A released dataset file is never edited; a
+change gets a new `dataset_version`. `evaluations/manifest.toml` pins the hash of
+every released file, and a unit test enforces it.
 
-The repository ships two synthetic datasets (see
-[evaluations/README.md](../evaluations/README.md)): 44 support tickets in four
-categories, and 40 invoice texts with five fields to extract. They contain no
-customer data. Do not add real customer prompts to the repository.
+### Development and holdout partitions
+
+A dataset version can have two files:
+
+- the development partition, whose results may be recorded as routing evidence;
+- the holdout partition, used only to measure a routing policy after its evidence
+  is fixed. The gateway never reads holdout results as evidence, and the routing
+  experiment refuses them as evidence.
+
+```sh
+uv run python -m gateway.evaluation check \
+  --development evaluations/datasets/support-ticket-category-v1.jsonl \
+  --holdout evaluations/datasets/support-ticket-category-v1-holdout.jsonl
+```
+
+`check` requires the same dataset name, version, task, method, system prompts,
+and label sets in both files. It rejects shared case IDs, and holdout cases whose
+non-system text shares at least 60% of its distinct words with a development case
+(digits ignored). It detects copied cases, not paraphrases.
+
+The repository ships two synthetic datasets, each with both partitions (see
+[evaluations/README.md](../evaluations/README.md) for construction and known
+biases): support tickets in four categories (44 development, 60 holdout), and
+invoice texts with five fields to extract (40 and 40). They contain no customer
+data. Do not add real customer prompts to the repository.
 
 ## Scoring
 

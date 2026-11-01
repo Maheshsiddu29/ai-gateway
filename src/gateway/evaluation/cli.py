@@ -8,6 +8,9 @@ targets and writes one results file per target. Provider calls cost money, so
 
 ``record`` re-checks results files and inserts them into PostgreSQL
 (``GATEWAY_DATABASE_URL``), where the gateway reads routing evidence.
+
+``check`` verifies that a holdout partition shares its development partition's
+task definition and none of its cases.
 """
 
 import argparse
@@ -26,7 +29,7 @@ from gateway.admission.tokens import estimate_input_tokens
 from gateway.core.config import GatewayConfig, read_gateway_config, resolve_api_keys
 from gateway.cost.pricing import Price, PriceCatalog
 from gateway.errors import ConfigurationError
-from gateway.evaluation.dataset import Dataset, DatasetError, load_dataset
+from gateway.evaluation.dataset import Dataset, DatasetError, check_partitions, load_dataset
 from gateway.evaluation.runner import MAX_CONCURRENCY, EvaluationRun, run_evaluation
 from gateway.evaluation.simulated import SimulatedProvider
 from gateway.evaluation.store import EvaluationRecordError, record_run
@@ -44,8 +47,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "run":
             asyncio.run(_run(args))
-        else:
+        elif args.command == "record":
             asyncio.run(_record([Path(path) for path in args.results]))
+        else:
+            _check(args.development, args.holdout)
     except (UsageError, ConfigurationError, DatasetError, EvaluationRecordError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -80,6 +85,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout-seconds", type=float, default=60.0)
     record = commands.add_parser("record", help="store results files in PostgreSQL")
     record.add_argument("results", nargs="+", help="results files written by run")
+    check = commands.add_parser(
+        "check", help="verify that a holdout partition is independent of its development data"
+    )
+    check.add_argument("--development", type=Path, required=True, help="development JSONL")
+    check.add_argument("--holdout", type=Path, required=True, help="holdout JSONL")
     return parser
 
 
@@ -150,6 +160,15 @@ async def _record(paths: list[Path]) -> None:
             print(f"recorded {run.identity.run_id} ({run.identity.provider}/{run.identity.model})")
     finally:
         await engine.dispose()
+
+
+def _check(development_path: Path, holdout_path: Path) -> None:
+    development, holdout = load_dataset(development_path), load_dataset(holdout_path)
+    check_partitions(development, holdout)
+    print(
+        f"{development.name} v{development.version}: {len(development.cases)} development and"
+        f" {len(holdout.cases)} holdout cases, no shared or near-duplicate cases"
+    )
 
 
 def _parse_target(value: str, config: GatewayConfig) -> tuple[str, str]:
