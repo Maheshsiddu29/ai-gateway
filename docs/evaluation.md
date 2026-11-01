@@ -276,25 +276,76 @@ provider announces changes, and periodically within `max_evidence_age_days`.
 
 ## Comparing policies
 
-`tools/routing_experiment.py` replays a dataset through the router for `fixed`,
-`lowest_cost`, and `quality_constrained`, using one results file per target. Each
-policy's choice is paired with that model's recorded result for the same case. It
-reports:
+`tools/routing_experiment.py` measures whether a quality-constrained alias would
+have cost less than its fixed primary model while keeping quality, on cases that
+played no part in qualifying its models:
 
-- total cost and the per-request distribution (p50, p95, max), priced from
-  recorded token usage at the configuration's current prices;
-- success rate with its interval, and whether it fell below `min_success_rate`;
-- latency p50/p95/p99 from the recorded calls;
-- routing distribution, refused requests by error code, invalid responses, and
-  provider errors;
-- savings against `fixed`, as (baseline − policy) / baseline × 100. Savings are
-  shown only when both policies served every case with recorded usage. Otherwise
-  the report states why they are not comparable.
+```sh
+uv run python tools/routing_experiment.py \
+  --config config/gateway.toml --alias classify \
+  --evidence-dataset evaluations/datasets/support-ticket-category-v1.jsonl \
+  --evidence results/dev/*.json \
+  --dataset evaluations/datasets/support-ticket-category-v1-holdout.jsonl \
+  --results results/holdout/*.json --output report.json
+```
 
-When the same runs serve as evidence and as workload (the default), the report
-says `in_sample`, and the quality it shows is optimistic. Pass separate
-`--evidence` files from another run, or a different dataset version, for an
-out-of-sample comparison. Simulated inputs need `--allow-simulated`, and the
-report then begins with a SIMULATED warning. See
-[benchmarks.md](benchmarks.md#phase-4-routing-measurements-2026-10-31) for a
-simulated example and its limits.
+It replays the holdout dataset through the router for `fixed` (the primary
+model), `lowest_cost` (the same candidates without quality rules), and the
+alias's `quality_constrained` policy. Routing evidence comes only from the
+development runs, evaluated as of the newest evidence run so the replay is
+reproducible. Each policy's choice for a case is paired with that model's
+recorded holdout result for the same case. No provider is called and no request
+goes through the gateway.
+
+The tool refuses comparisons that would be unfair:
+
+- holdout runs offered as evidence, or a holdout that fails `check` against the
+  evidence dataset;
+- workload runs from a different dataset file, incomplete runs, or a target
+  without workload runs;
+- workload runs sent with a `max_tokens` other than the alias's output allowance,
+  or with mixed streaming settings;
+- simulated runs, unless `--allow-simulated` is given.
+
+For each policy the report gives:
+
+- requests, refusals by error code, and requests the quality-constrained policy
+  sent to its primary without qualified evidence (`unverified_fallbacks`);
+- success rate over all requests, with refused requests and failed calls counted
+  as not passed, and its 95% Wilson interval;
+- a threshold verdict against `min_success_rate`: `passes` when the lower bound
+  reaches it, `fails` when the observed rate is below it, `inconclusive`
+  otherwise;
+- the quality difference from `fixed` on the same cases, with a 95% paired
+  interval (the adjusted Wald interval of Bonett and Price, 2012) and the counts
+  of cases only one of the two passed;
+- invalid responses, provider errors, timeouts, and error rate;
+- observed cost (recorded token usage at the configuration's current prices, the
+  same price snapshot for every policy) and, separately, the number of cases
+  with unknown cost and their upper bound;
+- savings against `fixed`: the absolute difference in observed cost, and a
+  percentage when both policies served every request with known costs. With
+  unknown costs the report gives the range of possible percentages instead.
+  With refusals it gives no percentage, because the policies served different
+  work. Negative savings are reported as negative;
+- latency p50/p95/p99 of the recorded calls (`null` without enough samples) and
+  the routing distribution.
+
+The report also records both datasets' hashes, the evidence and workload run
+IDs, the quality rules, price versions, the router's measured decision time, and
+a list of limitations that apply to the inputs. That list always states that the
+comparison is a replay, that latency is client-side evaluation latency, and that
+costs are not invoices. It adds a warning when inputs are simulated, in-sample,
+from a single run per model, or include unknown costs.
+
+Several results files for the same target are repetitions, for example reruns
+of a nondeterministic model. Every target needs the same number. Each repetition
+is compared separately, the report lists per-repetition results, and
+`variability` shows how often each model's case outcomes agreed across runs.
+Repetitions reuse the same cases, so they are not pooled into one interval.
+
+Without `--evidence`, the workload doubles as evidence. That is allowed only
+for a development dataset and is reported as `in_sample`, because quality is
+then optimistic. See
+[benchmarks.md](benchmarks.md#phase-5-measurements-2026-11-01) for a simulated
+example and its limits.

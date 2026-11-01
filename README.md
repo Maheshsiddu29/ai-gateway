@@ -274,18 +274,19 @@ uv run --env-file .env python -m gateway.evaluation run --config config/gateway.
 # Record results as routing evidence.
 GATEWAY_DATABASE_URL=... uv run python -m gateway.evaluation record results/*.json
 
-# Compare fixed, lowest_cost, and quality_constrained on recorded results.
+# Compare fixed, lowest_cost, and quality_constrained on the holdout partition,
+# with evidence from development runs only.
 uv run python tools/routing_experiment.py --config config/gateway.toml --alias classify \
-  --dataset evaluations/datasets/support-ticket-category-v1.jsonl --results results/*.json
+  --evidence-dataset evaluations/datasets/support-ticket-category-v1.jsonl \
+  --evidence results/dev/*.json \
+  --dataset evaluations/datasets/support-ticket-category-v1-holdout.jsonl \
+  --results results/holdout/*.json
 ```
 
-The experiment report shows cost, success rate with a confidence interval,
-latency, and routing distribution for each policy. Savings against the
-fixed-model baseline are reported only when both policies served the same cases
-with recorded usage. Results from simulated runs, or from runs that also served as
-evidence (in-sample), are labelled as such. The cost figures are gateway
-accounting at configured prices, not invoices. See
-[docs/evaluation.md](docs/evaluation.md).
+The experiment report shows cost, success rate with a confidence interval, the
+paired quality difference from the fixed baseline, a threshold verdict, latency,
+and routing distribution for each policy. Unknown costs are reported separately.
+See [docs/evaluation.md](docs/evaluation.md).
 
 `GATEWAY_ENVIRONMENT` defaults to `production`, which requires gateway keys of at
 least 32 characters and HTTPS provider URLs. Every setting is described in

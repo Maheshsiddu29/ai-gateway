@@ -46,3 +46,28 @@ def reported_percentile(samples: Sequence[float], quantile: float) -> float | No
     if len(samples) < math.ceil(1 / (1 - quantile) - 1e-9):
         return None
     return percentile(samples, quantile)
+
+
+def paired_difference_interval(
+    first_only: int, second_only: int, cases: int, z: float = Z_95
+) -> tuple[float, float]:
+    """An interval for p1 - p2 when both proportions are measured on the same cases.
+
+    ``first_only`` cases passed only under the first condition and
+    ``second_only`` only under the second. This is the adjusted Wald interval for
+    paired proportions of Bonett and Price (2012): add one to each discordant
+    count and two to the number of cases, then use the Wald formula. Unlike the
+    plain Wald interval, or Newcombe's hybrid interval, it does not shrink to
+    zero width when the two conditions agree on every case, so a small sample
+    cannot make two models look identical. In simulations with 20 to 200 cases
+    its coverage of the true difference was between 93% and 100%.
+    """
+    if first_only < 0 or second_only < 0 or first_only + second_only > cases:
+        raise ValueError("discordant counts must be non-negative and at most the case count")
+    if cases == 0:
+        return -1.0, 1.0
+    p12 = (first_only + 1) / (cases + 2)
+    p21 = (second_only + 1) / (cases + 2)
+    difference = p12 - p21
+    margin = z * math.sqrt((p12 + p21 - difference**2) / (cases + 2))
+    return max(-1.0, difference - margin), min(1.0, difference + margin)
