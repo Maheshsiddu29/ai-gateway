@@ -101,12 +101,14 @@ uv run python -m gateway.evaluation run \
   --max-tokens 8 --output results/ \
   --simulate openai/small-model-id=0.8 --simulate anthropic/large-model-id=0.95
 
-# Real providers. This costs money.
+# Real providers (costs money). The first command prints a plan and sends nothing.
 uv run --env-file .env python -m gateway.evaluation run \
   --config config/gateway.toml \
   --dataset evaluations/datasets/support-ticket-category-v1.jsonl \
   --target openai/small-model-id --max-tokens 8 --output results/ \
-  --live --max-cost-micro-usd 200000
+  --live --max-cost-micro-usd 200000 --max-requests 100
+# After reviewing the plan, repeat the same command with its digest.
+uv run --env-file .env python -m gateway.evaluation run ... --approve <plan sha256>
 
 # Store results as routing evidence.
 GATEWAY_DATABASE_URL=postgresql+asyncpg://... \
@@ -150,27 +152,72 @@ Costs are estimates from the configured prices. Providers do not report charges
 per call, so there is no observed charge to compare them with, and they are not
 invoice amounts.
 
-Safeguards:
+### Live-run safeguards
 
-- Real provider calls require `--live`. They also require `--max-cost-micro-usd`
-  covering the worst case: every case at its estimated input and the full
-  `--max-tokens`, at the configured prices. A target without a price cannot run
-  live. Credentials are read only for the providers named in `--target`.
-- Concurrency is at most 16 (default 4) and every call has a timeout (default
-  60 s).
+A live evaluation spends money, and having provider credentials in the
+environment is not permission to spend it. The CLI therefore refuses to send
+anything until the operator approves an exact plan:
+
+1. `--live` requires `--max-cost-micro-usd` and `--max-requests`.
+2. Before any credential is read, the CLI checks each target. Each target needs
+   a price effective now and a `[[routing.models]]` entry. Every case must fit
+   the entry's context window, `--max-tokens` must not exceed its output limit,
+   and `--stream` needs the `streaming` and `stream_usage` capabilities. The
+   provider adapter must accept every case unchanged. A failure in any check
+   rejects the whole plan.
+3. The CLI prints the plan and its SHA-256, then exits with code 3 without
+   sending anything. The plan lists the dataset (name, version, partition,
+   hash), each target with its base URL and price version, the request count,
+   generation settings, and the worst-case cost per target and in total.
+   `--plan-output` also writes it as JSON. The plan is refused if it needs more
+   requests than `--max-requests`, or if its worst case (every case at its
+   estimated input plus the full `--max-tokens`) exceeds the ceiling.
+4. Repeating the command with `--approve <sha256>` runs the plan. Any change to
+   the dataset file, targets, base URLs, prices, limits, or settings changes the
+   digest, so the old approval no longer matches and nothing is sent.
+5. Credentials are read only after approval, and only for the approved targets'
+   providers.
+
+While a run executes:
+
+- Each case is sent once. Errors and timeouts are recorded, never retried, so an
+  uncertain call is never paid for twice.
+- Before each dispatch, the case reserves its worst-case cost against the
+  ceiling, shared by all targets of the command. After the call the reservation
+  settles to the known cost, or stays at the worst case when usage is unknown.
+  When a reservation does not fit, no further case is sent. The run ends with
+  `stop_reason = "cost_ceiling"`, later targets are skipped, and the exit code is
+  4. A provider can report more input tokens than estimated, so calls already in
+  flight can carry spend past the ceiling. The ceiling limits what the CLI sends.
+  It does not bound the provider's invoice.
+- Every case is journalled to `<results>.partial.jsonl` when it is sent and when
+  its result is known, with each line synced to disk. The journal is removed
+  once the results file is written. After Ctrl-C (exit code 130) or a crash, the
+  journal remains. Cases sent but without a result were possibly charged. The
+  CLI never reads journals, so an interrupted run is not resumed; running the
+  command again starts a new run from the first case.
+- Concurrency is at most 16 (default 4), and every call has a timeout (default
+  60 s, at most 600 s).
+
+Other safeguards:
+
 - `--simulate` uses `SimulatedProvider`. It returns the expected answer for a
   deterministic share of cases (by hash of model and case ID) and a well-formed
   wrong answer otherwise. Its token counts are estimates and its latency is an
   in-process function call. It tests the pipeline and nothing else, and routing
   never accepts its runs.
 - `record` recomputes each file's summary from its case records. It refuses files
-  whose summary does not match, and cases with negative measurements, scores
-  outside [0, 1], or a pass alongside an error. The database also refuses runs
-  completed in the future, counts that exceed the case count, and negative
-  latencies, token counts, or costs.
+  whose summary does not match, cases with negative measurements, scores outside
+  [0, 1], a pass alongside an error, and field counts or first-token times that
+  do not fit the run. The database also refuses runs completed in the future,
+  counts that exceed the case count, and negative latencies, token counts, or
+  costs.
 
-The default test suite uses only simulated or fake providers and needs no vendor
-credentials. Real evaluations are run manually by the operator.
+The test suite and CI use only simulated, stubbed, or local mock providers and
+need no vendor credentials.
+`tests/integration/test_evaluation_live_mock.py` runs the full live path (plan,
+approval, journal, results) in a subprocess against the mock provider on
+localhost. Real evaluations are run manually by the operator.
 
 ## Storage
 

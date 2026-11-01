@@ -35,7 +35,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 from pydantic import SecretStr
 
 from gateway.admission.tokens import estimate_input_tokens
@@ -43,6 +42,7 @@ from gateway.core.config import GatewayConfig, read_gateway_config
 from gateway.cost.pricing import PriceCatalog
 from gateway.errors import ConfigurationError, GatewayError
 from gateway.evaluation.dataset import Dataset, DatasetError, load_dataset
+from gateway.evaluation.plan import OfflineTransport
 from gateway.evaluation.runner import CaseResult, EvaluationRun, mean_completion_tokens
 from gateway.evaluation.stats import percentile, wilson_interval
 from gateway.providers.base import Provider, ProviderRequest
@@ -57,13 +57,6 @@ type Target = tuple[str, str]
 
 class ExperimentError(Exception):
     pass
-
-
-class _OfflineTransport(httpx.AsyncBaseTransport):
-    """Adapters are built only for their request validation, which does no I/O."""
-
-    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        raise ExperimentError("the experiment must not call providers")
 
 
 @dataclass
@@ -170,7 +163,7 @@ def compare(
         for target, run in workload.items()
     }
     providers: dict[str, Provider] = {
-        name: build_provider(name, settings, SecretStr("offline"), _OfflineTransport())
+        name: build_provider(name, settings, SecretStr("offline"), OfflineTransport())
         for name, settings in config.providers.items()
     }
     catalog = PriceCatalog(config.cost.pricing)

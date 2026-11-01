@@ -11,6 +11,11 @@ its result is known, so a caller can journal progress to disk. If the run is
 cancelled, every case still waiting for its provider is reported as
 ``evaluation_interrupted`` before the cancellation propagates.
 
+An optional ``CostCeiling`` is checked before each dispatch. Each case reserves
+its worst-case cost and settles to its known cost afterwards. When a reservation
+does not fit, no further case is sent and the run ends with
+``stop_reason = "cost_ceiling"``.
+
 The summary is derived only from the per-case results (``summarize``), so a
 results file can be re-checked before it is recorded as evidence.
 """
@@ -51,6 +56,7 @@ MAX_CONCURRENCY = 16
 # Bumped whenever a field is added to or removed from results files.
 RESULTS_FORMAT_VERSION = 2
 
+COST_CEILING = "cost_ceiling"
 TIMEOUT = "evaluation_timeout"
 INTERRUPTED = "evaluation_interrupted"
 # Finish reasons that mark a refusal or a truncated answer.
@@ -310,6 +316,38 @@ def _field_scores(
     return precision, recall, f1
 
 
+class CostCeilingError(Exception):
+    pass
+
+
+class CostCeiling:
+    """A spending limit shared by the runs of one evaluation command.
+
+    Committed spend counts each finished case at its known cost and every other
+    sent case at its worst case. A provider can still report more input tokens
+    than the estimate, so calls already in flight can take spend past the limit;
+    the limit is a safeguard, not a bound on a provider's invoice.
+    """
+
+    def __init__(self, limit_micro_usd: int) -> None:
+        if limit_micro_usd < 0:
+            raise ValueError("the cost ceiling cannot be negative")
+        self.limit_micro_usd = limit_micro_usd
+        self.committed_micro_usd = 0
+        self.reached = False
+
+    def reserve(self, amount: int) -> bool:
+        if self.reached or self.committed_micro_usd + amount > self.limit_micro_usd:
+            self.reached = True
+            return False
+        self.committed_micro_usd += amount
+        return True
+
+    def settle(self, reserved: int, cost: int | None) -> None:
+        if cost is not None:
+            self.committed_micro_usd += cost - reserved
+
+
 class CaseObserver(Protocol):
     def dispatched(self, case_id: str) -> None: ...
 
@@ -333,12 +371,15 @@ async def run_evaluation(
     provider_base_url: str | None = None,
     run_id: uuid.UUID | None = None,
     observer: CaseObserver | None = None,
+    ceiling: CostCeiling | None = None,
     concurrency: int = 4,
     call_timeout_seconds: float = 60.0,
     clock: Callable[[], float] = time.perf_counter,
 ) -> EvaluationRun:
     if not 1 <= concurrency <= MAX_CONCURRENCY:
         raise ValueError(f"concurrency must be between 1 and {MAX_CONCURRENCY}")
+    if ceiling is not None and price is None:
+        raise ValueError("a cost ceiling needs a price")
     started_at = datetime.now(UTC)
     semaphore = asyncio.Semaphore(concurrency)
     finished: dict[str, CaseResult] = {}
@@ -350,6 +391,11 @@ async def run_evaluation(
 
     async def one(case: EvaluationCase) -> None:
         async with semaphore:
+            reserved = 0
+            if ceiling is not None and price is not None:
+                reserved = case_max_cost(price, case, max_output_tokens)
+                if not ceiling.reserve(reserved):
+                    return
             if observer is not None:
                 observer.dispatched(case.id)
             try:
@@ -367,13 +413,17 @@ async def run_evaluation(
                 # The provider may already be running (and charging for) the call.
                 record(_failed(case, INTERRUPTED, price, max_output_tokens, may_have_run=True))
                 raise
+            if ceiling is not None:
+                ceiling.settle(reserved, result.cost_micro_usd)
             record(result)
 
     async with asyncio.TaskGroup() as group:
         for case in dataset.cases:
             group.create_task(one(case))
 
-    results = tuple(finished[case.id] for case in dataset.cases)
+    results = tuple(finished[case.id] for case in dataset.cases if case.id in finished)
+    if not results:
+        raise CostCeilingError("no case could be sent within the cost ceiling")
     identity = RunIdentity(
         run_id=run_id or uuid.uuid4(),
         provider=provider.name,
@@ -392,6 +442,7 @@ async def run_evaluation(
         pricing_version=price.version if price is not None else None,
         started_at=started_at,
         completed_at=datetime.now(UTC),
+        stop_reason=None if len(results) == len(dataset.cases) else COST_CEILING,
     )
     return EvaluationRun(identity, summarize(results), results)
 

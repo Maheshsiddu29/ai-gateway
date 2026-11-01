@@ -264,11 +264,12 @@ uv run python -m gateway.evaluation run --config config/gateway.toml \
   --target openai/small-model-id --max-tokens 8 --output results/ \
   --simulate openai/small-model-id=0.9
 
-# Real provider calls (costs money): requires --live and a worst-case cost ceiling.
+# Real provider calls (costs money): --live prints a preflight plan and sends nothing
+# until the command is repeated with --approve <plan sha256>.
 uv run --env-file .env python -m gateway.evaluation run --config config/gateway.toml \
   --dataset evaluations/datasets/support-ticket-category-v1.jsonl \
   --target openai/small-model-id --max-tokens 8 --output results/ \
-  --live --max-cost-micro-usd 200000
+  --live --max-cost-micro-usd 200000 --max-requests 100
 
 # Record results as routing evidence.
 GATEWAY_DATABASE_URL=... uv run python -m gateway.evaluation record results/*.json

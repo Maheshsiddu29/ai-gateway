@@ -302,13 +302,12 @@ def test_cli_simulated_run_writes_labelled_results(
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
-        (["--live"], "requires --max-cost-micro-usd"),
-        (["--live", "--max-cost-micro-usd", "1"], "exceeds --max-cost-micro-usd"),
         (["--simulate", "sim/other=0.5"], "no --simulate accuracy for sim/m"),
         (["--simulate", "sim/m=2"], "in \\[0, 1\\]"),
+        (["--simulate", "sim/m=1", "--approve", "abc"], "apply only to --live"),
     ],
 )
-def test_cli_refuses_unbounded_or_unconfigured_runs(
+def test_cli_refuses_unconfigured_simulations(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], extra: list[str], message: str
 ) -> None:
     code = cli_run(tmp_path, *extra)
@@ -316,17 +315,6 @@ def test_cli_refuses_unbounded_or_unconfigured_runs(
     assert code == 2
     assert message.replace("\\", "") in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
-
-
-def test_cli_live_run_requires_provider_credentials(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("SIM_KEY", raising=False)
-
-    code = cli_run(tmp_path, "--live", "--max-cost-micro-usd", "1000000")
-
-    assert code == 2
-    assert "requires environment variable SIM_KEY" in capsys.readouterr().err
 
 
 def test_cli_rejects_unknown_targets(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
