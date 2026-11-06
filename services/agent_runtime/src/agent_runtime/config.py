@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from agent_runtime.diagnostics.tools import validate_allowed_paths
 from agent_runtime.investigation.schemas import MAX_PLAN_STEPS
+from agent_runtime.persistence.database import validate_database_url
 
 MIN_PRODUCTION_KEY_LENGTH = 32
 
@@ -130,4 +131,30 @@ class Settings(BaseSettings):
                 "gateway_url must use https in production unless"
                 " AGENT_GATEWAY_ALLOW_INSECURE_HTTP is true"
             )
+        return self
+
+
+DatabaseSchema = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
+DatabaseRole = Annotated[str, Field(pattern=r"^[a-z_][a-z0-9_]{0,62}$")]
+
+
+class MigrationSettings(BaseSettings):
+    """Settings for ``python -m agent_runtime.persistence``, which runs as the schema owner."""
+
+    model_config = SettingsConfigDict(env_prefix="AGENT_", frozen=True, hide_input_in_errors=True)
+
+    environment: Environment = Environment.PRODUCTION
+    database_owner_url: SecretStr
+    database_schema: DatabaseSchema = "agent_runtime"
+    # Granted the application privileges after every upgrade, when set.
+    database_app_role: DatabaseRole | None = None
+    database_allow_insecure: bool = False
+
+    @model_validator(mode="after")
+    def _check_url(self) -> "MigrationSettings":
+        validate_database_url(
+            self.database_owner_url,
+            require_tls=self.environment is Environment.PRODUCTION
+            and not self.database_allow_insecure,
+        )
         return self
