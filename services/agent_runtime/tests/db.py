@@ -63,6 +63,7 @@ async def insert_accepted(
     deadline_seconds: float = 3600,
     budget_micro_usd: int = 1_000_000,
     pricing: dict[str, Any] | None = PRICING,
+    workflow_version: str = WORKFLOW_VERSION,
 ) -> str:
     """A newly accepted investigation, as the API stores it."""
     investigation_id = f"inv-{uuid.uuid4().hex}"
@@ -75,7 +76,7 @@ async def insert_accepted(
             investigation_id,
             hashlib.sha256(investigation_id.encode()).digest(),
             incident,
-            WORKFLOW_VERSION,
+            workflow_version,
             PROMPT_VERSION,
             max_llm_calls,
             budget_micro_usd,

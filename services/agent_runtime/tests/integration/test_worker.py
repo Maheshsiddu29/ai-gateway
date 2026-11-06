@@ -438,3 +438,20 @@ async def test_a_stale_worker_cannot_finish_an_investigation(owner: Connection, 
         await store.finish(stale, example_result(investigation_id))
     assert (await investigation(owner, investigation_id))["status"] == "running"
     assert gateway.requests == {}
+
+
+async def test_a_worker_ignores_other_workflow_versions(owner: Connection, pool: Pool) -> None:
+    """A rolling deploy must not let a worker resume a graph it does not implement."""
+    mine = await insert_accepted(owner)
+    # The version is immutable once stored, so it is written at insert time.
+    theirs = await insert_accepted(owner, workflow_version="some-later-graph-9")
+    gateway = ScriptedGateway()
+
+    async with worker(pool, gateway) as w:
+        await w.run_until_idle()
+
+    assert (await investigation(owner, mine))["status"] == "completed"
+    other = await investigation(owner, theirs)
+    assert other["status"] == "accepted"
+    assert other["attempts"] == 0
+    assert gateway.requests == {"planner": 1, "diagnosis": 1}
