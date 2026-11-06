@@ -7,10 +7,13 @@ or validation errors.
 """
 
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+from agent_runtime.diagnostics.tools import validate_allowed_paths
 
 MIN_PRODUCTION_KEY_LENGTH = 32
 
@@ -51,7 +54,28 @@ class Settings(BaseSettings):
     gateway_max_request_bytes: int = Field(default=262_144, ge=4096, le=1_048_576)
     gateway_max_response_bytes: int = Field(default=262_144, ge=4096, le=4_194_304)
 
-    _split_api_keys = field_validator("api_keys", mode="before")(_split_list)
+    # Diagnostics. The roots exist so tests, or a container with the host's
+    # filesystems mounted elsewhere, can point the tools at other locations.
+    procfs_root: Path = Path("/proc")
+    cgroup_root: Path = Path("/sys/fs/cgroup")
+    # The only paths the filesystem tools accept, matched exactly.
+    filesystem_paths: Annotated[tuple[str, ...], NoDecode] = ("/",)
+    tool_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    max_tool_output_bytes: int = Field(default=16_384, ge=1024, le=262_144)
+
+    _split_lists = field_validator("api_keys", "filesystem_paths", mode="before")(_split_list)
+
+    @field_validator("filesystem_paths")
+    @classmethod
+    def _check_filesystem_paths(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_allowed_paths(paths)
+
+    @field_validator("procfs_root", "cgroup_root")
+    @classmethod
+    def _check_absolute(cls, path: Path) -> Path:
+        if not path.is_absolute():
+            raise ValueError("diagnostic roots must be absolute paths")
+        return path
 
     @field_validator("gateway_url")
     @classmethod

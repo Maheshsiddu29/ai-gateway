@@ -84,3 +84,28 @@ def test_rejects_gateway_urls_with_credentials_query_or_fragment(url: str) -> No
 
 def test_gateway_key_is_not_in_repr() -> None:
     assert GATEWAY_API_KEY not in repr(make_settings())
+
+
+def test_filesystem_paths_default_to_the_root_filesystem() -> None:
+    assert make_settings().filesystem_paths == ("/",)
+
+
+def test_reads_filesystem_paths_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_API_KEYS", AGENT_API_KEY)
+    monkeypatch.setenv("AGENT_ENVIRONMENT", "development")
+    monkeypatch.setenv("AGENT_GATEWAY_URL", "http://gateway:8000")
+    monkeypatch.setenv("AGENT_GATEWAY_API_KEY", GATEWAY_API_KEY)
+    monkeypatch.setenv("AGENT_FILESYSTEM_PATHS", "/, /var/lib/postgresql")
+
+    assert Settings().filesystem_paths == ("/", "/var/lib/postgresql")
+
+
+@pytest.mark.parametrize("paths", [("relative",), ("/var/",), ("/a", "/a")])
+def test_rejects_invalid_filesystem_paths(paths: tuple[str, ...]) -> None:
+    with pytest.raises(ValidationError, match="filesystem paths"):
+        make_settings(filesystem_paths=paths)
+
+
+def test_diagnostic_roots_must_be_absolute() -> None:
+    with pytest.raises(ValidationError, match="absolute"):
+        make_settings(procfs_root="proc")
