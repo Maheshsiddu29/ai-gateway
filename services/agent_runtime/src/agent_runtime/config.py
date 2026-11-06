@@ -145,10 +145,8 @@ class DatabaseFields(BaseFields):
         return self
 
 
-class Settings(GatewayFields, DiagnosticsFields, ModelFields):
-    # Credentials accepted from callers of the runtime's own API.
-    api_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(min_length=1)
-    max_request_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
+class WorkflowLimitFields(BaseFields):
+    """Limits recorded on each investigation when it is accepted."""
 
     max_llm_calls: int = Field(default=2, ge=1, le=8)
     max_tool_calls: int = Field(default=6, ge=1, le=MAX_PLAN_STEPS)
@@ -156,7 +154,16 @@ class Settings(GatewayFields, DiagnosticsFields, ModelFields):
     # them, count toward it, so it must leave room for the JSON reply.
     max_output_tokens: int = Field(default=2048, ge=64, le=16_384)
     investigation_timeout_seconds: float = Field(default=180.0, gt=0, le=900)
-    max_concurrent_investigations: int = Field(default=4, ge=1, le=64)
+
+
+class ApiSettings(DatabaseFields, WorkflowLimitFields):
+    """The investigation API. It never calls the gateway and holds no gateway key."""
+
+    # Credentials accepted from callers of the runtime's own API.
+    api_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(min_length=1)
+    max_request_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
+    # Unfinished investigations one caller may have; more are refused with 429.
+    max_active_investigations_per_principal: int = Field(default=10, ge=1, le=10_000)
 
     _split_api_keys = field_validator("api_keys", mode="before")(_split_list)
 
@@ -166,14 +173,9 @@ class Settings(GatewayFields, DiagnosticsFields, ModelFields):
             len(key.get_secret_value()) < MIN_PRODUCTION_KEY_LENGTH for key in self.api_keys
         ):
             raise ValueError(
-                f"agent and gateway API keys must be at least {MIN_PRODUCTION_KEY_LENGTH}"
-                " characters in production"
+                f"agent API keys must be at least {MIN_PRODUCTION_KEY_LENGTH} characters"
+                " in production"
             )
-        if self.gateway_api_key.get_secret_value() in {
-            key.get_secret_value() for key in self.api_keys
-        }:
-            # Otherwise every runtime caller could also call the gateway directly.
-            raise ValueError("the gateway API key must differ from every agent API key")
         return self
 
 

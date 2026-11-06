@@ -1,13 +1,21 @@
+import re
 from typing import Annotated
 
 from fastapi import Depends, Request
 from pydantic import ValidationError
 
-from agent_runtime.api.errors import AuthenticationError, InvalidRequestError, NotReadyError
-from agent_runtime.config import Settings
+from agent_runtime.api.errors import (
+    AuthenticationError,
+    InvalidRequestError,
+    NotReadyError,
+)
+from agent_runtime.config import ApiSettings
 from agent_runtime.investigation.schemas import InvestigationRequest
-from agent_runtime.investigation.workflow import Investigator
+from agent_runtime.persistence.store import InvestigationStore
 from agent_runtime.security import Authenticator, Principal, parse_bearer_token
+
+IDEMPOTENCY_KEY_HEADER = "idempotency-key"
+_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 async def require_principal(request: Request) -> Principal:
@@ -25,11 +33,22 @@ async def require_principal(request: Request) -> Principal:
     return principal
 
 
-async def get_investigator(request: Request) -> Investigator:
-    investigator: Investigator | None = request.app.state.investigator
-    if investigator is None:
+async def get_store(request: Request) -> InvestigationStore:
+    store: InvestigationStore | None = request.app.state.store
+    if store is None:
         raise NotReadyError("The agent runtime is not ready.")
-    return investigator
+    return store
+
+
+async def read_idempotency_key(request: Request) -> str | None:
+    key = request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    if key is not None and not _IDEMPOTENCY_KEY.fullmatch(key):
+        raise InvalidRequestError(
+            "Idempotency-Key must be 1 to 128 characters from A-Z a-z 0-9 . _ : -.",
+            code="invalid_idempotency_key",
+            param="Idempotency-Key",
+        )
+    return key
 
 
 async def read_investigation_request(request: Request) -> InvestigationRequest:
@@ -42,7 +61,7 @@ async def read_investigation_request(request: Request) -> InvestigationRequest:
             code="unsupported_media_type",
             status_code=415,
         )
-    settings: Settings = request.app.state.settings
+    settings: ApiSettings = request.app.state.settings
     limit = settings.max_request_bytes
     too_large = InvalidRequestError(
         f"Request body exceeds the {limit}-byte limit.", code="request_too_large", status_code=413
@@ -74,5 +93,6 @@ async def read_investigation_request(request: Request) -> InvestigationRequest:
 
 
 PrincipalDep = Annotated[Principal, Depends(require_principal)]
-InvestigatorDep = Annotated[Investigator, Depends(get_investigator)]
+StoreDep = Annotated[InvestigationStore, Depends(get_store)]
+IdempotencyKeyDep = Annotated[str | None, Depends(read_idempotency_key)]
 InvestigationRequestDep = Annotated[InvestigationRequest, Depends(read_investigation_request)]

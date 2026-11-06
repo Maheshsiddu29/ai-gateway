@@ -1,78 +1,57 @@
-"""Application assembly.
+"""Application assembly for the investigation API.
 
 ``create_app`` is the ASGI entry point. ``build_app`` takes its dependencies
-explicitly so tests can supply settings, an HTTP transport for the gateway, and a
-diagnostic backend.
+explicitly so tests can supply settings and a connection pool. The API stores and
+reads investigations; the durable worker (``python -m agent_runtime.worker``)
+runs them.
 """
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI
 
 from agent_runtime.api import health, investigations
 from agent_runtime.api.errors import install_error_handlers
 from agent_runtime.api.middleware import RequestContextMiddleware
-from agent_runtime.config import Settings
-from agent_runtime.diagnostics.local import LocalDiagnostics
-from agent_runtime.diagnostics.tools import DiagnosticBackend
-from agent_runtime.factories import build_diagnostic_executor, build_gateway_client
-from agent_runtime.gateway_client import GatewayClient
-from agent_runtime.investigation.workflow import InvestigationLimits, Investigator, ModelAliases
+from agent_runtime.config import ApiSettings
 from agent_runtime.logging import configure_logging
+from agent_runtime.persistence import migrations
+from agent_runtime.persistence.database import Pool, create_pool
+from agent_runtime.persistence.store import InvestigationStore
 from agent_runtime.security import StaticKeyAuthenticator
 
 
 def create_app() -> FastAPI:
-    settings = Settings()
+    settings = ApiSettings()
     configure_logging(settings.log_level)
     return build_app(settings)
 
 
-def build_investigator(
-    settings: Settings, gateway: GatewayClient, backend: DiagnosticBackend
-) -> Investigator:
-    return Investigator(
-        gateway,
-        build_diagnostic_executor(settings, backend),
-        models=ModelAliases(planner=settings.planner_model, diagnosis=settings.diagnosis_model),
-        limits=InvestigationLimits(
-            max_llm_calls=settings.max_llm_calls,
-            max_tool_calls=settings.max_tool_calls,
-            max_output_tokens=settings.max_output_tokens,
-            timeout_seconds=settings.investigation_timeout_seconds,
-        ),
-        allowed_paths=frozenset(settings.filesystem_paths),
-    )
+def build_app(settings: ApiSettings, pool: Pool | None = None) -> FastAPI:
+    """``pool``, when given, is used as is and not closed; otherwise one is opened."""
 
-
-def build_app(
-    settings: Settings,
-    gateway_transport: httpx.AsyncBaseTransport | None = None,
-    diagnostic_backend: DiagnosticBackend | None = None,
-) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        local: LocalDiagnostics | None = None
-        backend = diagnostic_backend
-        if backend is None:
-            backend = local = LocalDiagnostics(
-                settings.procfs_root, settings.cgroup_root, workers=settings.diagnostic_workers
-            )
-        gateway = build_gateway_client(settings, gateway_transport)
-        app.state.gateway_client = gateway
-        app.state.investigator = build_investigator(settings, gateway, backend)
-        app.state.ready = True
+        owned = pool is None
+        active = pool or create_pool(
+            settings.database_url,
+            settings.database_schema,
+            "agent-runtime-api",
+            max_size=settings.database_pool_size,
+            timeout=settings.database_timeout_seconds,
+        )
+        if owned:
+            await active.open(wait=True, timeout=settings.database_timeout_seconds)
         try:
+            async with active.connection() as conn:
+                await migrations.verify(conn)
+            app.state.store = InvestigationStore(active)
             yield
         finally:
-            app.state.ready = False
-            app.state.investigator = None
-            await gateway.aclose()
-            if local is not None:
-                local.close()
+            app.state.store = None
+            if owned:
+                await active.close()
 
     # Request bodies are parsed manually with a size limit, so a generated schema
     # would not describe them; the interactive docs are disabled.
@@ -85,10 +64,7 @@ def build_app(
     )
     app.state.settings = settings
     app.state.authenticator = StaticKeyAuthenticator(settings.api_keys)
-    app.state.ready = False
-    app.state.gateway_client = None
-    app.state.investigator = None
-    app.state.investigation_capacity = asyncio.Semaphore(settings.max_concurrent_investigations)
+    app.state.store = None
 
     install_error_handlers(app)
     app.add_middleware(RequestContextMiddleware)

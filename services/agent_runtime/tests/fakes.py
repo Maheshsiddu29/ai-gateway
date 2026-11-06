@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI
 
-from agent_runtime.config import Environment, Settings
+from agent_runtime.config import ApiSettings, Environment, WorkerSettings
 from agent_runtime.diagnostics.tools import (
     DiagnosticBackend,
     DiagnosticExecutor,
@@ -32,20 +32,33 @@ from agent_runtime.investigation.schemas import InvestigationResult
 AGENT_API_KEY = "test-agent-key-0123456789abcdef0123"
 GATEWAY_API_KEY = "test-gateway-key-0123456789abcdef"
 GATEWAY_URL = "http://gateway.test"
+OTHER_AGENT_API_KEY = "test-other-agent-key-0123456789abcdef"
 AUTH_HEADERS = {"Authorization": f"Bearer {AGENT_API_KEY}"}
+OTHER_AUTH_HEADERS = {"Authorization": f"Bearer {OTHER_AGENT_API_KEY}"}
 
 
-def make_settings(**overrides: object) -> Settings:
+def make_settings(**overrides: object) -> ApiSettings:
+    """API settings. The database URL is a placeholder: tests pass their own pool."""
     values: dict[str, object] = {
-        "api_keys": (AGENT_API_KEY,),
+        "api_keys": (AGENT_API_KEY, OTHER_AGENT_API_KEY),
+        "environment": Environment.DEVELOPMENT,
+        "database_url": "postgresql://agent_app:unused@localhost/agent",
+    }
+    values.update(overrides)
+    return ApiSettings.model_validate(values)
+
+
+def make_worker_settings(**overrides: object) -> WorkerSettings:
+    values: dict[str, object] = {
         "environment": Environment.DEVELOPMENT,
         "gateway_url": GATEWAY_URL,
         "gateway_api_key": GATEWAY_API_KEY,
         "planner_model": "planner",
         "diagnosis_model": "diagnosis",
+        "database_url": "postgresql://agent_app:unused@localhost/agent",
     }
     values.update(overrides)
-    return Settings.model_validate(values)
+    return WorkerSettings.model_validate(values)
 
 
 @asynccontextmanager

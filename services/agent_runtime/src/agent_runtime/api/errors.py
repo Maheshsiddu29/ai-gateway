@@ -8,10 +8,9 @@ contain request content, model output, or upstream error bodies.
 from typing import Any, ClassVar
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from agent_runtime.api.disconnect import CLIENT_CLOSED_REQUEST, ClientDisconnectedError
 from agent_runtime.logging import request_id_var
 
 _HTTP_EXCEPTION_CODES = {404: "not_found", 405: "method_not_allowed"}
@@ -53,6 +52,24 @@ class RateLimitedError(ApiError):
     error_type = "rate_limited"
     default_status_code = 429
     default_code = "rate_limited"
+
+
+class ConflictError(ApiError):
+    error_type = "conflict"
+    default_status_code = 409
+    default_code = "conflict"
+
+
+class NotFoundError(ApiError):
+    error_type = "invalid_request"
+    default_status_code = 404
+    default_code = "not_found"
+
+
+class PersistenceUnavailableError(ApiError):
+    error_type = "persistence_unavailable"
+    default_status_code = 503
+    default_code = "persistence_unavailable"
 
 
 class NotReadyError(ApiError):
@@ -104,7 +121,3 @@ def install_error_handlers(app: FastAPI) -> None:
         if exc.headers:
             response.headers.update(exc.headers)
         return response
-
-    @app.exception_handler(ClientDisconnectedError)
-    async def handle_client_disconnect(request: Request, exc: ClientDisconnectedError) -> Response:
-        return Response(status_code=CLIENT_CLOSED_REQUEST)

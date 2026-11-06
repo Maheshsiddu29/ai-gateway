@@ -10,6 +10,7 @@ triggers enforce the state machines independently of this code.
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, LiteralString
 
@@ -86,6 +87,58 @@ class Operation:
         )
 
 
+class IdempotencyConflictError(Exception):
+    """The idempotency key was used before with a different request."""
+
+
+class ActiveLimitError(Exception):
+    """The caller already has the maximum number of unfinished investigations."""
+
+
+@dataclass(frozen=True)
+class NewInvestigation:
+    principal_id: str
+    idempotency_key: str | None
+    request_hash: bytes
+    incident: str
+    workflow_version: str
+    prompt_version: str
+    max_llm_calls: int
+    max_tool_calls: int
+    max_output_tokens: int
+    timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class InvestigationRecord:
+    """What a caller may see of an investigation: never the incident or the journal."""
+
+    investigation_id: str
+    status: str
+    current_stage: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    result: dict[str, Any] | None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "InvestigationRecord":
+        return cls(
+            investigation_id=row["investigation_id"],
+            status=row["status"],
+            current_stage=row["current_stage"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+            result=row["result"],
+        )
+
+
+_RECORD_COLUMNS = sql.SQL(
+    "investigation_id, status, current_stage, created_at, updated_at, completed_at, result"
+)
+
+
 @dataclass(frozen=True)
 class Claim:
     """An investigation a worker now owns, with the limits recorded when it was accepted."""
@@ -123,6 +176,99 @@ async def _fence(conn: Connection, lease: Lease) -> dict[str, Any]:
 class InvestigationStore:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
+
+    # The registry -----------------------------------------------------------------
+
+    async def create(
+        self, new: NewInvestigation, *, max_active_per_principal: int
+    ) -> tuple[InvestigationRecord, bool]:
+        """Store an accepted investigation; returns it and whether it was created.
+
+        With an idempotency key, a repeated identical request returns the original
+        investigation, and the same key with a different request raises
+        ``IdempotencyConflictError``. Creation is refused with ``ActiveLimitError``
+        when the caller already has ``max_active_per_principal`` unfinished ones.
+        Concurrent requests from one caller are serialized by an advisory lock.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"agent_runtime.principal:{new.principal_id}",),
+            )
+            if new.idempotency_key is not None:
+                existing = await self._by_key(conn, new.principal_id, new.idempotency_key)
+                if existing is not None:
+                    record, request_hash = existing
+                    if request_hash != new.request_hash:
+                        raise IdempotencyConflictError(new.idempotency_key)
+                    return record, False
+            cursor = await conn.execute(
+                "SELECT count(*) AS active FROM investigations WHERE principal_id = %s"
+                " AND status IN ('accepted', 'running')",
+                (new.principal_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None and row["active"] >= max_active_per_principal:
+                raise ActiveLimitError(new.principal_id)
+            cursor = await conn.execute(
+                sql.SQL(
+                    "INSERT INTO investigations (investigation_id, principal_id,"
+                    " idempotency_key, request_hash, incident, workflow_version, prompt_version,"
+                    " max_llm_calls, max_tool_calls, max_output_tokens, deadline_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
+                    " now() + make_interval(secs => %s)) RETURNING {}"
+                ).format(_RECORD_COLUMNS),
+                (
+                    f"inv-{uuid.uuid4().hex}",
+                    new.principal_id,
+                    new.idempotency_key,
+                    new.request_hash,
+                    new.incident,
+                    new.workflow_version,
+                    new.prompt_version,
+                    new.max_llm_calls,
+                    new.max_tool_calls,
+                    new.max_output_tokens,
+                    new.timeout_seconds,
+                ),
+            )
+            created = await cursor.fetchone()
+        if created is None:
+            raise RuntimeError("INSERT ... RETURNING returned no row")
+        return InvestigationRecord.from_row(created), True
+
+    async def _by_key(
+        self, conn: Connection, principal_id: str, key: str
+    ) -> tuple[InvestigationRecord, bytes] | None:
+        cursor = await conn.execute(
+            sql.SQL(
+                "SELECT {}, request_hash FROM investigations"
+                " WHERE principal_id = %s AND idempotency_key = %s"
+            ).format(_RECORD_COLUMNS),
+            (principal_id, key),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return InvestigationRecord.from_row(row), bytes(row["request_hash"])
+
+    async def get(self, investigation_id: str, principal_id: str) -> InvestigationRecord | None:
+        """The investigation, if it exists and belongs to ``principal_id``."""
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute(
+                sql.SQL(
+                    "SELECT {} FROM investigations WHERE investigation_id = %s"
+                    " AND principal_id = %s"
+                ).format(_RECORD_COLUMNS),
+                (investigation_id, principal_id),
+            )
+            row = await cursor.fetchone()
+        return None if row is None else InvestigationRecord.from_row(row)
+
+    async def ping(self) -> bool:
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute("SELECT 1 AS ok")
+            return await cursor.fetchone() == {"ok": 1}
 
     # Ownership --------------------------------------------------------------------
 

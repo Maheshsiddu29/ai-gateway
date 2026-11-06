@@ -1,116 +1,136 @@
-"""POST /v1/investigations through the application, with the gateway simulated by an
-httpx transport and the local diagnostics reading fake procfs and cgroup trees."""
+"""POST and GET /v1/investigations against PostgreSQL.
+
+The API only stores and reads investigations; tests that need one to finish run
+the worker in-process against a scripted gateway.
+"""
 
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from pydantic import SecretStr
 from starlette.types import Message
 
+from agent_runtime.diagnostics.tools import DiagnosticExecutor
+from agent_runtime.durable.worker import Worker, WorkerConfig
+from agent_runtime.gateway_client import GatewayClient, GatewayTimeouts
+from agent_runtime.investigation.graph import WORKFLOW_VERSION, ModelAliases
 from agent_runtime.main import build_app
+from agent_runtime.persistence.checkpoints import checkpointer
+from agent_runtime.persistence.database import Connection, Pool
+from agent_runtime.persistence.store import InvestigationStore
+from tests.db import investigation
 from tests.fakes import (
     AGENT_API_KEY,
     AUTH_HEADERS,
+    DIAGNOSIS_REPLY,
     GATEWAY_API_KEY,
+    OTHER_AUTH_HEADERS,
+    PLAN_REPLY,
+    CountingBackend,
     GatewayStub,
     completion_body,
     make_settings,
     serve,
 )
 
-PLAN = {
-    "steps": [
-        {"tool": "memory_info", "arguments": {}, "reason": "System memory."},
-        {"tool": "cgroup_memory", "arguments": {}, "reason": "Container limit."},
-        {"tool": "filesystem_capacity", "arguments": {"path": "/"}, "reason": "Disk."},
-    ]
-}
-DIAGNOSIS = {
-    "conclusion": "supported",
-    "summary": "The container is at its memory limit.",
-    "findings": [{"claim": "Usage equals the limit.", "evidence": ["E2"]}],
-    "next_steps": ["Review the memory limit."],
-}
-
-
-@pytest.fixture
-def host(tmp_path: Path) -> dict[str, Path]:
-    procfs, cgroup = tmp_path / "proc", tmp_path / "cgroup"
-    (procfs / "self").mkdir(parents=True)
-    cgroup.mkdir()
-    (procfs / "meminfo").write_text("MemTotal: 8000000 kB\nMemFree: 100000 kB\n")
-    (procfs / "self" / "cgroup").write_text("0::/\n")
-    (cgroup / "cgroup.controllers").write_text("memory\n")
-    (cgroup / "memory.current").write_text("1073741824\n")
-    (cgroup / "memory.max").write_text("1073741824\n")
-    (cgroup / "memory.events").write_text("max 40\noom 2\noom_kill 2\n")
-    return {"procfs_root": procfs, "cgroup_root": cgroup}
-
-
-def scripted(plan: object = PLAN, diagnosis: object = DIAGNOSIS) -> GatewayStub:
-    replies = {"planner": plan, "diagnosis": diagnosis}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        model = json.loads(request.content)["model"]
-        return httpx.Response(200, json=completion_body(json.dumps(replies[model]), model=model))
-
-    return GatewayStub(handler)
+INCIDENT = {"incident": "The payments container was OOM killed."}
 
 
 async def post(
-    client: httpx.AsyncClient, body: object, headers: dict[str, str] | None = None
+    client: httpx.AsyncClient,
+    body: object = INCIDENT,
+    headers: dict[str, str] | None = None,
+    key: str | None = None,
 ) -> httpx.Response:
-    return await client.post(
-        "/v1/investigations", json=body, headers=AUTH_HEADERS if headers is None else headers
+    sent = dict(AUTH_HEADERS if headers is None else headers)
+    if key is not None:
+        sent["Idempotency-Key"] = key
+    return await client.post("/v1/investigations", json=body, headers=sent)
+
+
+async def run_worker(pool: Pool) -> CountingBackend:
+    def reply(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        content = PLAN_REPLY if model == "planner" else DIAGNOSIS_REPLY
+        return httpx.Response(200, json=completion_body(content, model=model))
+
+    backend = CountingBackend()
+    client = GatewayClient(
+        "http://gateway.test",
+        SecretStr(GATEWAY_API_KEY),
+        timeouts=GatewayTimeouts(),
+        max_connections=2,
+        max_request_bytes=262_144,
+        max_response_bytes=65_536,
+        transport=GatewayStub(reply),
     )
+    worker = Worker(
+        InvestigationStore(pool),
+        checkpointer(pool),
+        client,
+        DiagnosticExecutor(backend, timeout_seconds=5, max_output_bytes=16_384),
+        WorkerConfig(
+            worker_id="worker-test",
+            concurrency=2,
+            max_running=10,
+            lease_seconds=10,
+            poll_seconds=0.05,
+            shutdown_grace_seconds=1,
+            max_recovery_attempts=3,
+            models=ModelAliases("planner", "diagnosis"),
+            allowed_paths=frozenset({"/"}),
+        ),
+    )
+    await worker.run_until_idle()
+    await client.aclose()
+    return backend
 
 
-async def test_runs_an_investigation_against_local_diagnostics(host: dict[str, Path]) -> None:
-    stub = scripted()
-    app = build_app(make_settings(**host), stub)
-
-    async with serve(app) as client:
-        response = await post(client, {"incident": "The service was OOM killed."})
-
-    assert response.status_code == 200
-    result = response.json()
-    assert result["status"] == "completed"
-    assert result["investigation_id"].startswith("inv-")
-    assert [(e["id"], e["tool"], e["status"]) for e in result["evidence"]] == [
-        ("E1", "memory_info", "ok"),
-        ("E2", "cgroup_memory", "ok"),
-        ("E3", "filesystem_capacity", "ok"),
-    ]
-    assert result["evidence"][1]["data"]["limit_bytes"] == 1_073_741_824
-    assert result["diagnosis"]["conclusion"] == "supported"
-    assert result["usage"]["llm_calls"] == 2
-    # The gateway sees the runtime's gateway key, never the caller's agent key.
-    assert {r.headers["authorization"] for r in stub.requests} == {f"Bearer {GATEWAY_API_KEY}"}
-    request_ids = [r.headers["x-request-id"] for r in stub.requests]
-    assert request_ids == [f"{result['investigation_id']}-llm{n}" for n in (1, 2)]
+@pytest.fixture
+async def client(pool: Pool) -> AsyncIterator[httpx.AsyncClient]:
+    async with serve(build_app(make_settings(), pool)) as client:
+        yield client
 
 
-async def test_a_failed_investigation_is_a_result_not_an_error(host: dict[str, Path]) -> None:
-    plan = {"steps": [{"tool": "exec", "arguments": {"cmd": "id"}, "reason": "x"}]}
-    app = build_app(make_settings(**host), scripted(plan=plan))
+async def test_accepts_and_persists_before_answering(
+    client: httpx.AsyncClient, owner: Connection
+) -> None:
+    response = await post(client)
 
-    async with serve(app) as client:
-        response = await post(client, {"incident": "Disk is full."})
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "accepted"
+    assert body["result"] is None
+    assert response.headers["location"] == f"/v1/investigations/{body['investigation_id']}"
+    row = await investigation(owner, body["investigation_id"])
+    assert row["status"] == "accepted"
+    assert row["incident"] == INCIDENT["incident"]
+    assert row["workflow_version"] == WORKFLOW_VERSION
+    assert (row["max_llm_calls"], row["max_tool_calls"], row["max_output_tokens"]) == (2, 6, 2048)
+    assert row["principal_id"].startswith("agent-key-")
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "failed"
-    assert response.json()["failure"] == {
-        "stage": "planning",
-        "code": "unknown_tool",
-        "message": "The plan names a tool that does not exist.",
-        "gateway_status": None,
-        "gateway_error_code": None,
-    }
-    assert response.json()["evidence"] == []
+
+async def test_a_finished_investigation_is_returned_with_its_result(
+    client: httpx.AsyncClient, pool: Pool
+) -> None:
+    investigation_id = (await post(client)).json()["investigation_id"]
+
+    pending = await client.get(f"/v1/investigations/{investigation_id}", headers=AUTH_HEADERS)
+    await run_worker(pool)
+    done = await client.get(f"/v1/investigations/{investigation_id}", headers=AUTH_HEADERS)
+
+    assert pending.json()["status"] == "accepted"
+    assert done.status_code == 200
+    body = done.json()
+    assert body["status"] == "completed"
+    assert body["stage"] == "finalize"
+    assert body["result"]["diagnosis"]["conclusion"] == "supported"
+    assert [e["id"] for e in body["result"]["evidence"]] == ["E1", "E2"]
+    assert "incident" not in json.dumps(body)
 
 
 @pytest.mark.parametrize(
@@ -118,14 +138,46 @@ async def test_a_failed_investigation_is_a_result_not_an_error(host: dict[str, P
     [{}, {"Authorization": "Bearer wrong"}, {"Authorization": f"Bearer {GATEWAY_API_KEY}"}],
     ids=["missing", "wrong", "gateway-key"],
 )
-async def test_requires_an_agent_key(headers: dict[str, str]) -> None:
-    stub = scripted()
-    async with serve(build_app(make_settings(), stub)) as client:
-        response = await post(client, {"incident": "x"}, headers)
+async def test_requires_an_agent_key(
+    client: httpx.AsyncClient, owner: Connection, headers: dict[str, str]
+) -> None:
+    created = await post(client, headers=headers)
+    read = await client.get(f"/v1/investigations/inv-{'0' * 32}", headers=headers)
+
+    assert created.status_code == read.status_code == 401
+    cursor = await owner.execute("SELECT count(*) AS n FROM investigations")
+    assert await cursor.fetchone() == {"n": 0}
+
+
+async def test_authenticates_before_reading_the_body(pool: Pool) -> None:
+    async with serve(build_app(make_settings(max_request_bytes=4096), pool)) as client:
+        response = await client.post(
+            "/v1/investigations",
+            content=b" " * 10_000,
+            headers={"Content-Type": "application/json"},
+        )
 
     assert response.status_code == 401
-    assert response.json()["error"]["type"] == "authentication_error"
-    assert stub.requests == []
+
+
+async def test_other_callers_investigations_look_like_unknown_ones(
+    client: httpx.AsyncClient,
+) -> None:
+    investigation_id = (await post(client)).json()["investigation_id"]
+
+    theirs = await client.get(f"/v1/investigations/{investigation_id}", headers=OTHER_AUTH_HEADERS)
+    unknown = await client.get(f"/v1/investigations/inv-{'a' * 32}", headers=AUTH_HEADERS)
+    malformed = await client.get("/v1/investigations/../../etc", headers=AUTH_HEADERS)
+    bad_id = await client.get("/v1/investigations/inv-XYZ", headers=AUTH_HEADERS)
+
+    assert theirs.status_code == unknown.status_code == bad_id.status_code == 404
+    assert (
+        theirs.json()["error"]["code"]
+        == unknown.json()["error"]["code"]
+        == "investigation_not_found"
+    )
+    assert theirs.json()["error"]["message"] == unknown.json()["error"]["message"]
+    assert malformed.status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -139,119 +191,124 @@ async def test_requires_an_agent_key(headers: dict[str, str]) -> None:
         (b"[]", 400, "invalid_parameter"),
     ],
 )
-async def test_rejects_invalid_requests(body: bytes, status: int, code: str) -> None:
-    stub = scripted()
-    async with serve(build_app(make_settings(), stub)) as client:
-        response = await client.post(
-            "/v1/investigations",
-            content=body,
-            headers={**AUTH_HEADERS, "Content-Type": "application/json"},
-        )
+async def test_rejects_invalid_requests_without_storing_them(
+    client: httpx.AsyncClient, owner: Connection, body: bytes, status: int, code: str
+) -> None:
+    response = await client.post(
+        "/v1/investigations",
+        content=body,
+        headers={**AUTH_HEADERS, "Content-Type": "application/json"},
+    )
 
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
-    assert stub.requests == []
+    cursor = await owner.execute("SELECT count(*) AS n FROM investigations")
+    assert await cursor.fetchone() == {"n": 0}
 
 
-async def test_rejects_other_media_types() -> None:
-    async with serve(build_app(make_settings(), scripted())) as client:
-        response = await client.post(
-            "/v1/investigations", content=b"incident=x", headers=AUTH_HEADERS
-        )
+async def test_rejects_other_media_types(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/investigations", content=b"incident=x", headers=AUTH_HEADERS)
 
     assert response.status_code == 415
 
 
-async def test_rejects_oversized_bodies_with_and_without_a_length() -> None:
+async def test_rejects_oversized_bodies_with_and_without_a_length(pool: Pool) -> None:
     async def chunks() -> AsyncIterator[bytes]:
         for _ in range(10):
             yield b" " * 1024
 
     headers = {**AUTH_HEADERS, "Content-Type": "application/json"}
-    async with serve(build_app(make_settings(max_request_bytes=4096), scripted())) as client:
+    async with serve(build_app(make_settings(max_request_bytes=4096), pool)) as client:
         declared = await client.post("/v1/investigations", content=b" " * 5000, headers=headers)
         chunked = await client.post("/v1/investigations", content=chunks(), headers=headers)
 
     assert declared.status_code == chunked.status_code == 413
 
 
-async def test_refuses_investigations_beyond_the_concurrency_limit(
-    host: dict[str, Path],
+async def test_an_idempotent_retry_returns_the_same_investigation(
+    client: httpx.AsyncClient, owner: Connection
 ) -> None:
-    release = asyncio.Event()
-    entered = asyncio.Event()
-    replies: dict[str, Any] = {"planner": PLAN, "diagnosis": DIAGNOSIS}
+    first = await post(client, key="retry-key-1")
+    second = await post(client, key="retry-key-1")
 
-    class BlockingGateway(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            entered.set()
-            await release.wait()
-            model = json.loads(request.content)["model"]
-            return httpx.Response(
-                200, json=completion_body(json.dumps(replies[model]), model=model)
-            )
-
-    app = build_app(make_settings(max_concurrent_investigations=1, **host), BlockingGateway())
-    async with serve(app) as client:
-        first = asyncio.create_task(post(client, {"incident": "first"}))
-        await entered.wait()
-        second = await post(client, {"incident": "second"})
-        release.set()
-        first_response = await first
-
-    assert second.status_code == 429
-    assert second.json()["error"]["code"] == "concurrency_limit_exceeded"
-    assert first_response.json()["status"] == "completed"
+    assert first.status_code == second.status_code == 202
+    assert first.json()["investigation_id"] == second.json()["investigation_id"]
+    assert "idempotent-replayed" not in first.headers
+    assert second.headers["idempotent-replayed"] == "true"
+    cursor = await owner.execute("SELECT count(*) AS n FROM investigations")
+    assert await cursor.fetchone() == {"n": 1}
 
 
-async def test_not_ready_outside_the_lifespan() -> None:
-    app = build_app(make_settings(), scripted())
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://agent.test") as client:
-        response = await post(client, {"incident": "x"})
+async def test_reusing_a_key_for_a_different_request_conflicts(client: httpx.AsyncClient) -> None:
+    await post(client, key="retry-key-2")
 
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "not_ready"
+    response = await post(client, {"incident": "Something else entirely."}, key="retry-key-2")
 
-
-async def test_the_agent_key_never_reaches_the_gateway(host: dict[str, Path]) -> None:
-    stub = scripted()
-    async with serve(build_app(make_settings(**host), stub)) as client:
-        await post(client, {"incident": "x"})
-
-    for request in stub.requests:
-        assert AGENT_API_KEY not in str(request.headers)
-        assert AGENT_API_KEY not in request.content.decode()
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "idempotency_key_reused"
 
 
-async def test_a_client_disconnect_cancels_the_investigation(host: dict[str, Path]) -> None:
-    started, cancelled, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+async def test_idempotency_keys_are_scoped_to_the_caller(client: httpx.AsyncClient) -> None:
+    mine = await post(client, key="shared-key")
+    theirs = await post(client, headers=OTHER_AUTH_HEADERS, key="shared-key")
 
-    class HangingGateway(httpx.AsyncBaseTransport):
-        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-            raise AssertionError("unreachable")
+    assert mine.json()["investigation_id"] != theirs.json()["investigation_id"]
 
-    body = json.dumps({"incident": "x"}).encode()
+
+async def test_concurrent_submissions_with_one_key_create_one_investigation(
+    client: httpx.AsyncClient, owner: Connection
+) -> None:
+    responses = await asyncio.gather(*(post(client, key="burst-key") for _ in range(12)))
+
+    assert {r.status_code for r in responses} == {202}
+    assert len({r.json()["investigation_id"] for r in responses}) == 1
+    cursor = await owner.execute("SELECT count(*) AS n FROM investigations")
+    assert await cursor.fetchone() == {"n": 1}
+
+
+@pytest.mark.parametrize("key", ["", "has space", "x" * 129, "semi;colon"])
+async def test_rejects_malformed_idempotency_keys(client: httpx.AsyncClient, key: str) -> None:
+    response = await client.post(
+        "/v1/investigations", json=INCIDENT, headers={**AUTH_HEADERS, "Idempotency-Key": key}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_idempotency_key"
+
+
+async def test_limits_unfinished_investigations_per_caller(pool: Pool) -> None:
+    async with serve(
+        build_app(make_settings(max_active_investigations_per_principal=2), pool)
+    ) as client:
+        accepted = [await post(client) for _ in range(2)]
+        refused = await post(client)
+        other = await post(client, headers=OTHER_AUTH_HEADERS)
+        replay = await post(client, key="k")  # a new key still counts
+
+    assert [r.status_code for r in accepted] == [202, 202]
+    assert refused.status_code == 429
+    assert refused.json()["error"]["code"] == "active_investigation_limit"
+    assert other.status_code == 202
+    assert replay.status_code == 429
+
+
+async def test_a_client_disconnect_after_acceptance_does_not_cancel(
+    pool: Pool, owner: Connection
+) -> None:
+    app = build_app(make_settings(), pool)
+    body = json.dumps(INCIDENT).encode()
     pending: list[Message] = [{"type": "http.request", "body": body, "more_body": False}]
 
     async def receive() -> Message:
-        if pending:
-            return pending.pop()
-        await disconnected.wait()
-        return {"type": "http.disconnect"}
+        # The client is gone as soon as the body has been read.
+        return pending.pop() if pending else {"type": "http.disconnect"}
 
     sent: list[Message] = []
 
     async def send(message: Message) -> None:
         sent.append(message)
 
-    scope = {
+    scope: dict[str, Any] = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
@@ -270,14 +327,23 @@ async def test_a_client_disconnect_cancels_the_investigation(host: dict[str, Pat
         "client": ("127.0.0.1", 50000),
         "server": ("agent.test", 80),
     }
-    app = build_app(make_settings(max_concurrent_investigations=1, **host), HangingGateway())
-
     async with app.router.lifespan_context(app):
-        call = asyncio.create_task(app(scope, receive, send))
-        await asyncio.wait_for(started.wait(), timeout=2)
-        disconnected.set()
-        await asyncio.wait_for(call, timeout=2)
+        await app(scope, receive, send)
 
-        assert cancelled.is_set()
-        assert not app.state.investigation_capacity.locked()
-    assert sent[0]["status"] == 499
+    assert sent[0]["status"] == 202
+    investigation_id = json.loads(sent[1]["body"])["investigation_id"]
+    assert (await investigation(owner, investigation_id))["status"] == "accepted"
+    await run_worker(pool)
+    assert (await investigation(owner, investigation_id))["status"] == "completed"
+
+
+async def test_answers_503_when_the_database_is_unavailable(
+    client: httpx.AsyncClient, pool: Pool
+) -> None:
+    await pool.close()
+
+    created = await post(client)
+    read = await client.get(f"/v1/investigations/inv-{'0' * 32}", headers=AUTH_HEADERS)
+
+    assert created.status_code == read.status_code == 503
+    assert created.json()["error"]["code"] == "persistence_unavailable"

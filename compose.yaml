@@ -54,11 +54,54 @@ services:
     ports:
       - "127.0.0.1:8001:8000"
 
-  # The agent runtime (docs/agent-runtime.md). AGENT_GATEWAY_API_KEY must be one of
-  # GATEWAY_API_KEYS. The variables default to empty so that other profiles work
-  # without them; the runtime refuses to start if they are missing. Its only
-  # network is shared with the gateways alone, so it cannot reach the mock
-  # provider, Redis, or PostgreSQL directly.
+  # The agent runtime (docs/agent-runtime.md), started only with --profile agent:
+  # its own PostgreSQL, a migration job, the investigation API, and a durable
+  # worker. AGENT_GATEWAY_API_KEY must be one of GATEWAY_API_KEYS. The variables
+  # default to empty so that other profiles work without them; the runtime
+  # refuses to start if they are missing.
+  #
+  # Networks: the API is on agent-api (its published port) and agent-data, so it
+  # reaches only its database. The worker is on agent (shared with the gateways
+  # only) and agent-data. agent and agent-data are internal: the worker has no
+  # outbound access, and neither service can reach the mock provider, Redis, or
+  # the gateway's billing database.
+  agent-postgres:
+    image: postgres:16.10-alpine
+    profiles: [agent]
+    environment:
+      POSTGRES_DB: agent
+      POSTGRES_USER: agent_owner
+      POSTGRES_PASSWORD: agent-owner-local-only
+      # Read by the init script, which creates the unprivileged application role.
+      AGENT_DB_APP_PASSWORD: agent-app-local-only
+    volumes:
+      - agent-postgres-data:/var/lib/postgresql/data
+      - ./config/agent-postgres/10-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_owner -d agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [agent-data]
+
+  # Runs migrations as the schema owner and grants the application role. The API
+  # and worker connect only as agent_app.
+  agent-migrate:
+    <<: *hardening
+    profiles: [agent]
+    build:
+      context: .
+      target: agent-runtime
+    environment:
+      AGENT_ENVIRONMENT: development
+      AGENT_DATABASE_OWNER_URL: postgresql://agent_owner:agent-owner-local-only@agent-postgres:5432/agent
+      AGENT_DATABASE_APP_ROLE: agent_app
+    command: ["python", "-m", "agent_runtime.persistence", "upgrade"]
+    networks: [agent-data]
+    depends_on:
+      agent-postgres:
+        condition: service_healthy
+
   agent-runtime:
     <<: *hardening
     profiles: [agent]
@@ -68,17 +111,41 @@ services:
     environment:
       AGENT_ENVIRONMENT: development
       AGENT_API_KEYS: ${AGENT_API_KEYS:-}
+      AGENT_DATABASE_URL: postgresql://agent_app:agent-app-local-only@agent-postgres:5432/agent
+      AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8100:8100"
+    networks: [agent-api, agent-data]
+    depends_on:
+      agent-migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 35s
+
+  agent-worker:
+    <<: *hardening
+    profiles: [agent]
+    build:
+      context: .
+      target: agent-runtime
+    environment:
+      AGENT_ENVIRONMENT: development
       AGENT_GATEWAY_URL: http://gateway:8000
       AGENT_GATEWAY_API_KEY: ${AGENT_GATEWAY_API_KEY:-}
       AGENT_PLANNER_MODEL: agent-planner
       AGENT_DIAGNOSIS_MODEL: agent-diagnosis
+      AGENT_DATABASE_URL: postgresql://agent_app:agent-app-local-only@agent-postgres:5432/agent
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
-    ports:
-      - "127.0.0.1:8100:8100"
-    networks: [agent]
+    command: ["python", "-m", "agent_runtime.worker"]
+    # The image's check probes the API's HTTP port; the worker serves no HTTP.
+    healthcheck:
+      disable: true
+    networks: [agent, agent-data]
     depends_on:
       gateway:
         condition: service_healthy
+      agent-migrate:
+        condition: service_completed_successfully
+    # Longer than the worker's shutdown grace period (20 seconds by default).
     stop_grace_period: 35s
 
   mock-upstream:
@@ -138,9 +205,16 @@ networks:
   frontend: {}
   backend:
     internal: true
-  # The agent runtime and the gateways. Not internal, because the runtime's port is
-  # published to the host; outbound traffic from it is therefore not blocked.
-  agent: {}
+  # The agent worker and the gateways.
+  agent:
+    internal: true
+  # The agent API's published port. Not internal, so the API can make outbound
+  # connections; it holds no gateway or provider credentials.
+  agent-api: {}
+  # The agent database, the migration job, the API, and the worker.
+  agent-data:
+    internal: true
 
 volumes:
   postgres-data: {}
+  agent-postgres-data: {}

@@ -44,3 +44,4 @@ async def test_the_gateway_and_the_agent_runtime_do_not_import_each_other() -> N
     """They communicate only over HTTP, so either can be deployed and changed alone."""
     assert await _loaded_modules("gateway.main", "agent_runtime") == set()
     assert await _loaded_modules("agent_runtime.main", "gateway") == set()
+    assert await _loaded_modules("agent_runtime.worker", "gateway") == set()

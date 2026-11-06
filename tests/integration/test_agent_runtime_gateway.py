@@ -8,17 +8,33 @@ Diagnostics read fake procfs and cgroup trees, plus statvfs on "/".
 """
 
 import json
-from collections.abc import AsyncIterator
+import os
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from agent_runtime.config import Settings as AgentSettings
+from agent_runtime.config import ApiSettings, WorkerSettings
+from agent_runtime.diagnostics.local import LocalDiagnostics
+from agent_runtime.durable.worker import Worker, WorkerConfig
+from agent_runtime.factories import build_diagnostic_executor, build_gateway_client
 from agent_runtime.gateway_client import ChatMessage, GatewayClient, GatewayTimeouts
+from agent_runtime.investigation.graph import ModelAliases
+from agent_runtime.investigation.workflow import (
+    InvestigationLimits,
+    Investigator,
+    new_investigation_id,
+)
 from agent_runtime.main import build_app as build_agent_app
+from agent_runtime.persistence import migrations
+from agent_runtime.persistence.checkpoints import checkpointer
+from agent_runtime.persistence.database import connect, create_pool
+from agent_runtime.persistence.store import InvestigationStore
 from fastapi import FastAPI
 from pydantic import SecretStr
 
@@ -38,6 +54,7 @@ from tests.redis_server import RedisServer
 MOCK_CONFIG = Path(__file__).parents[2] / "config" / "gateway.mock.toml"
 AGENT_API_KEY = "test-agent-runtime-key-0123456789abcdef"
 AGENT_HEADERS = {"Authorization": f"Bearer {AGENT_API_KEY}"}
+INCIDENT = "The payments container restarted with exit code 137."
 
 
 class CountingTransport(httpx.AsyncBaseTransport):
@@ -81,44 +98,70 @@ def stub_gateway(
     return app, stub
 
 
-def agent_settings(host: dict[str, Path], **overrides: object) -> AgentSettings:
-    return AgentSettings.model_validate(
+@dataclass(frozen=True)
+class AgentConfig:
+    settings: WorkerSettings
+    max_output_tokens: int
+
+
+def agent_settings(host: dict[str, Path], **overrides: Any) -> AgentConfig:
+    max_output_tokens = overrides.pop("max_output_tokens", 2048)
+    settings = WorkerSettings.model_validate(
         {
             "environment": "development",
-            "api_keys": (AGENT_API_KEY,),
             "gateway_url": "http://gateway.test",
             "gateway_api_key": GATEWAY_API_KEY,
             "planner_model": "agent-planner",
             "diagnosis_model": "agent-diagnosis",
+            "database_url": "postgresql://unused:unused@localhost/unused",
             **host,
             **overrides,
         }
     )
+    return AgentConfig(settings, max_output_tokens)
+
+
+type Run = Callable[[], Awaitable[dict[str, Any]]]
 
 
 @asynccontextmanager
-async def agent(gateway: FastAPI, settings: AgentSettings) -> AsyncIterator[httpx.AsyncClient]:
-    """Run both applications' lifespans and yield a client for the agent runtime."""
-    app = build_agent_app(settings, httpx.ASGITransport(app=gateway))
-    async with (
-        gateway.router.lifespan_context(gateway),
-        app.router.lifespan_context(app),
-        httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://agent.test"
-        ) as client,
-    ):
-        yield client
+async def agent(gateway: FastAPI, config: AgentConfig) -> AsyncIterator[Run]:
+    """Run the investigation graph in memory against the real gateway application.
 
-
-async def investigate(client: httpx.AsyncClient) -> dict[str, Any]:
-    response = await client.post(
-        "/v1/investigations",
-        json={"incident": "The payments container restarted with exit code 137."},
-        headers=AGENT_HEADERS,
+    This exercises the runtime's gateway client, prompts, and validators over the
+    gateway's HTTP contract; the durable path is covered by
+    test_durable_investigation_through_the_gateway below.
+    """
+    settings = config.settings
+    client = build_gateway_client(settings, httpx.ASGITransport(app=gateway))
+    local = LocalDiagnostics(settings.procfs_root, settings.cgroup_root)
+    investigator = Investigator(
+        client,
+        build_diagnostic_executor(settings, local),
+        models=ModelAliases(settings.planner_model, settings.diagnosis_model),
+        limits=InvestigationLimits(
+            max_llm_calls=2,
+            max_tool_calls=6,
+            max_output_tokens=config.max_output_tokens,
+            timeout_seconds=60,
+        ),
+        allowed_paths=frozenset(settings.filesystem_paths),
     )
-    assert response.status_code == 200
-    result: dict[str, Any] = response.json()
-    return result
+
+    async def run() -> dict[str, Any]:
+        result = await investigator.investigate(INCIDENT, investigation_id=new_investigation_id())
+        return result.model_dump(mode="json")
+
+    try:
+        async with gateway.router.lifespan_context(gateway):
+            yield run
+    finally:
+        await client.aclose()
+        local.close()
+
+
+async def investigate(run: Run) -> dict[str, Any]:
+    return await run()
 
 
 @pytest.fixture
@@ -311,3 +354,80 @@ async def test_gateway_rate_limits_end_the_investigation(
     assert result["failure"]["gateway_error_code"] == "requests_per_minute_exceeded"
     assert len(result["evidence"]) == 1
     assert len(stub.requests) == 1
+
+
+@pytest.fixture
+async def agent_database() -> AsyncIterator[tuple[SecretStr, str]]:
+    """A migrated agent schema in AGENT_TEST_DATABASE_URL, dropped afterwards."""
+    url = os.environ.get("AGENT_TEST_DATABASE_URL")
+    if not url:
+        if os.environ.get("AGENT_REQUIRE_DATABASE_TESTS") == "1":
+            pytest.fail("AGENT_TEST_DATABASE_URL is required but not set")
+        pytest.skip("AGENT_TEST_DATABASE_URL is not set")
+    secret, schema = SecretStr(url), f"agent_contract_{uuid.uuid4().hex[:12]}"
+    async with await connect(secret, schema, "contract-tests") as conn:
+        await migrations.upgrade(conn, schema)
+    try:
+        yield secret, schema
+    finally:
+        async with await connect(secret, "public", "contract-tests") as conn:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+async def test_durable_investigation_through_the_gateway(
+    host: dict[str, Path], agent_database: tuple[SecretStr, str]
+) -> None:
+    url, schema = agent_database
+    gateway, upstream = mock_gateway()
+    settings = agent_settings(host).settings
+    pool = create_pool(url, schema, "contract-tests", max_size=4, timeout=10)
+    await pool.open(wait=True)
+    api = build_agent_app(
+        ApiSettings.model_validate(
+            {"environment": "development", "api_keys": (AGENT_API_KEY,), "database_url": url}
+        ),
+        pool,
+    )
+    client = build_gateway_client(settings, httpx.ASGITransport(app=gateway))
+    local = LocalDiagnostics(settings.procfs_root, settings.cgroup_root)
+    worker = Worker(
+        InvestigationStore(pool),
+        checkpointer(pool),
+        client,
+        build_diagnostic_executor(settings, local),
+        WorkerConfig(
+            worker_id="contract-worker",
+            concurrency=1,
+            max_running=4,
+            lease_seconds=10,
+            poll_seconds=0.05,
+            shutdown_grace_seconds=1,
+            max_recovery_attempts=3,
+            models=ModelAliases("agent-planner", "agent-diagnosis"),
+            allowed_paths=frozenset({"/"}),
+        ),
+    )
+    try:
+        async with (
+            gateway.router.lifespan_context(gateway),
+            api.router.lifespan_context(api),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api), base_url="http://agent.test"
+            ) as http,
+        ):
+            accepted = await http.post(
+                "/v1/investigations", json={"incident": INCIDENT}, headers=AGENT_HEADERS
+            )
+            await worker.run_until_idle()
+            investigation_id = accepted.json()["investigation_id"]
+            done = await http.get(f"/v1/investigations/{investigation_id}", headers=AGENT_HEADERS)
+    finally:
+        await client.aclose()
+        local.close()
+        await pool.close()
+
+    assert accepted.status_code == 202
+    body = done.json()
+    assert body["status"] == "completed", body["result"]
+    assert body["result"]["diagnosis"]["findings"][0]["evidence"] == ["E1"]
+    assert upstream.models == ["mock-agent-planner", "mock-agent-diagnosis"]
