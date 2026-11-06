@@ -82,8 +82,8 @@ Results contain only numbers and booleans under fixed keys. Status `unavailable`
 means the environment does not provide the information (no procfs, no memory
 controller, a filesystem that reports no inode counts). Status `failed` means it
 should exist but could not be read or parsed (`permission_denied`,
-`unrecognized_format`, `timeout`, `output_too_large`, `diagnostic_workers_busy`,
-...).
+`unrecognized_format`, `file_not_found`, `read_failed`, `timeout`,
+`output_too_large`, `diagnostic_workers_busy`).
 
 Reads run on a dedicated pool of `AGENT_DIAGNOSTIC_WORKERS` threads, never on the
 event loop's default executor, which also resolves the gateway's host name. A read
@@ -166,9 +166,11 @@ A caller reads only its own investigations. Another caller's ID is answered
 exactly like an unknown one, 404 `investigation_not_found`, so the API never
 reveals that it exists.
 
-Other HTTP errors, in the gateway's error envelope: 401 (missing or wrong agent
-key; gateway keys are not accepted), 400 (invalid JSON, fields, or
-`Idempotency-Key`), 413, 415, 429 `active_investigation_limit`
+Other HTTP errors, in the gateway's error envelope: 401 `missing_api_key` or
+`invalid_api_key` (gateway keys are not accepted), 400 `invalid_json`,
+`invalid_parameter`, `unknown_parameter`, `invalid_idempotency_key`, or
+`invalid_header`, 413 `request_too_large`, 415 `unsupported_media_type`,
+429 `active_investigation_limit`
 (`AGENT_MAX_ACTIVE_INVESTIGATIONS_PER_PRINCIPAL` unfinished), 503
 `persistence_unavailable` when the database cannot be reached, and 503
 `not_ready` before startup completes. `GET /health/live` and `GET /health/ready`
