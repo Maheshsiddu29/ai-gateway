@@ -384,7 +384,20 @@ async def test_durable_investigation_through_the_gateway(
     await pool.open(wait=True)
     api = build_agent_app(
         ApiSettings.model_validate(
-            {"environment": "development", "api_keys": (AGENT_API_KEY,), "database_url": url}
+            {
+                "environment": "development",
+                "api_keys": (AGENT_API_KEY,),
+                "database_url": url,
+                "planner_model": "agent-planner",
+                "diagnosis_model": "agent-diagnosis",
+                "model_prices": {
+                    alias: {
+                        "input_micro_usd_per_million_tokens": 1_000_000,
+                        "output_micro_usd_per_million_tokens": 2_000_000,
+                    }
+                    for alias in ("agent-planner", "agent-diagnosis")
+                },
+            }
         ),
         pool,
     )

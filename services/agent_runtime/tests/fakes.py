@@ -33,6 +33,10 @@ AGENT_API_KEY = "test-agent-key-0123456789abcdef0123"
 GATEWAY_API_KEY = "test-gateway-key-0123456789abcdef"
 GATEWAY_URL = "http://gateway.test"
 OTHER_AGENT_API_KEY = "test-other-agent-key-0123456789abcdef"
+PRICE = {
+    "input_micro_usd_per_million_tokens": 1_000_000,
+    "output_micro_usd_per_million_tokens": 2_000_000,
+}
 AUTH_HEADERS = {"Authorization": f"Bearer {AGENT_API_KEY}"}
 OTHER_AUTH_HEADERS = {"Authorization": f"Bearer {OTHER_AGENT_API_KEY}"}
 
@@ -43,6 +47,9 @@ def make_settings(**overrides: object) -> ApiSettings:
         "api_keys": (AGENT_API_KEY, OTHER_AGENT_API_KEY),
         "environment": Environment.DEVELOPMENT,
         "database_url": "postgresql://agent_app:unused@localhost/agent",
+        "planner_model": "planner",
+        "diagnosis_model": "diagnosis",
+        "model_prices": {"planner": PRICE, "diagnosis": PRICE},
     }
     values.update(overrides)
     return ApiSettings.model_validate(values)
@@ -204,6 +211,9 @@ def stage_context(
     async def finish(result: InvestigationResult) -> None:
         collected.append(result)
 
+    async def admit_tool_calls(count: int) -> None:
+        return None
+
     return StageContext(
         investigation_id=investigation_id,
         llm=llm,
@@ -215,4 +225,26 @@ def stage_context(
         enter=enter,
         elapsed_ms=elapsed_ms,
         finish=finish,
+        admit_tool_calls=admit_tool_calls,
+    )
+
+
+def example_result(investigation_id: str, status: str = "completed") -> InvestigationResult:
+    return InvestigationResult.model_validate(
+        {
+            "investigation_id": investigation_id,
+            "status": status,
+            "prompt_version": "linux-investigation-1",
+            "plan": None,
+            "evidence": [],
+            "diagnosis": None,
+            "failure": None,
+            "usage": {
+                "llm_calls": 0,
+                "tool_calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "duration_ms": 0,
+            },
+        }
     )

@@ -19,7 +19,7 @@ from agent_runtime.diagnostics.tools import DiagnosticExecutor
 from agent_runtime.durable.worker import Worker, WorkerConfig
 from agent_runtime.gateway_client import GatewayClient, GatewayTimeouts
 from agent_runtime.investigation.graph import WORKFLOW_VERSION, ModelAliases, OperationType
-from agent_runtime.investigation.schemas import InvestigationResult, Usage
+from agent_runtime.investigation.schemas import InvestigationResult
 from agent_runtime.persistence.checkpoints import checkpointer
 from agent_runtime.persistence.database import Connection, Pool
 from agent_runtime.persistence.store import InvestigationStore, Lease, LeaseLostError, Operation
@@ -31,6 +31,7 @@ from tests.fakes import (
     CountingBackend,
     GatewayStub,
     completion_body,
+    example_result,
 )
 
 USAGE = {"prompt_tokens": 30, "completion_tokens": 6}
@@ -46,6 +47,8 @@ class ScriptedGateway:
             "diagnosis": asyncio.Event(),
         }
         self.hold: dict[str, asyncio.Event] = {}
+        # Set to None to answer without token usage.
+        self.usage: dict[str, int] | None = USAGE
         self.stub = GatewayStub(self.handle)
 
     async def handle(self, request: httpx.Request) -> httpx.Response:
@@ -55,7 +58,7 @@ class ScriptedGateway:
         if model in self.hold:
             await self.hold[model].wait()
         reply = PLAN_REPLY if model == "planner" else DIAGNOSIS_REPLY
-        return httpx.Response(200, json=completion_body(reply, model=model, usage=USAGE))
+        return httpx.Response(200, json=completion_body(reply, model=model, usage=self.usage))
 
     def client(self) -> GatewayClient:
         return GatewayClient(
@@ -432,19 +435,6 @@ async def test_a_stale_worker_cannot_finish_an_investigation(owner: Connection, 
     gateway = ScriptedGateway()
 
     with pytest.raises(LeaseLostError):
-        await store.finish(stale, _result(investigation_id))
+        await store.finish(stale, example_result(investigation_id))
     assert (await investigation(owner, investigation_id))["status"] == "running"
     assert gateway.requests == {}
-
-
-def _result(investigation_id: str) -> InvestigationResult:
-    return InvestigationResult(
-        investigation_id=investigation_id,
-        status="completed",
-        prompt_version="x",
-        plan=None,
-        evidence=[],
-        diagnosis=None,
-        failure=None,
-        usage=Usage(llm_calls=0, tool_calls=0, prompt_tokens=0, completion_tokens=0, duration_ms=0),
-    )

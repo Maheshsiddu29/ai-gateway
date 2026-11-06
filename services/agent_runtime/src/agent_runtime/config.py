@@ -13,6 +13,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from agent_runtime.budget import MICRO_USD_LIMIT, ModelPrice
 from agent_runtime.diagnostics.tools import validate_allowed_paths
 from agent_runtime.investigation.schemas import MAX_PLAN_STEPS
 from agent_runtime.persistence.database import validate_database_url
@@ -156,8 +157,14 @@ class WorkflowLimitFields(BaseFields):
     investigation_timeout_seconds: float = Field(default=180.0, gt=0, le=900)
 
 
-class ApiSettings(DatabaseFields, WorkflowLimitFields):
+class ApiSettings(DatabaseFields, WorkflowLimitFields, ModelFields):
     """The investigation API. It never calls the gateway and holds no gateway key."""
+
+    # Estimated spending admission (see agent_runtime.budget). Prices per alias, in
+    # micro-USD per million tokens, from AGENT_MODEL_PRICES as JSON. Both aliases
+    # must be priced: an unpriced call could not be bounded.
+    model_prices: dict[ModelAlias, ModelPrice] = Field(default_factory=dict)
+    max_investigation_cost_micro_usd: int = Field(default=100_000, ge=0, le=MICRO_USD_LIMIT)
 
     # Credentials accepted from callers of the runtime's own API.
     api_keys: Annotated[tuple[SecretStr, ...], NoDecode] = Field(min_length=1)
@@ -166,6 +173,16 @@ class ApiSettings(DatabaseFields, WorkflowLimitFields):
     max_active_investigations_per_principal: int = Field(default=10, ge=1, le=10_000)
 
     _split_api_keys = field_validator("api_keys", mode="before")(_split_list)
+
+    @model_validator(mode="after")
+    def _check_prices(self) -> Self:
+        unpriced = sorted({self.planner_model, self.diagnosis_model} - set(self.model_prices))
+        if unpriced:
+            raise ValueError(
+                f"AGENT_MODEL_PRICES has no price for {', '.join(unpriced)}; spending could"
+                " not be bounded"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_api_keys(self) -> Self:

@@ -155,6 +155,10 @@ class Investigator:
         async def finish(result: InvestigationResult) -> None:
             finished.append(result)
 
+        async def admit_tool_calls(count: int) -> None:
+            # validate_plan already holds the plan to max_tool_calls in memory.
+            return None
+
         ctx = StageContext(
             investigation_id=investigation_id,
             llm=DirectLlmCaller(
@@ -171,6 +175,7 @@ class Investigator:
             enter=enter,
             elapsed_ms=elapsed_ms,
             finish=finish,
+            admit_tool_calls=admit_tool_calls,
         )
         latest: InvestigationState = {}
         deadline = asyncio.timeout(self._limits.timeout_seconds)

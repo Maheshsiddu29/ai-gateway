@@ -1,6 +1,7 @@
 """Rows in the states a worker leaves them in, for journal and recovery tests."""
 
 import hashlib
+import json
 import uuid
 from typing import Any
 
@@ -8,6 +9,13 @@ from agent_runtime.investigation.graph import WORKFLOW_VERSION
 from agent_runtime.investigation.prompts import PROMPT_VERSION
 from agent_runtime.persistence.database import Connection
 from agent_runtime.persistence.store import Lease
+
+# A dollar per million input tokens, two per million output tokens.
+PRICE = {
+    "input_micro_usd_per_million_tokens": 1_000_000,
+    "output_micro_usd_per_million_tokens": 2_000_000,
+}
+PRICING = {"planner": PRICE, "diagnosis": PRICE}
 
 
 async def insert_running(
@@ -17,20 +25,24 @@ async def insert_running(
     max_llm_calls: int = 2,
     fencing_token: int = 1,
     deadline_seconds: int = 3600,
+    budget_micro_usd: int = 1_000_000,
+    pricing: dict[str, Any] | None = PRICING,
 ) -> Lease:
     """An investigation that a worker has claimed, as a lease for that worker."""
     investigation_id = investigation_id or f"inv-{uuid.uuid4().hex}"
     await conn.execute(
         "INSERT INTO investigations (investigation_id, principal_id, request_hash, incident,"
         " workflow_version, prompt_version, max_llm_calls, max_tool_calls, max_output_tokens,"
-        " deadline_at) VALUES (%s, 'agent-key-0123456789ab', %s, 'Disk full.', %s, %s, %s,"
-        " 6, 512, now() + make_interval(secs => %s))",
+        " budget_micro_usd, pricing, deadline_at) VALUES (%s, 'agent-key-0123456789ab', %s,"
+        " 'Disk full.', %s, %s, %s, 6, 512, %s, %s, now() + make_interval(secs => %s))",
         (
             investigation_id,
             hashlib.sha256(investigation_id.encode()).digest(),
             WORKFLOW_VERSION,
             PROMPT_VERSION,
             max_llm_calls,
+            budget_micro_usd,
+            json.dumps(pricing) if pricing is not None else None,
             deadline_seconds,
         ),
     )
@@ -49,14 +61,16 @@ async def insert_accepted(
     incident: str = "The database host is out of memory.",
     max_llm_calls: int = 2,
     deadline_seconds: float = 3600,
+    budget_micro_usd: int = 1_000_000,
+    pricing: dict[str, Any] | None = PRICING,
 ) -> str:
     """A newly accepted investigation, as the API stores it."""
     investigation_id = f"inv-{uuid.uuid4().hex}"
     await conn.execute(
         "INSERT INTO investigations (investigation_id, principal_id, request_hash, incident,"
         " workflow_version, prompt_version, max_llm_calls, max_tool_calls, max_output_tokens,"
-        " deadline_at) VALUES (%s, 'agent-key-0123456789ab', %s, %s, %s, %s, %s, 6, 512,"
-        " now() + make_interval(secs => %s))",
+        " budget_micro_usd, pricing, deadline_at) VALUES (%s, 'agent-key-0123456789ab', %s, %s,"
+        " %s, %s, %s, 6, 512, %s, %s, now() + make_interval(secs => %s))",
         (
             investigation_id,
             hashlib.sha256(investigation_id.encode()).digest(),
@@ -64,6 +78,8 @@ async def insert_accepted(
             WORKFLOW_VERSION,
             PROMPT_VERSION,
             max_llm_calls,
+            budget_micro_usd,
+            json.dumps(pricing) if pricing is not None else None,
             deadline_seconds,
         ),
     )

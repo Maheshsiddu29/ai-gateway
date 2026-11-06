@@ -44,13 +44,19 @@ from agent_runtime.investigation.graph import (
     ModelAliases,
     Node,
     StageContext,
+    StageFailedError,
     build_graph,
     build_result,
 )
 from agent_runtime.investigation.prompts import PROMPT_VERSION
 from agent_runtime.investigation.schemas import Failure, InvestigationResult, Usage
 from agent_runtime.investigation.workflow import CompletionClient
-from agent_runtime.persistence.store import Claim, InvestigationStore, LeaseLostError
+from agent_runtime.persistence.store import (
+    AdmissionRefusedError,
+    Claim,
+    InvestigationStore,
+    LeaseLostError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +313,12 @@ class _Execution:
         async def elapsed_ms() -> float:
             return await store.elapsed_ms(lease.investigation_id)
 
+        async def admit_tool_calls(count: int) -> None:
+            try:
+                await store.admit_tool_calls(lease, count)
+            except AdmissionRefusedError as exc:
+                raise StageFailedError(exc.code, exc.message) from None
+
         return StageContext(
             investigation_id=lease.investigation_id,
             llm=JournaledLlmCaller(
@@ -324,6 +336,7 @@ class _Execution:
             enter=enter,
             elapsed_ms=elapsed_ms,
             finish=self._finish,
+            admit_tool_calls=admit_tool_calls,
         )
 
     async def _finish(self, result: InvestigationResult) -> None:

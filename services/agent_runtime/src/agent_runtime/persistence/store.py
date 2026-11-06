@@ -16,6 +16,7 @@ from typing import Any, LiteralString
 
 from psycopg import sql
 
+from agent_runtime.budget import cost_micro_usd, price_in, settlement
 from agent_runtime.investigation.graph import OperationType, UsageTotals
 from agent_runtime.investigation.schemas import InvestigationResult
 from agent_runtime.persistence.database import Connection, Pool
@@ -69,6 +70,7 @@ class Operation:
     may_have_executed: bool | None
     gateway_status: int | None
     gateway_error_code: str | None
+    reserved_micro_usd: int = 0
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "Operation":
@@ -84,6 +86,7 @@ class Operation:
             may_have_executed=row["may_have_executed"],
             gateway_status=row["gateway_status"],
             gateway_error_code=row["gateway_error_code"],
+            reserved_micro_usd=row["reserved_micro_usd"],
         )
 
 
@@ -107,6 +110,8 @@ class NewInvestigation:
     max_tool_calls: int
     max_output_tokens: int
     timeout_seconds: float
+    budget_micro_usd: int
+    pricing: dict[str, dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,9 @@ class InvestigationRecord:
     updated_at: datetime
     completed_at: datetime | None
     result: dict[str, Any] | None
+    budget_micro_usd: int
+    reserved_micro_usd: int
+    settled_micro_usd: int
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "InvestigationRecord":
@@ -131,11 +139,15 @@ class InvestigationRecord:
             updated_at=row["updated_at"],
             completed_at=row["completed_at"],
             result=row["result"],
+            budget_micro_usd=row["budget_micro_usd"],
+            reserved_micro_usd=row["reserved_micro_usd"],
+            settled_micro_usd=row["settled_micro_usd"],
         )
 
 
 _RECORD_COLUMNS = sql.SQL(
-    "investigation_id, status, current_stage, created_at, updated_at, completed_at, result"
+    "investigation_id, status, current_stage, created_at, updated_at, completed_at, result,"
+    " budget_micro_usd, reserved_micro_usd, settled_micro_usd"
 )
 
 
@@ -214,8 +226,8 @@ class InvestigationStore:
                 sql.SQL(
                     "INSERT INTO investigations (investigation_id, principal_id,"
                     " idempotency_key, request_hash, incident, workflow_version, prompt_version,"
-                    " max_llm_calls, max_tool_calls, max_output_tokens, deadline_at)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
+                    " max_llm_calls, max_tool_calls, max_output_tokens, budget_micro_usd, pricing,"
+                    " deadline_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
                     " now() + make_interval(secs => %s)) RETURNING {}"
                 ).format(_RECORD_COLUMNS),
                 (
@@ -229,6 +241,8 @@ class InvestigationStore:
                     new.max_llm_calls,
                     new.max_tool_calls,
                     new.max_output_tokens,
+                    new.budget_micro_usd,
+                    json.dumps(new.pricing),
                     new.timeout_seconds,
                 ),
             )
@@ -383,10 +397,18 @@ class InvestigationStore:
         failure_code = result.failure.code if result.failure is not None else None
         async with self._pool.connection() as conn, conn.transaction():
             await _fence(conn, lease)
-            await conn.execute(
+            # Never dispatched, so certainly not executed: released in full.
+            cursor = await conn.execute(
                 "UPDATE operations SET state = 'abandoned', completed_at = now(),"
-                " may_have_executed = false WHERE investigation_id = %s AND state = 'intent'",
+                " may_have_executed = false, settled_micro_usd = 0"
+                " WHERE investigation_id = %s AND state = 'intent' RETURNING reserved_micro_usd",
                 (lease.investigation_id,),
+            )
+            released = sum(row["reserved_micro_usd"] for row in await cursor.fetchall())
+            await conn.execute(
+                "UPDATE investigations SET reserved_micro_usd = reserved_micro_usd - %s"
+                " WHERE investigation_id = %s",
+                (released, lease.investigation_id),
             )
             await conn.execute(
                 "UPDATE operations SET reply = NULL WHERE investigation_id = %s"
@@ -415,11 +437,19 @@ class InvestigationStore:
         return None if row is None else Operation.from_row(row)
 
     async def create_intent(
-        self, lease: Lease, operation_type: OperationType, model_alias: str, max_tokens: int
+        self,
+        lease: Lease,
+        operation_type: OperationType,
+        model_alias: str,
+        max_tokens: int,
+        input_token_bound: int,
     ) -> Operation:
         """Admit one model call against the investigation's limits and record its intent.
 
-        Raises ``AdmissionRefusedError`` when a limit is reached; nothing is written then.
+        In one transaction under the investigation's row lock: the call count must be
+        below its limit, the alias must have a recorded price, and the worst-case
+        estimate must fit the remaining budget, which it then reserves. Raises
+        ``AdmissionRefusedError`` otherwise; nothing is written then.
         """
         async with self._pool.connection() as conn, conn.transaction():
             investigation = await _fence(conn, lease)
@@ -429,15 +459,31 @@ class InvestigationStore:
                     "The investigation reached its limit of"
                     f" {investigation['max_llm_calls']} model calls.",
                 )
+            price = price_in(investigation["pricing"], model_alias)
+            if price is None:
+                raise AdmissionRefusedError(
+                    "price_unknown",
+                    "No price is recorded for the model alias, so the call's cost cannot be"
+                    " bounded.",
+                )
+            reservation = cost_micro_usd(price, input_token_bound, max_tokens)
+            committed = investigation["reserved_micro_usd"] + investigation["settled_micro_usd"]
+            if committed + reservation > investigation["budget_micro_usd"]:
+                raise AdmissionRefusedError(
+                    "budget_exhausted",
+                    "The investigation's estimated spending limit does not allow another"
+                    " model call.",
+                )
             await conn.execute(
-                "UPDATE investigations SET llm_calls_admitted = llm_calls_admitted + 1"
-                " WHERE investigation_id = %s",
-                (lease.investigation_id,),
+                "UPDATE investigations SET llm_calls_admitted = llm_calls_admitted + 1,"
+                " reserved_micro_usd = reserved_micro_usd + %s WHERE investigation_id = %s",
+                (reservation, lease.investigation_id),
             )
             cursor = await conn.execute(
                 "INSERT INTO operations (operation_id, investigation_id, operation_type,"
-                " attempt, state, fencing_token, model_alias, gateway_request_id, max_tokens)"
-                " VALUES (%s, %s, %s, 1, 'intent', %s, %s, %s, %s) RETURNING *",
+                " attempt, state, fencing_token, model_alias, gateway_request_id, max_tokens,"
+                " reserved_micro_usd) VALUES (%s, %s, %s, 1, 'intent', %s, %s, %s, %s, %s)"
+                " RETURNING *",
                 (
                     uuid.uuid4(),
                     lease.investigation_id,
@@ -446,6 +492,7 @@ class InvestigationStore:
                     model_alias,
                     f"{lease.investigation_id}-{operation_type.value}-1",
                     max_tokens,
+                    reservation,
                 ),
             )
             row = await cursor.fetchone()
@@ -466,13 +513,14 @@ class InvestigationStore:
     async def record_success(
         self, lease: Lease, operation: Operation, reply: str, usage: ObservedUsage | None
     ) -> None:
-        await self._transition(
+        await self._close(
             lease,
             operation,
-            OperationState.DISPATCHED,
             OperationState.SUCCEEDED,
-            "completed_at = now(), may_have_executed = true, reply = %s, usage = %s",
+            "may_have_executed = true, reply = %s, usage = %s",
             (reply, usage.to_json() if usage is not None else None),
+            may_have_executed=True,
+            usage=usage,
         )
 
     async def record_failure(
@@ -486,13 +534,12 @@ class InvestigationStore:
         gateway_error_code: str | None = None,
         usage: ObservedUsage | None = None,
     ) -> None:
-        await self._transition(
+        await self._close(
             lease,
             operation,
-            OperationState.DISPATCHED,
             OperationState.FAILED,
-            "completed_at = now(), failure_code = %s, may_have_executed = %s,"
-            " gateway_status = %s, gateway_error_code = %s, usage = %s",
+            "failure_code = %s, may_have_executed = %s, gateway_status = %s,"
+            " gateway_error_code = %s, usage = %s",
             (
                 code,
                 may_have_executed,
@@ -500,11 +547,13 @@ class InvestigationStore:
                 gateway_error_code,
                 usage.to_json() if usage is not None else None,
             ),
+            may_have_executed=may_have_executed,
+            usage=usage,
         )
 
     async def mark_uncertain(self, lease: Lease, operation: Operation) -> None:
         """A dispatched call without a recorded outcome: it may have run, so it is
-        never sent again."""
+        never sent again, and its reservation stays as an unresolved liability."""
         await self._transition(
             lease,
             operation,
@@ -526,6 +575,64 @@ class InvestigationStore:
         if row is None:
             return UsageTotals(0, 0, 0)
         return UsageTotals(row["calls"], row["prompt_tokens"], row["completion_tokens"])
+
+    async def _close(
+        self,
+        lease: Lease,
+        operation: Operation,
+        new: OperationState,
+        assignments: LiteralString,
+        params: tuple[object, ...],
+        *,
+        may_have_executed: bool,
+        usage: ObservedUsage | None,
+    ) -> None:
+        """Close a dispatched call and settle its reservation, once, in one transaction.
+
+        The state check in the UPDATE makes a second close of the same operation fail
+        instead of settling twice.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            investigation = await _fence(conn, lease)
+            settled = settlement(
+                reserved=operation.reserved_micro_usd,
+                price=price_in(investigation["pricing"], operation.model_alias),
+                may_have_executed=may_have_executed,
+                input_tokens=usage.prompt_tokens if usage is not None else None,
+                output_tokens=usage.completion_tokens if usage is not None else None,
+            )
+            statement = sql.SQL(
+                "UPDATE operations SET state = %s, completed_at = now(), settled_micro_usd = %s,"
+                " {} WHERE operation_id = %s AND state = 'dispatched'"
+            ).format(sql.SQL(assignments))
+            cursor = await conn.execute(
+                statement, (new.value, settled, *params, operation.operation_id)
+            )
+            if cursor.rowcount != 1:
+                raise OperationConflictError(
+                    f"operation {operation.operation_id} is not dispatched"
+                )
+            await conn.execute(
+                "UPDATE investigations SET reserved_micro_usd = reserved_micro_usd - %s,"
+                " settled_micro_usd = settled_micro_usd + %s WHERE investigation_id = %s",
+                (operation.reserved_micro_usd, settled, lease.investigation_id),
+            )
+
+    async def admit_tool_calls(self, lease: Lease, count: int) -> None:
+        """Record the diagnostics a plan will run; idempotent when a stage is repeated."""
+        async with self._pool.connection() as conn, conn.transaction():
+            investigation = await _fence(conn, lease)
+            if count > investigation["max_tool_calls"]:
+                raise AdmissionRefusedError(
+                    "tool_call_limit_exceeded",
+                    f"The plan requests {count} diagnostics; the limit is"
+                    f" {investigation['max_tool_calls']}.",
+                )
+            await conn.execute(
+                "UPDATE investigations SET tool_calls_admitted ="
+                " greatest(tool_calls_admitted, %s) WHERE investigation_id = %s",
+                (count, lease.investigation_id),
+            )
 
     async def _transition(
         self,

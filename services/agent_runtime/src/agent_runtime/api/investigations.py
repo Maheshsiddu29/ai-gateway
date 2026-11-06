@@ -47,6 +47,17 @@ _INVESTIGATION_ID = re.compile(r"inv-[0-9a-f]{32}")
 _DATABASE_ERRORS = (psycopg.Error, PoolTimeout, PoolClosed, OSError)
 
 
+class Spending(BaseModel):
+    """Estimated spending in micro-USD at the prices recorded on acceptance. Not an
+    invoice: the gateway's ledger and the provider's bill are authoritative."""
+
+    budget_micro_usd: int
+    # Admitted calls not yet settled; for a reconciliation_required investigation,
+    # the calls whose outcome is unknown.
+    reserved_micro_usd: int
+    settled_micro_usd: int
+
+
 class InvestigationView(BaseModel):
     investigation_id: str
     status: str
@@ -54,6 +65,7 @@ class InvestigationView(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
+    spending: Spending
     result: InvestigationResult | None
 
     @classmethod
@@ -65,6 +77,11 @@ class InvestigationView(BaseModel):
             created_at=record.created_at,
             updated_at=record.updated_at,
             completed_at=record.completed_at,
+            spending=Spending(
+                budget_micro_usd=record.budget_micro_usd,
+                reserved_micro_usd=record.reserved_micro_usd,
+                settled_micro_usd=record.settled_micro_usd,
+            ),
             result=(
                 InvestigationResult.model_validate(record.result)
                 if record.result is not None
@@ -106,6 +123,13 @@ async def create_investigation(
         max_tool_calls=settings.max_tool_calls,
         max_output_tokens=settings.max_output_tokens,
         timeout_seconds=settings.investigation_timeout_seconds,
+        budget_micro_usd=settings.max_investigation_cost_micro_usd,
+        # The prices in force now stay with the investigation across restarts and
+        # configuration changes.
+        pricing={
+            alias: settings.model_prices[alias].model_dump()
+            for alias in (settings.planner_model, settings.diagnosis_model)
+        },
     )
     try:
         record, created = await store.create(

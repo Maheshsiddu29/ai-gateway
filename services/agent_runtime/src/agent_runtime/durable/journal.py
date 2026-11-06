@@ -17,6 +17,7 @@ from collections.abc import Callable, Sequence
 
 import psycopg
 
+from agent_runtime.budget import input_token_bound
 from agent_runtime.gateway_client import ChatMessage, GatewayCallError, TokenUsage
 from agent_runtime.investigation.graph import (
     LlmFailure,
@@ -80,7 +81,11 @@ class JournaledLlmCaller:
         if existing is None:
             try:
                 existing = await self._store.create_intent(
-                    self._lease, operation, model, self._max_output_tokens
+                    self._lease,
+                    operation,
+                    model,
+                    self._max_output_tokens,
+                    input_token_bound(messages),
                 )
             except AdmissionRefusedError as exc:
                 return LlmFailure(exc.code, exc.message)

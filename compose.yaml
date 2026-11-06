@@ -113,6 +113,18 @@ services:
       AGENT_API_KEYS: ${AGENT_API_KEYS:-}
       AGENT_DATABASE_URL: postgresql://agent_app:agent-app-local-only@agent-postgres:5432/agent
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+      # Recorded on each investigation for spending admission. These match the
+      # mock prices in config/gateway.compose.toml ($1 and $2 per million tokens);
+      # with real providers, use at least the price of the most expensive model each
+      # alias can be routed to.
+      AGENT_PLANNER_MODEL: agent-planner
+      AGENT_DIAGNOSIS_MODEL: agent-diagnosis
+      AGENT_MODEL_PRICES: >-
+        {"agent-planner": {"input_micro_usd_per_million_tokens": 1000000,
+        "output_micro_usd_per_million_tokens": 2000000},
+        "agent-diagnosis": {"input_micro_usd_per_million_tokens": 1000000,
+        "output_micro_usd_per_million_tokens": 2000000}}
+      AGENT_MAX_INVESTIGATION_COST_MICRO_USD: "100000"
     ports:
       - "127.0.0.1:8100:8100"
     networks: [agent-api, agent-data]

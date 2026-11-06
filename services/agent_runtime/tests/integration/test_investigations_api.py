@@ -30,6 +30,7 @@ from tests.fakes import (
     GATEWAY_API_KEY,
     OTHER_AUTH_HEADERS,
     PLAN_REPLY,
+    PRICE,
     CountingBackend,
     GatewayStub,
     completion_body,
@@ -105,6 +106,11 @@ async def test_accepts_and_persists_before_answering(
     body = response.json()
     assert body["status"] == "accepted"
     assert body["result"] is None
+    assert body["spending"] == {
+        "budget_micro_usd": 100_000,
+        "reserved_micro_usd": 0,
+        "settled_micro_usd": 0,
+    }
     assert response.headers["location"] == f"/v1/investigations/{body['investigation_id']}"
     row = await investigation(owner, body["investigation_id"])
     assert row["status"] == "accepted"
@@ -112,6 +118,7 @@ async def test_accepts_and_persists_before_answering(
     assert row["workflow_version"] == WORKFLOW_VERSION
     assert (row["max_llm_calls"], row["max_tool_calls"], row["max_output_tokens"]) == (2, 6, 2048)
     assert row["principal_id"].startswith("agent-key-")
+    assert row["pricing"] == {"planner": PRICE, "diagnosis": PRICE}
 
 
 async def test_a_finished_investigation_is_returned_with_its_result(
@@ -130,6 +137,9 @@ async def test_a_finished_investigation_is_returned_with_its_result(
     assert body["stage"] == "finalize"
     assert body["result"]["diagnosis"]["conclusion"] == "supported"
     assert [e["id"] for e in body["result"]["evidence"]] == ["E1", "E2"]
+    assert body["spending"]["reserved_micro_usd"] == 0
+    # No usage was reported, so both calls are charged their full reservations.
+    assert body["spending"]["settled_micro_usd"] > 0
     assert "incident" not in json.dumps(body)
 
 

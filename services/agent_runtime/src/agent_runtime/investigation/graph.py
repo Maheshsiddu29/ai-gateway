@@ -155,6 +155,9 @@ class StageContext:
     elapsed_ms: Callable[[], Awaitable[float]]
     # Persists the result and the terminal status. Called once, by finalize.
     finish: Callable[[InvestigationResult], Awaitable[None]]
+    # Records how many diagnostics the plan will run, before any runs; raises
+    # StageFailedError when a limit does not allow them.
+    admit_tool_calls: Callable[[int], Awaitable[None]]
 
 
 class CheckpointStateError(Exception):
@@ -305,8 +308,13 @@ async def collect_diagnostics(
 ) -> InvestigationState:
     ctx = runtime.context
     await ctx.enter("collect_diagnostics")
+    plan = _read_list(state, "plan")
+    try:
+        await ctx.admit_tool_calls(len(plan))
+    except StageFailedError as exc:
+        return {"failure": _failure("collect_diagnostics", exc.code, exc.message)}
     evidence: list[Evidence] = []
-    for index, raw in enumerate(_read_list(state, "plan"), start=1):
+    for index, raw in enumerate(plan, start=1):
         step = _read(raw, PlannedTool)
         # Re-checked against the allowlist: the plan came from a checkpoint.
         try:

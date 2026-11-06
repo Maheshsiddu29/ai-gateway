@@ -121,7 +121,7 @@ async def test_a_recorded_reply_is_replayed_without_a_call(owner: Connection, po
 async def test_an_intent_left_by_a_crash_is_sent_once(owner: Connection, pool: Pool) -> None:
     lease = await insert_running(owner)
     store = InvestigationStore(pool)
-    await store.create_intent(lease, OperationType.PLAN, "planner", 512)  # then the crash
+    await store.create_intent(lease, OperationType.PLAN, "planner", 512, 100)  # then the crash
 
     harness = Harness(pool, lease)
     outcome = await harness.plan()
@@ -137,7 +137,7 @@ async def test_a_dispatched_call_without_an_outcome_is_never_resent(
 ) -> None:
     lease = await insert_running(owner)
     store = InvestigationStore(pool)
-    operation = await store.create_intent(lease, OperationType.PLAN, "planner", 512)
+    operation = await store.create_intent(lease, OperationType.PLAN, "planner", 512, 100)
     # The crash happened after dispatch was recorded: during the request, or after
     # the reply arrived but before it was recorded.
     await store.mark_dispatched(lease, operation)

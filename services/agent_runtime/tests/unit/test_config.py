@@ -1,8 +1,10 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from agent_runtime.config import ApiSettings, Environment, WorkerSettings
-from tests.fakes import AGENT_API_KEY, GATEWAY_API_KEY, make_settings, make_worker_settings
+from tests.fakes import AGENT_API_KEY, GATEWAY_API_KEY, PRICE, make_settings, make_worker_settings
 
 DATABASE = "postgresql://u:p@db/agent?sslmode=verify-full"
 PRODUCTION_WORKER = {
@@ -17,17 +19,48 @@ def test_reads_api_settings_from_the_environment(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("AGENT_API_KEYS", f" {AGENT_API_KEY} , {'b' * 32},")
     monkeypatch.setenv("AGENT_ENVIRONMENT", "production")
     monkeypatch.setenv("AGENT_DATABASE_URL", DATABASE)
+    monkeypatch.setenv("AGENT_PLANNER_MODEL", "fast")
+    monkeypatch.setenv("AGENT_DIAGNOSIS_MODEL", "quality")
+    monkeypatch.setenv("AGENT_MODEL_PRICES", json.dumps({"fast": PRICE, "quality": PRICE}))
 
     settings = ApiSettings()
 
     assert [key.get_secret_value() for key in settings.api_keys] == [AGENT_API_KEY, "b" * 32]
     assert settings.database_schema == "agent_runtime"
+    assert settings.model_prices["fast"].output_micro_usd_per_million_tokens == 2_000_000
 
 
 def test_defaults_to_production() -> None:
-    settings = ApiSettings.model_validate({"api_keys": ("a" * 32,), "database_url": DATABASE})
+    settings = ApiSettings.model_validate(
+        {
+            "api_keys": ("a" * 32,),
+            "database_url": DATABASE,
+            "planner_model": "p",
+            "diagnosis_model": "d",
+            "model_prices": {"p": PRICE, "d": PRICE},
+        }
+    )
 
     assert settings.environment is Environment.PRODUCTION
+
+
+def test_every_alias_needs_a_price() -> None:
+    with pytest.raises(ValidationError, match="no price for diagnosis"):
+        make_settings(model_prices={"planner": PRICE})
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        {"input_micro_usd_per_million_tokens": -1, "output_micro_usd_per_million_tokens": 1},
+        {"input_micro_usd_per_million_tokens": 1.5, "output_micro_usd_per_million_tokens": 1},
+        {"input_micro_usd_per_million_tokens": 1},
+        {**PRICE, "currency": "EUR"},
+    ],
+)
+def test_rejects_invalid_prices(price: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(model_prices={"planner": price, "diagnosis": PRICE})
 
 
 def test_the_api_holds_no_gateway_credentials() -> None:
