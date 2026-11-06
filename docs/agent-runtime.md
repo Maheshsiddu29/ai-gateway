@@ -185,6 +185,24 @@ curl -s http://127.0.0.1:8100/v1/investigations \
   -d '{"incident": "Disk alerts on the database host."}'
 ```
 
+With Docker Compose, the `agent` profile adds the runtime on 127.0.0.1:8100,
+using the stack's gateway, Redis admission, and cost accounting:
+
+```sh
+export GATEWAY_API_KEYS=$(openssl rand -hex 32)
+export AGENT_API_KEYS=$(openssl rand -hex 32)
+export AGENT_GATEWAY_API_KEY=$GATEWAY_API_KEYS
+docker compose --profile agent up --build --wait
+tools/smoke_agent.sh        # readiness, authentication, one investigation
+docker compose --profile agent down -v
+```
+
+The container (`agent-runtime` build target) holds only the runtime's package
+and dependencies, runs as an unprivileged user with a read-only root filesystem
+and no capabilities, and is attached to the frontend network only, so it reaches
+the gateway but not Redis or PostgreSQL. Its diagnostics describe its own
+container.
+
 To use real models, point the two aliases at real providers in the gateway's
 configuration. No real model has been evaluated on this workflow; there are no
 measured figures for diagnosis quality or cost.

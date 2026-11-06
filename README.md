@@ -61,6 +61,8 @@ docker compose down -v
 
 [docs/quickstart.md](docs/quickstart.md) walks through streaming, usage and
 budgets, adding an alias, routing, and metrics.
+`docker compose --profile agent up` also starts the agent runtime; see
+[docs/agent-runtime.md](docs/agent-runtime.md#running-it-locally).
 
 ### Running without Docker
 

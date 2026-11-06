@@ -3,6 +3,8 @@
 #
 #   docker compose up --build                  one gateway on 127.0.0.1:8000
 #   docker compose --profile multi up --build  a second gateway on 127.0.0.1:8001
+#   docker compose --profile agent up --build  the agent runtime on 127.0.0.1:8100
+#                                              (needs AGENT_API_KEYS and AGENT_GATEWAY_API_KEY)
 #
 # Redis is reachable only on the internal backend network. Its data is not
 # persisted, so limits reset when the container restarts.
@@ -51,6 +53,32 @@ services:
     profiles: [multi]
     ports:
       - "127.0.0.1:8001:8000"
+
+  # The agent runtime (docs/agent-runtime.md). AGENT_GATEWAY_API_KEY must be one of
+  # GATEWAY_API_KEYS. The variables default to empty so that other profiles work
+  # without them; the runtime refuses to start if they are missing. It is on the
+  # frontend network only, so it reaches the gateway but not Redis or PostgreSQL.
+  agent-runtime:
+    <<: *hardening
+    profiles: [agent]
+    build:
+      context: .
+      target: agent-runtime
+    environment:
+      AGENT_ENVIRONMENT: development
+      AGENT_API_KEYS: ${AGENT_API_KEYS:-}
+      AGENT_GATEWAY_URL: http://gateway:8000
+      AGENT_GATEWAY_API_KEY: ${AGENT_GATEWAY_API_KEY:-}
+      AGENT_PLANNER_MODEL: agent-planner
+      AGENT_DIAGNOSIS_MODEL: agent-diagnosis
+      AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
+    ports:
+      - "127.0.0.1:8100:8100"
+    networks: [frontend]
+    depends_on:
+      gateway:
+        condition: service_healthy
+    stop_grace_period: 35s
 
   mock-upstream:
     <<: *hardening

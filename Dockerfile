@@ -39,6 +39,37 @@ COPY evaluations ./evaluations
 ENV GATEWAY_REQUIRE_REDIS_TESTS=1
 CMD ["uv", "run", "pytest", "-q"]
 
+# The agent runtime's dependencies only; it does not include the gateway package.
+FROM ${PYTHON_IMAGE} AS agent-builder
+COPY --from=uv /uv /usr/local/bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv
+WORKDIR /build
+COPY pyproject.toml uv.lock ./
+COPY services/agent_runtime/pyproject.toml ./services/agent_runtime/
+RUN uv sync --frozen --no-dev --no-install-workspace --package agent-runtime
+COPY services/agent_runtime ./services/agent_runtime
+# Installs the lockfile as is; the gateway build above checks that it is current.
+RUN uv sync --frozen --no-dev --no-editable --package agent-runtime
+
+# The agent runtime, with its own unprivileged user. Configuration and keys are
+# supplied as AGENT_* environment variables at run time.
+FROM ${PYTHON_IMAGE} AS agent-runtime
+RUN groupadd --system --gid 10002 agent \
+    && useradd --system --uid 10002 --gid agent --no-create-home --shell /usr/sbin/nologin agent
+COPY --from=agent-builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+USER agent
+EXPOSE 8100
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health/ready', timeout=2)"]
+CMD ["uvicorn", "agent_runtime.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8100", \
+     "--no-access-log", "--no-server-header", "--timeout-graceful-shutdown", "30"]
+
 # Shared runtime: the virtual environment and an unprivileged user, no build tools.
 FROM ${PYTHON_IMAGE} AS base
 RUN groupadd --system --gid 10001 gateway \
