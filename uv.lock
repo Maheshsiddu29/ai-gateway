@@ -6,6 +6,34 @@ resolution-markers = [
     "python_full_version < '3.15'",
 ]
 
+[manifest]
+members = [
+    "agent-runtime",
+    "ai-gateway",
+]
+
+[[package]]
+name = "agent-runtime"
+source = { editable = "services/agent_runtime" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "starlette" },
+    { name = "uvicorn" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.162.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
+    { name = "pydantic", specifier = ">=2.14.2" },
+    { name = "pydantic-settings", specifier = ">=2.16.2" },
+    { name = "starlette", specifier = ">=1.10.0" },
+    { name = "uvicorn", specifier = ">=0.54.0" },
+]
+
 [[package]]
 name = "ai-gateway"
 source = { editable = "." }
@@ -25,6 +53,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "agent-runtime" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
@@ -49,6 +78,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "agent-runtime", editable = "services/agent_runtime" },
     { name = "hypothesis", specifier = ">=6.170.14" },
     { name = "mypy", specifier = ">=2.4.1" },
     { name = "pytest", specifier = ">=9.2.0" },

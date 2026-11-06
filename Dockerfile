@@ -14,10 +14,15 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_DOWNLOADS=never \
     UV_PROJECT_ENVIRONMENT=/opt/venv
 WORKDIR /build
+# The dependency layer is installed before any source is copied, so uv cannot yet
+# check the lockfile against the workspace packages (--frozen). The final sync,
+# with every workspace member present, checks it (--locked).
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+COPY services/agent_runtime/pyproject.toml ./services/agent_runtime/
+RUN uv sync --frozen --no-dev --no-install-workspace
 COPY README.md LICENSE ./
 COPY src ./src
+COPY services/agent_runtime ./services/agent_runtime
 RUN uv sync --locked --no-dev --no-editable
 
 # Linux regression environment using the Redis 7.0 package from Debian bookworm.

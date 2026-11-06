@@ -22,12 +22,21 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    # Installed into the development environment for the cross-service contract
+    # tests; the gateway itself never imports it.
+    "agent-runtime",
     "hypothesis>=6.170.14",
     "mypy>=2.4.1",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
     "ruff>=0.17.3",
 ]
+
+[tool.uv.workspace]
+members = ["services/agent_runtime"]
+
+[tool.uv.sources]
+agent-runtime = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

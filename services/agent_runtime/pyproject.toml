@@ -1,0 +1,59 @@
+[project]
+name = "agent-runtime"
+dynamic = ["version"]
+description = "Bounded LLM workflows, starting with read-only Linux incident investigation, that call the AI Gateway over HTTP."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.162.0",
+    "httpx>=0.28.1",
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "starlette>=1.10.0",
+    "uvicorn>=0.54.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/agent_runtime/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_runtime"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/agent_runtime", "README.md", "pyproject.toml"]
+
+# Development tools come from the workspace root's dev dependency group. Run the
+# checks from this directory, e.g. `uv run --directory services/agent_runtime mypy`.
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+src = ["src", "tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use plain asserts and fixed, non-secret credentials.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = ["src"]
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["--strict-markers", "--strict-config"]
+filterwarnings = ["error"]
