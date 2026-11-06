@@ -104,7 +104,7 @@ class Usage(BaseModel):
 
 class InvestigationResult(BaseModel):
     investigation_id: str
-    status: Literal["completed", "failed"]
+    status: Literal["completed", "failed", "reconciliation_required"]
     prompt_version: str
     plan: list[PlannedTool] | None
     evidence: list[Evidence]

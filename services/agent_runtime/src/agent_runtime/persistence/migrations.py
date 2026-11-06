@@ -1,12 +1,14 @@
 """Versioned schema migrations for the agent runtime's own PostgreSQL schema.
 
 Migrations are plain SQL files shipped in the package, applied in order, each in
-its own transaction together with its row in ``schema_migrations``. They run only
+its own transaction together with its row in ``schema_migrations``. Every upgrade
+then creates or upgrades LangGraph's checkpoint tables in the same schema. They run only
 through ``python -m agent_runtime.persistence`` with the schema owner's
 credentials; the API and worker connect as an unprivileged role and only
 ``verify`` the schema, refusing to start on any mismatch.
 """
 
+import asyncio
 import hashlib
 import re
 from collections.abc import AsyncIterator
@@ -16,8 +18,16 @@ from importlib.resources import files
 
 from psycopg import sql
 
+from agent_runtime.persistence.checkpoints import (
+    CHECKPOINT_TABLES,
+    LATEST_CHECKPOINT_MIGRATION,
+    checkpoint_version,
+    create_checkpoint_tables,
+    drop_checkpoint_tables,
+)
 from agent_runtime.persistence.database import SCHEMA_PATTERN, Connection
 
+_LOCK_TIMEOUT_SECONDS = 300
 _FILE = re.compile(r"(?P<version>\d{4})_(?P<name>[a-z0-9_]+)\.up\.sql")
 
 
@@ -63,6 +73,9 @@ APP_TABLE_PRIVILEGES: dict[str, tuple[str, ...]] = {
     "schema_migrations": ("SELECT",),
     "investigations": ("SELECT", "INSERT", "UPDATE"),
     "operations": ("SELECT", "INSERT", "UPDATE"),
+    "checkpoint_migrations": ("SELECT",),
+    # LangGraph upserts checkpoints and deletes a thread's when it is finished.
+    **dict.fromkeys(CHECKPOINT_TABLES, ("SELECT", "INSERT", "UPDATE", "DELETE")),
 }
 
 
@@ -94,6 +107,12 @@ async def verify(conn: Connection) -> None:
     for version, checksum in applied.items():
         if checksum != known[version].checksum:
             raise SchemaError(f"migration {version} differs from the one applied to the database")
+    checkpoints = await checkpoint_version(conn)
+    if checkpoints != LATEST_CHECKPOINT_MIGRATION:
+        raise SchemaError(
+            f"checkpoint tables are at version {checkpoints}, expected"
+            f" {LATEST_CHECKPOINT_MIGRATION}; run `python -m agent_runtime.persistence upgrade`"
+        )
 
 
 async def upgrade(conn: Connection, schema: str, *, target: int | None = None) -> list[int]:
@@ -126,6 +145,8 @@ async def upgrade(conn: Connection, schema: str, *, target: int | None = None) -
                     (migration.version, migration.name, migration.checksum),
                 )
             done.append(migration.version)
+        if target == LATEST_VERSION:
+            await create_checkpoint_tables(conn)
         return done
 
 
@@ -166,6 +187,8 @@ async def downgrade(
                 " pass --allow-data-loss to proceed"
             )
         known = {migration.version: migration for migration in MIGRATIONS}
+        if 1 in reverting:
+            await drop_checkpoint_tables(conn)
         for version in reverting:
             async with conn.transaction():
                 await conn.execute(known[version].down)
@@ -215,7 +238,21 @@ async def _migration_lock(conn: Connection, schema: str) -> AsyncIterator[None]:
     if not SCHEMA_PATTERN.fullmatch(schema):
         raise ValueError("invalid database schema name")
     key = f"agent_runtime.migrations:{schema}"
-    await conn.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (key,))
+    # Polled rather than awaited: a session blocked inside pg_advisory_lock holds a
+    # snapshot, and LangGraph's CREATE INDEX CONCURRENTLY, run by the lock holder,
+    # waits for every such snapshot, which would deadlock.
+    loop = asyncio.get_running_loop()
+    give_up = loop.time() + _LOCK_TIMEOUT_SECONDS
+    while True:
+        cursor = await conn.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended(%s, 0)) AS locked", (key,)
+        )
+        row = await cursor.fetchone()
+        if row is not None and row["locked"]:
+            break
+        if loop.time() > give_up:
+            raise SchemaError("another migration is still running; try again later")
+        await asyncio.sleep(0.2)
     try:
         yield
     finally:
