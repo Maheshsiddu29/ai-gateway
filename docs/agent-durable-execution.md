@@ -5,6 +5,9 @@ investigation and each model call can be in, who may change them, and what the
 runtime does after a crash. It is the specification the implementation and its
 tests follow. Operating instructions are in [agent-runtime.md](agent-runtime.md).
 
+[ADR 0009](adr/0009-journal-beside-checkpoints-for-model-calls.md) records why the
+model-call journal exists beside the checkpoints.
+
 ## Goals and non-goals
 
 - An accepted investigation is in PostgreSQL before the client is told so, and

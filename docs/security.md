@@ -1,7 +1,7 @@
 # Security review
 
 This document records the controls that exist and the risks that remain, as of
-Phase 6A. It covers the gateway, the evaluation tooling, and the agent runtime. General request
+Phase 6B. It covers the gateway, the evaluation tooling, and the agent runtime. General request
 handling controls are also listed in
 [architecture.md](architecture.md#security-controls).
 
@@ -13,7 +13,9 @@ handling controls are also listed in
 | API client (gateway key) | Its own completions, usage, and budgets. Clients cannot choose a provider, read another key's usage, or see routing decisions. |
 | Metrics reader (metrics key) | Aggregate Prometheus counters, and nothing else. |
 | Provider | Request content sent to it. Its responses are parsed defensively and its error bodies never reach clients. |
-| Agent runtime caller (agent key) | Starting investigations and reading their results. Callers cannot choose tools, paths, or models beyond what the runtime allows, and never see the runtime's gateway key. |
+| Agent runtime caller (agent key) | Starting investigations and reading their own results. Callers cannot choose tools, paths, or models beyond what the runtime allows, cannot see another caller's investigations, and never see the runtime's gateway key. |
+| Agent database (app role) | Storing investigations, their journal, and checkpoints. The role cannot delete rows from the registry or journal, nor change the schema or its triggers. |
+| Agent checkpoint contents | Nothing. Graph state is JSON re-validated on every read and deserialized without constructing objects. |
 | Model output (in the agent runtime) | Nothing. Plans and diagnoses are parsed and checked as untrusted input and can only select from fixed read-only diagnostics. |
 
 ## Controls
@@ -173,6 +175,23 @@ Release review of Phase 6A added four controls:
 - In Compose, the runtime's only network is shared with the gateways, so it
   cannot reach the provider, Redis, or PostgreSQL directly.
 
+Phase 6B split the runtime into an API and a durable worker:
+
+- The API holds the agent keys and no gateway key; the worker holds the gateway
+  key and no agent keys. Neither can change the database schema: only the
+  migration command, run with the owner's credentials, can.
+- The agent's persistence is a separate database from the gateway's billing
+  tables, on its own internal Compose network. The worker has no outbound
+  access and cannot reach the mock provider, Redis, or the gateway's database.
+- Checkpoints are deserialized with `allowed_msgpack_modules=None` and no
+  pickle (CVE-2026-28277), and graph state is re-validated when read, so write
+  access to the checkpoint tables cannot make the runtime construct an object or
+  run an unpermitted tool.
+- A model call whose outcome is unknown is never repeated, which bounds
+  duplicate provider spending to the gateway's own budget for the runtime's key.
+- The worker refuses to start with LangSmith tracing enabled, which would export
+  prompts containing incident text.
+
 ## Open risks
 
 - **The cost ceiling is not an invoice bound.** It limits what the CLI sends,
@@ -210,3 +229,18 @@ Release review of Phase 6A added four controls:
 - **Agent runtime: hung diagnostic threads.** Their threads cannot be killed.
   Enough of them make every diagnostic fail as `diagnostic_workers_busy` until
   they return or the process restarts.
+- **Agent runtime: stored incident text.** An accepted investigation's incident
+  text, and recorded model replies, live in the agent database until the
+  investigation is terminal. Encryption at rest is the operator's.
+- **Agent runtime: unresolved provider executions.** A model call interrupted
+  after dispatch may have run and been charged. The investigation ends as
+  `reconciliation_required` and a human must compare it with the gateway's
+  ledger; the runtime never resolves it automatically.
+- **Agent runtime: estimated spending is not an invoice bound.** Admission uses
+  configured prices and a token upper bound. An alias priced below the model the
+  gateway routes it to, or a provider counting more input tokens, exceeds the
+  ceiling.
+- **Agent runtime: one shared gateway key.** Every investigation uses it, so the
+  gateway's limits and budgets for that key are shared by all callers. The API
+  can no longer check that this key differs from the agent keys, because they are
+  held by different processes; keeping them distinct is an operator requirement.

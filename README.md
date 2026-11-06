@@ -30,7 +30,11 @@ and budgets, translates the request, and normalizes the response.
 - A separate agent runtime (`services/agent_runtime`) that runs a bounded,
   read-only Linux incident investigation through the gateway: model-chosen
   diagnostics from a fixed allowlist, and a diagnosis that must cite the
-  evidence collected. See [docs/agent-runtime.md](docs/agent-runtime.md).
+  evidence collected. Investigations are accepted over HTTP, stored in their own
+  PostgreSQL schema, and run by a durable worker on a LangGraph graph with
+  checkpoints, leases, and a journal that never repeats a model call whose
+  outcome is unknown. See [docs/agent-runtime.md](docs/agent-runtime.md) and
+  [docs/agent-durable-execution.md](docs/agent-durable-execution.md).
 
 Caching is not implemented.
 
@@ -61,7 +65,8 @@ docker compose down -v
 
 [docs/quickstart.md](docs/quickstart.md) walks through streaming, usage and
 budgets, adding an alias, routing, and metrics.
-`docker compose --profile agent up` also starts the agent runtime; see
+`docker compose --profile agent up` also starts the agent runtime, its own
+PostgreSQL, and a durable worker; see
 [docs/agent-runtime.md](docs/agent-runtime.md#running-it-locally).
 
 ### Running without Docker
@@ -202,7 +207,8 @@ recorded results.
 | [docs/cost-accounting.md](docs/cost-accounting.md), [docs/budget-enforcement.md](docs/budget-enforcement.md) | Ledger semantics and spending admission. |
 | [docs/routing.md](docs/routing.md), [docs/evaluation.md](docs/evaluation.md) | Routing policies, evaluation datasets, live-run safeguards, comparisons. |
 | [docs/security.md](docs/security.md) | Trust boundaries, controls, database roles, and open risks. |
-| [docs/agent-runtime.md](docs/agent-runtime.md) | The agent runtime: investigation workflow, diagnostics, API, configuration, limits. |
+| [docs/agent-runtime.md](docs/agent-runtime.md) | The agent runtime: investigation workflow, diagnostics, API, configuration, operations, limits. |
+| [docs/agent-durable-execution.md](docs/agent-durable-execution.md) | Durable execution: states, leases, the model-call journal, budgets, recovery. |
 | [docs/benchmarks.md](docs/benchmarks.md) | Measurements and how to reproduce them. |
 | [docs/adr/](docs/adr/) | Design decisions. |
 
