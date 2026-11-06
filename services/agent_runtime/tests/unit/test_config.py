@@ -8,6 +8,8 @@ PRODUCTION = {
     "environment": Environment.PRODUCTION,
     "gateway_url": "https://gateway.example",
     "gateway_api_key": "g" * 32,
+    "planner_model": "planner",
+    "diagnosis_model": "diagnosis",
 }
 
 
@@ -16,6 +18,8 @@ def test_reads_settings_from_the_environment(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("AGENT_ENVIRONMENT", "production")
     monkeypatch.setenv("AGENT_GATEWAY_URL", "https://gateway.example")
     monkeypatch.setenv("AGENT_GATEWAY_API_KEY", "g" * 32)
+    monkeypatch.setenv("AGENT_PLANNER_MODEL", "fast")
+    monkeypatch.setenv("AGENT_DIAGNOSIS_MODEL", "quality")
 
     settings = Settings()
 
@@ -95,6 +99,8 @@ def test_reads_filesystem_paths_from_the_environment(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("AGENT_ENVIRONMENT", "development")
     monkeypatch.setenv("AGENT_GATEWAY_URL", "http://gateway:8000")
     monkeypatch.setenv("AGENT_GATEWAY_API_KEY", GATEWAY_API_KEY)
+    monkeypatch.setenv("AGENT_PLANNER_MODEL", "fast")
+    monkeypatch.setenv("AGENT_DIAGNOSIS_MODEL", "quality")
     monkeypatch.setenv("AGENT_FILESYSTEM_PATHS", "/, /var/lib/postgresql")
 
     assert Settings().filesystem_paths == ("/", "/var/lib/postgresql")
@@ -109,3 +115,32 @@ def test_rejects_invalid_filesystem_paths(paths: tuple[str, ...]) -> None:
 def test_diagnostic_roots_must_be_absolute() -> None:
     with pytest.raises(ValidationError, match="absolute"):
         make_settings(procfs_root="proc")
+
+
+def test_model_aliases_are_required() -> None:
+    values = make_settings().model_dump()
+    del values["planner_model"]
+
+    with pytest.raises(ValidationError, match="planner_model"):
+        Settings.model_validate(values)
+
+
+@pytest.mark.parametrize("alias", ["", "has space", "-leading", "a" * 65])
+def test_rejects_invalid_model_aliases(alias: str) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(diagnosis_model=alias)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_llm_calls": 0},
+        {"max_tool_calls": 17},
+        {"max_output_tokens": 16_385},
+        {"investigation_timeout_seconds": 0},
+        {"max_concurrent_investigations": 0},
+    ],
+)
+def test_rejects_limits_out_of_range(overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        make_settings(**overrides)

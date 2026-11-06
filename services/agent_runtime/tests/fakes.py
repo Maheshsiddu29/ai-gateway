@@ -22,6 +22,8 @@ def make_settings(**overrides: object) -> Settings:
         "environment": Environment.DEVELOPMENT,
         "gateway_url": GATEWAY_URL,
         "gateway_api_key": GATEWAY_API_KEY,
+        "planner_model": "planner",
+        "diagnosis_model": "diagnosis",
     }
     values.update(overrides)
     return Settings.model_validate(values)

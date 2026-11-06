@@ -14,10 +14,13 @@ from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from agent_runtime.diagnostics.tools import validate_allowed_paths
+from agent_runtime.investigation.schemas import MAX_PLAN_STEPS
 
 MIN_PRODUCTION_KEY_LENGTH = 32
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
+# The gateway's alias syntax.
+ModelAlias = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")]
 
 
 class Environment(StrEnum):
@@ -62,6 +65,17 @@ class Settings(BaseSettings):
     filesystem_paths: Annotated[tuple[str, ...], NoDecode] = ("/",)
     tool_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     max_tool_output_bytes: int = Field(default=16_384, ge=1024, le=262_144)
+
+    # Investigations. Model aliases are required: the runtime never picks a model.
+    planner_model: ModelAlias
+    diagnosis_model: ModelAlias
+    max_llm_calls: int = Field(default=2, ge=1, le=8)
+    max_tool_calls: int = Field(default=6, ge=1, le=MAX_PLAN_STEPS)
+    # Sent as max_tokens on every call. Reasoning tokens, where a provider uses
+    # them, count toward it, so it must leave room for the JSON reply.
+    max_output_tokens: int = Field(default=2048, ge=64, le=16_384)
+    investigation_timeout_seconds: float = Field(default=180.0, gt=0, le=900)
+    max_concurrent_investigations: int = Field(default=4, ge=1, le=64)
 
     _split_lists = field_validator("api_keys", "filesystem_paths", mode="before")(_split_list)
 
