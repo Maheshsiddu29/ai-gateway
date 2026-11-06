@@ -161,6 +161,19 @@ class Investigator:
         try:
             async with deadline:
                 await self._run(run, incident)
+        except asyncio.CancelledError:
+            # The caller went away; the gateway call in flight, if any, is closed.
+            logger.info(
+                "investigation cancelled",
+                extra={
+                    "investigation_id": investigation_id,
+                    "principal_id": principal_id,
+                    "stage": run.stage.value,
+                    "llm_calls": run.llm_calls,
+                    "tool_calls": len(run.evidence),
+                },
+            )
+            raise
         except InvestigationFailedError as exc:
             failure = exc.failure
         except TimeoutError:

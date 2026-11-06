@@ -104,6 +104,9 @@ A failed investigation has `"status": "failed"`, `"diagnosis": null`, and a
 gateway's status and error code. The plan and evidence collected before the
 failure are included. `plan`, `reason`, and `diagnosis` are model-generated text.
 
+If the client disconnects, the investigation is cancelled, including any gateway
+call in flight, and the request is logged with status 499.
+
 HTTP errors are only for requests that never started an investigation, in the
 gateway's error envelope: 401 (missing or wrong agent key; gateway keys are not
 accepted), 400 (invalid JSON or fields), 413, 415, 429
@@ -256,9 +259,9 @@ truncation, refusals, timeouts, and a Redis-backed 429.
 
 ## Limitations
 
-- Investigations are synchronous and in memory. A client that disconnects does
-  not stop its investigation, which runs until it finishes or reaches its
-  deadline. A process restart loses running investigations.
+- Investigations are synchronous and in memory: the result is lost if the client
+  disconnects, which cancels the investigation, or if the process restarts. A
+  cancelled gateway call may already have run, and been charged, at the provider.
 - A diagnostic that hangs in the kernel (for example `statvfs` on an unresponsive
   network mount) is abandoned at its timeout, but its worker thread runs until
   the call returns, and the interpreter waits for it on exit. In a container,

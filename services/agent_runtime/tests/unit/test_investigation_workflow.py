@@ -491,3 +491,45 @@ async def test_logs_carry_no_incident_or_model_text(caplog: pytest.LogCaptureFix
     assert "investigation finished" in logged
     for text in (INCIDENT, "free text the model wrote", "memory limit", GATEWAY_API_KEY):
         assert text not in logged
+
+
+async def test_cancellation_propagates_and_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    started = asyncio.Event()
+
+    class HangingGateway(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    client = GatewayClient(
+        "http://gateway.test",
+        SecretStr(GATEWAY_API_KEY),
+        timeouts=GatewayTimeouts(),
+        max_connections=1,
+        max_request_bytes=65_536,
+        max_response_bytes=65_536,
+        transport=HangingGateway(),
+    )
+    investigator = Investigator(
+        client,
+        DiagnosticExecutor(FakeBackend(), timeout_seconds=1, max_output_bytes=1024),
+        models=ModelAliases(planner="planner", diagnosis="diagnosis"),
+        limits=InvestigationLimits(
+            max_llm_calls=2, max_tool_calls=4, max_output_tokens=64, timeout_seconds=30
+        ),
+        allowed_paths=frozenset({"/"}),
+    )
+    task = asyncio.create_task(investigator.investigate(INCIDENT, investigation_id="inv-gone"))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await client.aclose()
+
+    cancelled = [r for r in caplog.records if r.getMessage() == "investigation cancelled"]
+    assert len(cancelled) == 1
+    assert vars(cancelled[0])["stage"] == "planning"
+    assert INCIDENT not in " ".join(str(vars(r)) for r in caplog.records)

@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from starlette.types import Message
 
 from agent_runtime.main import build_app
 from tests.fakes import (
@@ -221,3 +222,62 @@ async def test_the_agent_key_never_reaches_the_gateway(host: dict[str, Path]) ->
     for request in stub.requests:
         assert AGENT_API_KEY not in str(request.headers)
         assert AGENT_API_KEY not in request.content.decode()
+
+
+async def test_a_client_disconnect_cancels_the_investigation(host: dict[str, Path]) -> None:
+    started, cancelled, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class HangingGateway(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+    body = json.dumps({"incident": "x"}).encode()
+    pending: list[Message] = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive() -> Message:
+        if pending:
+            return pending.pop()
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/investigations",
+        "raw_path": b"/v1/investigations",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"agent.test"),
+            (b"authorization", f"Bearer {AGENT_API_KEY}".encode()),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+        "client": ("127.0.0.1", 50000),
+        "server": ("agent.test", 80),
+    }
+    app = build_app(make_settings(max_concurrent_investigations=1, **host), HangingGateway())
+
+    async with app.router.lifespan_context(app):
+        call = asyncio.create_task(app(scope, receive, send))
+        await asyncio.wait_for(started.wait(), timeout=2)
+        disconnected.set()
+        await asyncio.wait_for(call, timeout=2)
+
+        assert cancelled.is_set()
+        assert not app.state.investigation_capacity.locked()
+    assert sent[0]["status"] == 499
