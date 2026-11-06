@@ -250,7 +250,9 @@ truncation, refusals, timeouts, and a Redis-backed 429.
   the model writes, but only within the checks above: they cannot add tools,
   widen paths, or cause any action.
 - **Bounded work.** Model calls, diagnostics, output tokens, request and response
-  sizes, tool output, duration, and concurrency are all limited.
+  sizes, tool output, duration, and concurrency are all limited. The gateway client
+  asks for uncompressed responses and refuses encoded ones, so the response
+  limit bounds memory, not just bytes on the wire.
 - **Logging.** Logs record IDs, counts, codes, and durations. They never include
   keys, incident text, prompts, or model output.
 - **Gateway connection.** The gateway URL comes only from configuration.

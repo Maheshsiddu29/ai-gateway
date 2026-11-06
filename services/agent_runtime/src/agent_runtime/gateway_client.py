@@ -223,6 +223,9 @@ class GatewayClient:
             "authorization": f"Bearer {self._api_key.get_secret_value()}",
             "content-type": "application/json",
             "accept": "application/json",
+            # The gateway does not compress responses. Asking for none, and refusing
+            # any, keeps the size limit a bound on memory rather than on wire bytes.
+            "accept-encoding": "identity",
         }
         if request_id is not None and _REQUEST_ID.fullmatch(request_id):
             headers["x-request-id"] = request_id
@@ -263,6 +266,14 @@ class GatewayClient:
 
     async def _read_body(self, response: httpx.Response) -> bytes:
         limit = self._max_response_bytes
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in {"", "identity"}:
+            raise GatewayCallError(
+                GatewayErrorCode.MALFORMED_RESPONSE,
+                "The gateway sent an encoded response that was not requested.",
+                may_have_executed=_may_have_executed(response.status_code),
+                status_code=response.status_code,
+            )
         too_large = GatewayCallError(
             GatewayErrorCode.RESPONSE_TOO_LARGE,
             f"The gateway response exceeds the {limit}-byte limit.",
@@ -278,6 +289,8 @@ class GatewayClient:
         ):
             raise too_large
         payload = bytearray()
+        # With every Content-Encoding refused above, httpx decodes nothing, so the
+        # limit holds for each chunk as received.
         async for chunk in response.aiter_bytes():
             payload += chunk
             if len(payload) > limit:

@@ -1,5 +1,7 @@
+import gzip
 import json
 import logging
+import zlib
 from collections.abc import AsyncIterator
 
 import httpx
@@ -338,3 +340,29 @@ async def test_an_oversized_refusal_did_not_execute() -> None:
     assert error is not None
     assert error.code is GatewayErrorCode.RESPONSE_TOO_LARGE
     assert error.may_have_executed is False
+
+
+async def test_asks_for_an_uncompressed_response() -> None:
+    stub, _ = await call(lambda _: httpx.Response(200, json=completion_body("x")))
+
+    assert stub.requests[0].headers["accept-encoding"] == "identity"
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "identity, gzip"])
+async def test_rejects_compressed_responses_before_decoding(encoding: str) -> None:
+    # 10 MiB of padding compresses to about 10 KiB; the limit must apply to what
+    # would be held in memory, not to the bytes on the wire.
+    raw = json.dumps({**completion_body("x"), "padding": " " * (10 << 20)}).encode()
+    body = gzip.compress(raw) if encoding != "deflate" else zlib.compress(raw)
+    assert len(body) < 65_536
+
+    _, error = await call(
+        lambda _: httpx.Response(
+            200,
+            content=body,
+            headers={"content-type": "application/json", "content-encoding": encoding},
+        )
+    )
+
+    assert error is not None
+    assert error.code is GatewayErrorCode.MALFORMED_RESPONSE
