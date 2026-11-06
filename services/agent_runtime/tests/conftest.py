@@ -14,7 +14,7 @@ from psycopg import sql
 from pydantic import SecretStr
 
 from agent_runtime.persistence import migrations
-from agent_runtime.persistence.database import Connection, connect
+from agent_runtime.persistence.database import Connection, Pool, connect, create_pool
 
 
 @pytest.fixture
@@ -62,3 +62,14 @@ async def app_role(database_url: SecretStr, owner: Connection, schema: str) -> A
             )
             await conn.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
             await conn.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
+@pytest.fixture
+async def pool(database_url: SecretStr, owner: Connection, schema: str) -> AsyncIterator[Pool]:
+    """A connection pool on the migrated test schema, as the services use."""
+    pool = create_pool(database_url, schema, "agent-tests", max_size=8, timeout=10)
+    await pool.open(wait=True)
+    try:
+        yield pool
+    finally:
+        await pool.close()

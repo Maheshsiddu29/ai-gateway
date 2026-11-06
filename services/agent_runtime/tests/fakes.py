@@ -1,7 +1,8 @@
 """Shared test doubles and settings."""
 
+import inspect
 import json
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -59,7 +60,7 @@ async def serve(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
-type GatewayHandler = Callable[[httpx.Request], httpx.Response]
+type GatewayHandler = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
 
 
 class GatewayStub(httpx.AsyncBaseTransport):
@@ -72,7 +73,10 @@ class GatewayStub(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         await request.aread()
         self.requests.append(request)
-        return self._handler(request)
+        response = self._handler(request)
+        if inspect.isawaitable(response):
+            return await response
+        return response
 
     def json_bodies(self) -> list[Any]:
         return [json.loads(request.content) for request in self.requests]
