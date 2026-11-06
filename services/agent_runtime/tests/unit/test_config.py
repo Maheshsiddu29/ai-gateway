@@ -139,6 +139,8 @@ def test_rejects_invalid_model_aliases(alias: str) -> None:
         {"max_output_tokens": 16_385},
         {"investigation_timeout_seconds": 0},
         {"max_concurrent_investigations": 0},
+        {"diagnostic_workers": 0},
+        {"diagnostic_workers": 17},
     ],
 )
 def test_rejects_limits_out_of_range(overrides: dict[str, object]) -> None:

@@ -4,13 +4,21 @@ Each tool reads a fixed set of files under the configured procfs and cgroup root
 or calls ``os.statvfs`` on an allowed path. Nothing is executed. Reads happen in
 worker threads because file I/O blocks, and each file read is capped in size.
 
+The threads come from a dedicated, bounded pool. A read that hangs in the kernel,
+such as ``statvfs`` on an unresponsive network mount, cannot be interrupted, so it
+keeps its thread after the caller times out. With the event loop's default
+executor, such reads would also block host name resolution for gateway calls.
+When every worker is still busy, a read fails at once instead of queueing.
+
 Missing procfs or cgroup files mean the information is unavailable, as on macOS
 or without a memory controller, and are reported as such rather than as failures.
 """
 
 import asyncio
 import os
+import threading
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 from agent_runtime.diagnostics.tools import DataValue, DiagnosticResult, ToolName, ToolRequest
@@ -44,9 +52,16 @@ class _UnavailableError(Exception):
 
 
 class LocalDiagnostics:
-    def __init__(self, procfs_root: Path, cgroup_root: Path) -> None:
+    def __init__(self, procfs_root: Path, cgroup_root: Path, *, workers: int = 4) -> None:
         self._procfs = procfs_root
         self._cgroup = cgroup_root
+        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agent-diagnostic")
+        # Reads still running, including those whose caller has given up.
+        self._slots = threading.BoundedSemaphore(workers)
+
+    def close(self) -> None:
+        """Stop accepting reads. Hung reads keep their threads until they return."""
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     async def run(self, request: ToolRequest) -> DiagnosticResult:
         operations: Mapping[ToolName, Callable[[], Mapping[str, DataValue]]] = {
@@ -55,7 +70,19 @@ class LocalDiagnostics:
             ToolName.FILESYSTEM_CAPACITY: lambda: _filesystem_capacity(_path(request)),
             ToolName.FILESYSTEM_INODES: lambda: _filesystem_inodes(_path(request)),
         }
-        return await asyncio.to_thread(_collect, operations[request.tool])
+        if not self._slots.acquire(blocking=False):
+            return DiagnosticResult.failed("diagnostic_workers_busy")
+        try:
+            future = self._pool.submit(_collect, operations[request.tool])
+        except BaseException:
+            self._slots.release()
+            raise
+        future.add_done_callback(self._release)
+        return await asyncio.wrap_future(future)
+
+    def _release(self, _: "Future[DiagnosticResult]") -> None:
+        # Runs when the read returns, or when it is cancelled before it started.
+        self._slots.release()
 
     def _memory_info(self) -> Mapping[str, DataValue]:
         text = _read_or_unavailable(self._procfs / "meminfo", "procfs_unavailable")

@@ -75,10 +75,14 @@ def build_app(
     gateway_transport: httpx.AsyncBaseTransport | None = None,
     diagnostic_backend: DiagnosticBackend | None = None,
 ) -> FastAPI:
-    backend = diagnostic_backend or LocalDiagnostics(settings.procfs_root, settings.cgroup_root)
-
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        local: LocalDiagnostics | None = None
+        backend = diagnostic_backend
+        if backend is None:
+            backend = local = LocalDiagnostics(
+                settings.procfs_root, settings.cgroup_root, workers=settings.diagnostic_workers
+            )
         gateway = build_gateway_client(settings, gateway_transport)
         app.state.gateway_client = gateway
         app.state.investigator = build_investigator(settings, gateway, backend)
@@ -89,6 +93,8 @@ def build_app(
             app.state.ready = False
             app.state.investigator = None
             await gateway.aclose()
+            if local is not None:
+                local.close()
 
     # Request bodies are parsed manually with a size limit, so a generated schema
     # would not describe them; the interactive docs are disabled.

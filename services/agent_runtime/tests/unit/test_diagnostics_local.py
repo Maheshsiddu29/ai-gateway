@@ -1,10 +1,15 @@
+import asyncio
 import os
+import threading
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from agent_runtime.diagnostics.local import LocalDiagnostics
 from agent_runtime.diagnostics.tools import (
+    DiagnosticExecutor,
     DiagnosticResult,
     DiagnosticStatus,
     ToolName,
@@ -338,3 +343,57 @@ async def test_tools_only_read(procfs: Path, cgroup: Path, tmp_path: Path) -> No
 
     after = snapshot(tmp_path)
     assert after == before
+
+
+@pytest.fixture
+def hung_statvfs(monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Event]:
+    """statvfs that blocks, as on an unresponsive network mount, until released."""
+    release = threading.Event()
+
+    def hang(path: str) -> FakeStat:
+        release.wait(timeout=10)
+        return FakeStat()
+
+    monkeypatch.setattr(os, "statvfs", hang)
+    yield release
+    release.set()
+
+
+async def test_hung_reads_do_not_occupy_the_event_loop_default_executor(
+    procfs: Path, cgroup: Path, hung_statvfs: threading.Event
+) -> None:
+    loop = asyncio.get_running_loop()
+    # httpx resolves the gateway's host name on the loop's default executor.
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    diagnostics = LocalDiagnostics(procfs, cgroup)
+    executor = DiagnosticExecutor(diagnostics, timeout_seconds=0.05, max_output_bytes=1024)
+
+    executed = await executor.run(ToolRequest(ToolName.FILESYSTEM_CAPACITY, "/"))
+
+    assert executed.result == DiagnosticResult.failed("timeout")
+    await asyncio.wait_for(loop.getaddrinfo("127.0.0.1", 80), timeout=2)
+
+
+async def test_reads_beyond_the_worker_limit_fail_without_queueing(
+    procfs: Path, cgroup: Path, hung_statvfs: threading.Event
+) -> None:
+    diagnostics = LocalDiagnostics(procfs, cgroup, workers=1)
+    executor = DiagnosticExecutor(diagnostics, timeout_seconds=0.05, max_output_bytes=1024)
+    request = ToolRequest(ToolName.FILESYSTEM_CAPACITY, "/")
+
+    first = await executor.run(request)
+    second = await executor.run(request)
+
+    assert first.result == DiagnosticResult.failed("timeout")
+    assert second.result == DiagnosticResult.failed("diagnostic_workers_busy")
+    assert second.duration_ms < 50
+
+    # Once the hung read returns, its worker is available again.
+    hung_statvfs.set()
+    for _ in range(100):
+        third = await executor.run(request)
+        if third.result.status is DiagnosticStatus.OK:
+            break
+        await asyncio.sleep(0.01)
+    assert third.result.status is DiagnosticStatus.OK
+    diagnostics.close()

@@ -56,7 +56,14 @@ Results contain only numbers and booleans under fixed keys. Status `unavailable`
 means the environment does not provide the information (no procfs, no memory
 controller, a filesystem that reports no inode counts). Status `failed` means it
 should exist but could not be read or parsed (`permission_denied`,
-`unrecognized_format`, `timeout`, `output_too_large`, ...).
+`unrecognized_format`, `timeout`, `output_too_large`, `diagnostic_workers_busy`,
+...).
+
+Reads run on a dedicated pool of `AGENT_DIAGNOSTIC_WORKERS` threads, never on the
+event loop's default executor, which also resolves the gateway's host name. A read
+that hangs in the kernel keeps its thread after it times out; once every worker
+is held, further diagnostics fail at once as `diagnostic_workers_busy` until a
+hung read returns.
 
 The tools describe the host or container the runtime runs in. In a container,
 `cgroup_memory` and the filesystems are the container's, and `memory_info` shows
@@ -148,6 +155,7 @@ values stop startup.
 | `AGENT_MAX_CONCURRENT_INVESTIGATIONS` | `4` | Per process, 1 to 64. Further requests get 429. |
 | `AGENT_FILESYSTEM_PATHS` | `/` | Comma-separated absolute, normalized paths the filesystem tools accept, at most 16. |
 | `AGENT_TOOL_TIMEOUT_SECONDS` | `5` | Per diagnostic. |
+| `AGENT_DIAGNOSTIC_WORKERS` | `4` | Threads for diagnostic reads, 1 to 16. |
 | `AGENT_MAX_TOOL_OUTPUT_BYTES` | `16384` | Per diagnostic result, as JSON. |
 | `AGENT_PROCFS_ROOT`, `AGENT_CGROUP_ROOT` | `/proc`, `/sys/fs/cgroup` | Where the tools read; changed in tests. |
 | `AGENT_GATEWAY_CONNECT_TIMEOUT_SECONDS`, `..._READ_...`, `..._WRITE_...`, `..._POOL_...` | 5, 120, 30, 5 | httpx timeouts for gateway calls. |
@@ -253,7 +261,8 @@ truncation, refusals, timeouts, and a Redis-backed 429.
   deadline. A process restart loses running investigations.
 - A diagnostic that hangs in the kernel (for example `statvfs` on an unresponsive
   network mount) is abandoned at its timeout, but its worker thread runs until
-  the call returns.
+  the call returns, and the interpreter waits for it on exit. In a container,
+  the stop grace period then ends the process.
 - Diagnostics cover only the runtime's own host or container.
 - The runtime enforces per-investigation limits but no spending limit of its own;
   spending is bounded by the gateway's budgets for its key.

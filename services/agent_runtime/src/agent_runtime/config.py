@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # The only paths the filesystem tools accept, matched exactly.
     filesystem_paths: Annotated[tuple[str, ...], NoDecode] = ("/",)
     tool_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    # Threads for diagnostic reads. A read that hangs keeps its thread; when all
+    # are taken, further reads fail as diagnostic_workers_busy.
+    diagnostic_workers: int = Field(default=4, ge=1, le=16)
     max_tool_output_bytes: int = Field(default=16_384, ge=1024, le=262_144)
 
     # Investigations. Model aliases are required: the runtime never picks a model.
