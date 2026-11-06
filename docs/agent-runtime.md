@@ -210,9 +210,11 @@ docker compose --profile agent down -v
 
 The container (`agent-runtime` build target) holds only the runtime's package
 and dependencies, runs as an unprivileged user with a read-only root filesystem
-and no capabilities, and is attached to the frontend network only, so it reaches
-the gateway but not Redis or PostgreSQL. Its diagnostics describe its own
-container.
+and no capabilities. Its only network, `agent`, is shared with the gateways
+alone, so it reaches the gateway but not the mock provider, Redis, or PostgreSQL.
+That network is not internal, because the runtime's port is published to the
+host, so outbound connections from the container are not blocked. Its
+diagnostics describe its own container.
 
 To use real models, point the two aliases at real providers in the gateway's
 configuration. No real model has been evaluated on this workflow; there are no

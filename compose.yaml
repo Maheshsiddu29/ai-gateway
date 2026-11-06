@@ -32,7 +32,7 @@ x-gateway: &gateway
     MOCK_UPSTREAM_API_KEY: mock-upstream-key
   volumes:
     - ./config/gateway.compose.toml:/etc/gateway/gateway.toml:ro
-  networks: [frontend, backend]
+  networks: [frontend, backend, agent]
   depends_on:
     mock-upstream:
       condition: service_healthy
@@ -56,8 +56,9 @@ services:
 
   # The agent runtime (docs/agent-runtime.md). AGENT_GATEWAY_API_KEY must be one of
   # GATEWAY_API_KEYS. The variables default to empty so that other profiles work
-  # without them; the runtime refuses to start if they are missing. It is on the
-  # frontend network only, so it reaches the gateway but not Redis or PostgreSQL.
+  # without them; the runtime refuses to start if they are missing. Its only
+  # network is shared with the gateways alone, so it cannot reach the mock
+  # provider, Redis, or PostgreSQL directly.
   agent-runtime:
     <<: *hardening
     profiles: [agent]
@@ -74,7 +75,7 @@ services:
       AGENT_LOG_LEVEL: ${AGENT_LOG_LEVEL:-INFO}
     ports:
       - "127.0.0.1:8100:8100"
-    networks: [frontend]
+    networks: [agent]
     depends_on:
       gateway:
         condition: service_healthy
@@ -137,6 +138,9 @@ networks:
   frontend: {}
   backend:
     internal: true
+  # The agent runtime and the gateways. Not internal, because the runtime's port is
+  # published to the host; outbound traffic from it is therefore not blocked.
+  agent: {}
 
 volumes:
   postgres-data: {}
