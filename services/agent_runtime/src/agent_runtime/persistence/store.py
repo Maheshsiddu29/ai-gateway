@@ -16,7 +16,10 @@ from typing import Any, LiteralString
 from psycopg import sql
 
 from agent_runtime.investigation.graph import OperationType, UsageTotals
+from agent_runtime.investigation.schemas import InvestigationResult
 from agent_runtime.persistence.database import Connection, Pool
+
+_CLAIM_LOCK = "agent_runtime.claim"
 
 
 class OperationState(StrEnum):
@@ -84,6 +87,17 @@ class Operation:
 
 
 @dataclass(frozen=True)
+class Claim:
+    """An investigation a worker now owns, with the limits recorded when it was accepted."""
+
+    lease: Lease
+    attempts: int
+    remaining_seconds: float
+    max_tool_calls: int
+    max_output_tokens: int
+
+
+@dataclass(frozen=True)
 class ObservedUsage:
     prompt_tokens: int
     completion_tokens: int
@@ -109,6 +123,136 @@ async def _fence(conn: Connection, lease: Lease) -> dict[str, Any]:
 class InvestigationStore:
     def __init__(self, pool: Pool) -> None:
         self._pool = pool
+
+    # Ownership --------------------------------------------------------------------
+
+    async def claim(
+        self, worker_id: str, *, lease_seconds: float, max_running: int, workflow_version: str
+    ) -> Claim | None:
+        """Take the oldest claimable investigation, or return None.
+
+        Claimable: ``accepted``, or ``running`` with an expired or released lease,
+        and written by this workflow version. Claims are serialized by a
+        transaction-scoped advisory lock, so ``max_running`` live leases are never
+        exceeded across workers. Each claim increments the fencing token.
+        """
+        async with self._pool.connection() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (_CLAIM_LOCK,)
+            )
+            cursor = await conn.execute(
+                "SELECT count(*) AS live FROM investigations"
+                " WHERE status = 'running' AND lease_expires_at > now()"
+            )
+            row = await cursor.fetchone()
+            if row is None or row["live"] >= max_running:
+                return None
+            cursor = await conn.execute(
+                "UPDATE investigations SET status = 'running', lease_owner = %s,"
+                " lease_expires_at = now() + make_interval(secs => %s),"
+                " fencing_token = fencing_token + 1, attempts = attempts + 1"
+                " WHERE investigation_id = ("
+                "   SELECT investigation_id FROM investigations"
+                "   WHERE workflow_version = %s AND (status = 'accepted' OR (status = 'running'"
+                "     AND (lease_expires_at IS NULL OR lease_expires_at <= now())))"
+                "   ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)"
+                " RETURNING investigation_id, fencing_token, attempts, max_tool_calls,"
+                " max_output_tokens, extract(epoch FROM deadline_at - now()) AS remaining",
+                (worker_id, lease_seconds, workflow_version),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return Claim(
+            Lease(row["investigation_id"], worker_id, row["fencing_token"]),
+            attempts=row["attempts"],
+            remaining_seconds=float(row["remaining"]),
+            max_tool_calls=row["max_tool_calls"],
+            max_output_tokens=row["max_output_tokens"],
+        )
+
+    async def renew(self, lease: Lease, lease_seconds: float) -> bool:
+        """Extend the lease from database time; False if it is no longer this worker's."""
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute(
+                "UPDATE investigations SET lease_expires_at = now() + make_interval(secs => %s)"
+                " WHERE investigation_id = %s AND fencing_token = %s AND status = 'running'"
+                " AND lease_owner = %s",
+                (lease_seconds, lease.investigation_id, lease.fencing_token, lease.worker_id),
+            )
+            return cursor.rowcount == 1
+
+    async def release(self, lease: Lease) -> None:
+        """Give the investigation back unfinished, so another worker can resume it now."""
+        async with self._pool.connection() as conn, conn.transaction():
+            await _fence(conn, lease)
+            await conn.execute(
+                "UPDATE investigations SET lease_owner = NULL, lease_expires_at = NULL"
+                " WHERE investigation_id = %s",
+                (lease.investigation_id,),
+            )
+
+    async def enter_stage(self, lease: Lease, stage: str) -> float:
+        """Record the stage being entered; returns seconds left before the deadline."""
+        async with self._pool.connection() as conn, conn.transaction():
+            await _fence(conn, lease)
+            cursor = await conn.execute(
+                "UPDATE investigations SET current_stage = %s WHERE investigation_id = %s"
+                " RETURNING extract(epoch FROM deadline_at - now()) AS remaining",
+                (stage, lease.investigation_id),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise LeaseLostError(lease.investigation_id)
+        return float(row["remaining"])
+
+    async def incident(self, lease: Lease) -> str:
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT incident FROM investigations WHERE investigation_id = %s"
+                " AND fencing_token = %s AND status = 'running'",
+                (lease.investigation_id, lease.fencing_token),
+            )
+            row = await cursor.fetchone()
+        if row is None or row["incident"] is None:
+            raise LeaseLostError(lease.investigation_id)
+        return str(row["incident"])
+
+    async def elapsed_ms(self, investigation_id: str) -> float:
+        async with self._pool.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT extract(epoch FROM now() - created_at) * 1000 AS elapsed"
+                " FROM investigations WHERE investigation_id = %s",
+                (investigation_id,),
+            )
+            row = await cursor.fetchone()
+        return 0.0 if row is None else float(row["elapsed"])
+
+    async def finish(self, lease: Lease, result: InvestigationResult) -> None:
+        """Make the investigation terminal with ``result``, in one fenced transaction.
+
+        Intents that were never dispatched are abandoned, and the incident text and
+        recorded model replies are deleted. The terminal row cannot change again.
+        """
+        failure_code = result.failure.code if result.failure is not None else None
+        async with self._pool.connection() as conn, conn.transaction():
+            await _fence(conn, lease)
+            await conn.execute(
+                "UPDATE operations SET state = 'abandoned', completed_at = now(),"
+                " may_have_executed = false WHERE investigation_id = %s AND state = 'intent'",
+                (lease.investigation_id,),
+            )
+            await conn.execute(
+                "UPDATE operations SET reply = NULL WHERE investigation_id = %s"
+                " AND reply IS NOT NULL",
+                (lease.investigation_id,),
+            )
+            await conn.execute(
+                "UPDATE investigations SET status = %s, failure_code = %s, result = %s,"
+                " incident = NULL, completed_at = now(), current_stage = 'finalize',"
+                " lease_owner = NULL, lease_expires_at = NULL WHERE investigation_id = %s",
+                (result.status, failure_code, result.model_dump_json(), lease.investigation_id),
+            )
 
     # The model call journal ------------------------------------------------------
 

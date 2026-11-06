@@ -2,6 +2,7 @@
 
 import hashlib
 import uuid
+from typing import Any
 
 from agent_runtime.investigation.graph import WORKFLOW_VERSION
 from agent_runtime.investigation.prompts import PROMPT_VERSION
@@ -40,3 +41,57 @@ async def insert_running(
         (fencing_token, investigation_id),
     )
     return Lease(investigation_id, "worker-a", fencing_token)
+
+
+async def insert_accepted(
+    conn: Connection,
+    *,
+    incident: str = "The database host is out of memory.",
+    max_llm_calls: int = 2,
+    deadline_seconds: float = 3600,
+) -> str:
+    """A newly accepted investigation, as the API stores it."""
+    investigation_id = f"inv-{uuid.uuid4().hex}"
+    await conn.execute(
+        "INSERT INTO investigations (investigation_id, principal_id, request_hash, incident,"
+        " workflow_version, prompt_version, max_llm_calls, max_tool_calls, max_output_tokens,"
+        " deadline_at) VALUES (%s, 'agent-key-0123456789ab', %s, %s, %s, %s, %s, 6, 512,"
+        " now() + make_interval(secs => %s))",
+        (
+            investigation_id,
+            hashlib.sha256(investigation_id.encode()).digest(),
+            incident,
+            WORKFLOW_VERSION,
+            PROMPT_VERSION,
+            max_llm_calls,
+            deadline_seconds,
+        ),
+    )
+    return investigation_id
+
+
+async def investigation(conn: Connection, investigation_id: str) -> dict[str, Any]:
+    cursor = await conn.execute(
+        "SELECT * FROM investigations WHERE investigation_id = %s", (investigation_id,)
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    return row
+
+
+async def operation_states(conn: Connection, investigation_id: str) -> list[tuple[str, str]]:
+    cursor = await conn.execute(
+        "SELECT operation_type, state FROM operations WHERE investigation_id = %s"
+        " ORDER BY started_at",
+        (investigation_id,),
+    )
+    return [(row["operation_type"], row["state"]) for row in await cursor.fetchall()]
+
+
+async def checkpoint_rows(conn: Connection, investigation_id: str) -> int:
+    cursor = await conn.execute(
+        "SELECT count(*) AS n FROM checkpoints WHERE thread_id = %s", (investigation_id,)
+    )
+    row = await cursor.fetchone()
+    assert row is not None
+    return int(row["n"])

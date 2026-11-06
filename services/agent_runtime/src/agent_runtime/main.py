@@ -17,8 +17,9 @@ from agent_runtime.api.errors import install_error_handlers
 from agent_runtime.api.middleware import RequestContextMiddleware
 from agent_runtime.config import Settings
 from agent_runtime.diagnostics.local import LocalDiagnostics
-from agent_runtime.diagnostics.tools import DiagnosticBackend, DiagnosticExecutor
-from agent_runtime.gateway_client import GatewayClient, GatewayTimeouts
+from agent_runtime.diagnostics.tools import DiagnosticBackend
+from agent_runtime.factories import build_diagnostic_executor, build_gateway_client
+from agent_runtime.gateway_client import GatewayClient
 from agent_runtime.investigation.workflow import InvestigationLimits, Investigator, ModelAliases
 from agent_runtime.logging import configure_logging
 from agent_runtime.security import StaticKeyAuthenticator
@@ -30,35 +31,12 @@ def create_app() -> FastAPI:
     return build_app(settings)
 
 
-def build_gateway_client(
-    settings: Settings, transport: httpx.AsyncBaseTransport | None = None
-) -> GatewayClient:
-    return GatewayClient(
-        str(settings.gateway_url),
-        settings.gateway_api_key,
-        timeouts=GatewayTimeouts(
-            connect=settings.gateway_connect_timeout_seconds,
-            read=settings.gateway_read_timeout_seconds,
-            write=settings.gateway_write_timeout_seconds,
-            pool=settings.gateway_pool_timeout_seconds,
-        ),
-        max_connections=settings.gateway_max_connections,
-        max_request_bytes=settings.gateway_max_request_bytes,
-        max_response_bytes=settings.gateway_max_response_bytes,
-        transport=transport,
-    )
-
-
 def build_investigator(
     settings: Settings, gateway: GatewayClient, backend: DiagnosticBackend
 ) -> Investigator:
     return Investigator(
         gateway,
-        DiagnosticExecutor(
-            backend,
-            timeout_seconds=settings.tool_timeout_seconds,
-            max_output_bytes=settings.max_tool_output_bytes,
-        ),
+        build_diagnostic_executor(settings, backend),
         models=ModelAliases(planner=settings.planner_model, diagnosis=settings.diagnosis_model),
         limits=InvestigationLimits(
             max_llm_calls=settings.max_llm_calls,
