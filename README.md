@@ -27,6 +27,10 @@ and budgets, translates the request, and normalizes the response.
   plan, and a replay tool that compares routing policies on holdout data.
 - JSON logs with request IDs, Prometheus metrics behind a separate credential,
   and liveness and readiness endpoints.
+- A separate agent runtime (`services/agent_runtime`) that runs a bounded,
+  read-only Linux incident investigation through the gateway: model-chosen
+  diagnostics from a fixed allowlist, and a diagnosis that must cite the
+  evidence collected. See [docs/agent-runtime.md](docs/agent-runtime.md).
 
 Caching is not implemented.
 
@@ -171,6 +175,9 @@ GATEWAY_DATABASE_URL=$GATEWAY_TEST_DATABASE_URL uv run alembic upgrade head
 GATEWAY_TEST_DATABASE_URL=postgresql+asyncpg://... uv run pytest tests/integration
 ```
 
+The agent runtime has its own checks; see
+[docs/agent-runtime.md](docs/agent-runtime.md#testing).
+
 The tests need no network access or provider credentials. Providers are
 simulated with httpx transports, fake servers, and the mock provider. Redis
 tests start their own `redis-server` and are skipped without it, unless
@@ -193,6 +200,7 @@ recorded results.
 | [docs/cost-accounting.md](docs/cost-accounting.md), [docs/budget-enforcement.md](docs/budget-enforcement.md) | Ledger semantics and spending admission. |
 | [docs/routing.md](docs/routing.md), [docs/evaluation.md](docs/evaluation.md) | Routing policies, evaluation datasets, live-run safeguards, comparisons. |
 | [docs/security.md](docs/security.md) | Trust boundaries, controls, database roles, and open risks. |
+| [docs/agent-runtime.md](docs/agent-runtime.md) | The agent runtime: investigation workflow, diagnostics, API, configuration, limits. |
 | [docs/benchmarks.md](docs/benchmarks.md) | Measurements and how to reproduce them. |
 | [docs/adr/](docs/adr/) | Design decisions. |
 

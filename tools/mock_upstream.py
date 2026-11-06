@@ -25,8 +25,35 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+# Scripted replies for the agent runtime's investigation (services/agent_runtime).
+# The plan requests every diagnostic; the diagnosis cites only E1, the root
+# filesystem capacity, because that is the one diagnostic every POSIX host provides.
+AGENT_PLANNER_MODEL = "mock-agent-planner"
+AGENT_DIAGNOSIS_MODEL = "mock-agent-diagnosis"
+_AGENT_PLAN = {
+    "steps": [
+        {"tool": "filesystem_capacity", "arguments": {"path": "/"}, "reason": "Disk space."},
+        {"tool": "filesystem_inodes", "arguments": {"path": "/"}, "reason": "Inode use."},
+        {"tool": "memory_info", "arguments": {}, "reason": "System memory."},
+        {"tool": "cgroup_memory", "arguments": {}, "reason": "Container memory limit."},
+    ]
+}
+_AGENT_DIAGNOSIS = {
+    "conclusion": "inconclusive",
+    "summary": "Mock diagnosis: the mock provider does not interpret evidence.",
+    "findings": [{"claim": "The root filesystem capacity was measured.", "evidence": ["E1"]}],
+    "next_steps": ["Run the investigation against a real model alias."],
+}
+_SCRIPTED_REPLIES = {
+    AGENT_PLANNER_MODEL: json.dumps(_AGENT_PLAN),
+    AGENT_DIAGNOSIS_MODEL: json.dumps(_AGENT_DIAGNOSIS),
+}
+
 
 def _reply_for(body: dict[str, Any]) -> str:
+    scripted = _SCRIPTED_REPLIES.get(body.get("model", ""))
+    if scripted is not None:
+        return scripted
     messages = body.get("messages", [])
     last = messages[-1].get("content", "") if messages else ""
     return f"Mock reply from {body.get('model')}: received {len(last.split())} words."

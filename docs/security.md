@@ -1,7 +1,7 @@
 # Security review
 
 This document records the controls that exist and the risks that remain, as of
-Phase 5. It covers the gateway and the evaluation tooling. General request
+Phase 6A. It covers the gateway, the evaluation tooling, and the agent runtime. General request
 handling controls are also listed in
 [architecture.md](architecture.md#security-controls).
 
@@ -13,6 +13,8 @@ handling controls are also listed in
 | API client (gateway key) | Its own completions, usage, and budgets. Clients cannot choose a provider, read another key's usage, or see routing decisions. |
 | Metrics reader (metrics key) | Aggregate Prometheus counters, and nothing else. |
 | Provider | Request content sent to it. Its responses are parsed defensively and its error bodies never reach clients. |
+| Agent runtime caller (agent key) | Starting investigations and reading their results. Callers cannot choose tools, paths, or models beyond what the runtime allows, and never see the runtime's gateway key. |
+| Model output (in the agent runtime) | Nothing. Plans and diagnoses are parsed and checked as untrusted input and can only select from fixed read-only diagnostics. |
 
 ## Controls
 
@@ -150,6 +152,15 @@ migrations only.
   16, each call has a timeout of at most 600 seconds, and live runs need an
   explicit request limit. Repetitions in the routing experiment are capped at 10.
 
+### Agent runtime
+
+[agent-runtime.md](agent-runtime.md#security) lists the controls: separate
+agent keys, a gateway key that must differ from them, no process creation or
+code evaluation (checked by a static test), fixed read-only diagnostics, allowed
+paths matched exactly, strict schemas for model output, evidence references
+checked against collected evidence, limits on every resource, and logs without
+incident text, prompts, or output.
+
 ## Open risks
 
 - **The cost ceiling is not an invoice bound.** It limits what the CLI sends,
@@ -172,3 +183,12 @@ migrations only.
   provider's circuit breaker for everyone, as documented since Phase 2.
 - **Local Compose runs as the database owner**, which can drop triggers. It is
   not a deployment template.
+- **Agent runtime: shared gateway key.** Every investigation uses one gateway key,
+  so the gateway's limits and budgets apply to all runtime callers together. One
+  caller can use up the key's budget for the others.
+- **Agent runtime: grounded is not correct.** The runtime checks that findings
+  cite collected evidence, not that the claims are true. Diagnoses and
+  `next_steps` are model text and must be reviewed before anyone acts on them.
+- **Agent runtime: host information.** Diagnostics reveal memory sizes, cgroup
+  limits, and filesystem usage of the runtime's host to its callers and to the
+  model provider.

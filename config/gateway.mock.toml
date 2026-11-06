@@ -29,3 +29,15 @@ default_max_tokens = 512
 provider = "mock-anthropic"
 model = "mock-large"
 default_max_tokens = 2048
+
+# Scripted models for the agent runtime (services/agent_runtime). The mock returns
+# a fixed investigation plan and diagnosis for them.
+[models.agent-planner]
+provider = "mock-openai"
+model = "mock-agent-planner"
+max_output_tokens = 2048
+
+[models.agent-diagnosis]
+provider = "mock-openai"
+model = "mock-agent-diagnosis"
+max_output_tokens = 2048

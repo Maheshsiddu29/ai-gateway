@@ -29,6 +29,18 @@ model = "mock-large"
 default_max_tokens = 2048
 max_output_tokens = 4096
 
+# Scripted models for the agent runtime (services/agent_runtime). The mock returns
+# a fixed investigation plan and diagnosis for them.
+[models.agent-planner]
+provider = "mock-openai"
+model = "mock-agent-planner"
+max_output_tokens = 2048
+
+[models.agent-diagnosis]
+provider = "mock-openai"
+model = "mock-agent-diagnosis"
+max_output_tokens = 2048
+
 # Routed aliases. "routed" picks the cheaper of two mock models by mock price.
 # "routed-quality" requires recorded evaluation evidence, which a fresh stack does
 # not have, so it uses its primary until runs are recorded.
@@ -116,6 +128,22 @@ version = "mock-2026-10"
 effective_at = 2020-01-01T00:00:00Z
 input_per_million_usd = "0.50"
 output_per_million_usd = "1.00"
+
+[[cost.pricing]]
+provider = "mock-openai"
+model = "mock-agent-planner"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"
+
+[[cost.pricing]]
+provider = "mock-openai"
+model = "mock-agent-diagnosis"
+version = "mock-2026-10"
+effective_at = 2020-01-01T00:00:00Z
+input_per_million_usd = "1.00"
+output_per_million_usd = "2.00"
 
 # Capability registry for routed targets. The limits are made up for the mock
 # provider; for real models, take them from the vendor's documentation.

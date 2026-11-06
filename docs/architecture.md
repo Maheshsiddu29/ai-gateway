@@ -21,6 +21,10 @@
 | `gateway.core.*` | Configuration, logging, metrics, Redis client, authentication. |
 | `gateway.schemas.completions` | The accepted request schema. |
 
+The agent runtime in `services/agent_runtime` is a separate package and process
+that calls the gateway over HTTP like any client; it is described in
+[agent-runtime.md](agent-runtime.md) and [ADR 0008](adr/0008-agent-runtime-as-a-gateway-client.md).
+
 Dependencies point inwards: `api` uses `services`, which uses `admission`,
 `resilience`, `routing`, and `providers`; all of them use `core`, `schemas`, and `errors`. Providers know nothing about HTTP
 requests from clients, and the service knows nothing about wire formats.
