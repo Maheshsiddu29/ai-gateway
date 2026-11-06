@@ -26,12 +26,15 @@ async def test_health_endpoints_need_no_credentials() -> None:
     assert ready.json() == {"status": "ready"}
 
 
-async def test_not_ready_after_shutdown() -> None:
+async def test_shutdown_closes_the_gateway_client() -> None:
     app = build_app(make_settings())
     async with serve(app) as client:
         assert (await client.get("/health/ready")).status_code == 200
+        gateway = app.state.gateway_client
+        assert not gateway.is_closed
 
     assert app.state.ready is False
+    assert gateway.is_closed
 
 
 async def test_rejects_missing_and_invalid_credentials() -> None:
