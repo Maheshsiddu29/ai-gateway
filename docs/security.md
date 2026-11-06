@@ -161,6 +161,18 @@ paths matched exactly, strict schemas for model output, evidence references
 checked against collected evidence, limits on every resource, and logs without
 incident text, prompts, or output.
 
+Release review of Phase 6A added four controls:
+
+- Diagnostics run on their own bounded thread pool, so reads that hang in the
+  kernel cannot block the default executor that resolves the gateway's host
+  name. When the pool is full of hung reads, diagnostics fail immediately.
+- A client disconnect cancels its investigation and any gateway call in flight,
+  releasing the concurrency slot.
+- The gateway client refuses compressed responses, so the response size limit
+  bounds memory.
+- In Compose, the runtime's only network is shared with the gateways, so it
+  cannot reach the provider, Redis, or PostgreSQL directly.
+
 ## Open risks
 
 - **The cost ceiling is not an invoice bound.** It limits what the CLI sends,
@@ -192,3 +204,9 @@ incident text, prompts, or output.
 - **Agent runtime: host information.** Diagnostics reveal memory sizes, cgroup
   limits, and filesystem usage of the runtime's host to its callers and to the
   model provider.
+- **Agent runtime: outbound traffic.** The Compose network that publishes the
+  runtime's port does not block outbound connections. Nothing in the runtime
+  makes them, but a compromised container could.
+- **Agent runtime: hung diagnostic threads.** Their threads cannot be killed.
+  Enough of them make every diagnostic fail as `diagnostic_workers_busy` until
+  they return or the process restarts.
