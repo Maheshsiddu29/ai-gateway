@@ -19,8 +19,21 @@ jobs:
   checks:
     name: Lint, types, and tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     services:
+      # The agent runtime's persistence is a separate database server, as in
+      # compose.yaml. Its tests create and drop their own schemas and roles.
+      agent-postgres:
+        image: postgres:16.10-alpine
+        env:
+          POSTGRES_DB: agent_test
+          POSTGRES_USER: agent_owner
+          POSTGRES_PASSWORD: agent-test-only
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_owner -d agent_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
       postgres:
         image: postgres:16.10-alpine
         env:
@@ -52,11 +65,25 @@ jobs:
         run: uv run mypy
       - name: Unit tests
         run: uv run pytest tests/unit
-      - name: Agent runtime types and tests
+      - name: Agent runtime types and tests, including crash recovery
         working-directory: services/agent_runtime
+        env:
+          AGENT_TEST_DATABASE_URL: postgresql://agent_owner:agent-test-only@127.0.0.1:5433/agent_test
+          # Fail instead of skipping when the agent database is missing.
+          AGENT_REQUIRE_DATABASE_TESTS: "1"
         run: |
           uv run mypy
           uv run pytest
+      - name: Agent runtime schema migrations, including a downgrade round trip
+        env:
+          AGENT_ENVIRONMENT: development
+          AGENT_DATABASE_OWNER_URL: postgresql://agent_owner:agent-test-only@127.0.0.1:5433/agent_test
+          AGENT_DATABASE_SCHEMA: agent_ci
+        run: |
+          uv run python -m agent_runtime.persistence upgrade
+          uv run python -m agent_runtime.persistence status
+          uv run python -m agent_runtime.persistence downgrade --to 0
+          uv run python -m agent_runtime.persistence upgrade
       - name: Migrate test database, including a downgrade round trip
         run: |
           uv run alembic upgrade head
@@ -70,6 +97,9 @@ jobs:
           # Fail instead of skipping when redis-server is missing.
           GATEWAY_REQUIRE_REDIS_TESTS: "1"
           GATEWAY_TEST_DATABASE_URL: postgresql+asyncpg://gateway:gateway-test-only@127.0.0.1:5432/gateway_test
+          # The durable agent-runtime contract test needs the agent database.
+          AGENT_TEST_DATABASE_URL: postgresql://agent_owner:agent-test-only@127.0.0.1:5433/agent_test
+          AGENT_REQUIRE_DATABASE_TESTS: "1"
 
   package:
     name: Package build and Compose smoke test
@@ -111,7 +141,7 @@ jobs:
           AGENT_API_KEYS: ci-smoke-agent-key
           AGENT_GATEWAY_API_KEY: ci-smoke-gateway-key
         run: |
-          docker compose --profile agent up --build --wait --wait-timeout 180
+          docker compose --profile agent up --build --wait --wait-timeout 300
           tools/smoke_compose.sh
           tools/smoke_agent.sh
       - name: Show logs and remove the Compose stack
@@ -119,7 +149,8 @@ jobs:
         env:
           GATEWAY_API_KEYS: ci-smoke-gateway-key
         run: |
-          docker compose --profile agent logs --no-color gateway agent-runtime | tail -n 100
+          docker compose --profile agent logs --no-color gateway agent-migrate agent-runtime \
+            agent-worker | tail -n 150
           docker compose --profile agent down -v
 
   security:
