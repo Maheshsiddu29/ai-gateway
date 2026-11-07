@@ -15,7 +15,7 @@ dependencies = [
     "pydantic>=2.14.2",
     "pydantic-settings>=2.16.2",
     "redis>=8.1.0",
-    "sqlalchemy[asyncio]>=2.0,<3",
+    "sqlalchemy[asyncio]>=2.1.8,<3",
     "starlette>=1.10.0",
     "uvicorn>=0.54.0",
 ]
